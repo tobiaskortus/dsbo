@@ -13,7 +13,7 @@ class G4CaloReconstruction(ReconstructionContainerWrapper):
         self.script_path = "examples/calo/container_scripts/reconstruction.py"
 
     def train(self, simulation_dir: str) -> None:
-        args = [os.path.join(simulation_dir, "output_df"), 
+        args = [os.path.join(simulation_dir, "output_df.parquet"), 
                 os.path.join(self._reconstruction_dir, "reco_df"), 
                 str(False),
                 os.path.join(self._reconstruction_dir, "model.pt")]

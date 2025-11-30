@@ -22,12 +22,11 @@ class ContainerWrapperBase:
     def run_container(self, args: List[str]) -> None:
         cmd = self.__construct_cmd(args, is_exec=False)
         logging.debug(f"Running container with command: {' '.join(cmd)}")
-        subprocess.run(cmd,  check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+        subprocess.run(cmd,  check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) #
     def exec_container(self, args: List[str]) -> None:
         cmd = self.__construct_cmd(args, is_exec=True)
         logging.debug(f"Running container with command: {' '.join(cmd)}")
-        subprocess.run(cmd,  check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd,  check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) #
 
     @property
     def container_path(self) -> str:

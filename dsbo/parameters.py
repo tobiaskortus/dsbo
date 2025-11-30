@@ -1,5 +1,5 @@
-from abc import abstractmethod
-from typing import Any, Optional, Sequence, Tuple
+from abc import abstractclassmethod, abstractmethod
+from typing import Any, Callable, Optional, Sequence, Tuple
 import numpy as np
 
 class DesignParameter:
@@ -10,6 +10,7 @@ class DesignParameter:
     @abstractmethod
     def float_repr(self) -> str:
         pass
+
 
 class CompositeDesignParameter(DesignParameter):
     def __init__(self, name: str, parameters: Sequence[DesignParameter]) -> None:
@@ -37,7 +38,6 @@ class CompositeDesignParameter(DesignParameter):
                 else:
                     result[param.name] = param.current_value
             return result
-        
 
     def __repr__(self) -> str:
         return f"CompositeDesignParameter(name={self.name}, parameters={self._parameters})"

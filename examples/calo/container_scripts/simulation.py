@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import sys
 
 import numpy as np
@@ -14,7 +15,7 @@ class Simulation():
             #TODO: change this
             self.n_events_per_var = parameter_dict["num_events"]["current_value"]
         else:
-            self.n_events_per_var = 10000
+            self.n_events_per_var = 1000
 
         self.cw = GeometryDescriptor()
 
@@ -45,7 +46,7 @@ class Simulation():
                 minEnergy_GeV=1.,
                 maxEnergy_GeV=20.,
                 no_mp=True,
-                #manual_seed=self.parameter_dict["metadata"]["rng_seed"]
+                manual_seed=random.randint(1, 1e6)
             )
             df = df.assign(true_pid=np.full(len(df), pid, dtype='float32'))
             dfs.append(df)
@@ -85,5 +86,5 @@ if __name__ == "__main__":
         if df[column].dtype == "awkward":
             df[column] = df[column].to_list()
 
-    df.to_parquet(output_path)
+    np.save(output_path, df.to_records())
     os.system("rm -f ./*.pkl")

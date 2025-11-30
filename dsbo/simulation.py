@@ -3,8 +3,12 @@ import os
 import shutil
 from abc import ABC, abstractmethod
 from typing import List, Optional
+import dask.distributed
+from dask.distributed import Client, LocalCluster
 
 from dsbo.utils import ContainerWrapperBase
+from dsbo.transforms import SimulationTransform
+
 
 class SimulationBase(ABC):
     def __init__(self, workdir: str, **kwargs) -> None:
@@ -18,7 +22,7 @@ class SimulationBase(ABC):
             os.makedirs(self._simulation_dir, exist_ok=False)
 
     @abstractmethod
-    def simulate(self, design: dict) -> None:
+    def simulate(self, design: dict, suffix: Optional[str] = None) -> None:
         pass
 
     def remove_simulation_files(self) -> None:
@@ -41,3 +45,44 @@ class SimulationContainerWrapperBase(SimulationBase, ContainerWrapperBase):
     def call_container(self, arguments: list, is_exec: bool = False) -> None:
         if is_exec: super().exec_container(arguments)
         else: super().run_container(arguments)
+
+
+class DaskSimulationWrapper(SimulationBase):
+    def __init__(self, base_simulation: SimulationBase, n_simulations, n_workers: int, 
+                threads_per_worker: int, merge_function: SimulationTransform) -> None:
+        
+        super().__init__(workdir=base_simulation.workdir)
+
+        assert n_simulations > 1, "n_simulations must be greater than 1"
+        assert n_workers >= 1, "n_workers must be at least 1"
+        assert threads_per_worker >= 1, "threads_per_worker must be at least 1"
+        assert not isinstance(base_simulation, DaskSimulationWrapper), "Nested DaskSimulationWrapper is not allowed."
+
+        self.base_simulation = base_simulation
+        self.merge_function = merge_function
+        self.n_simulations = n_simulations
+
+        self.cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker,
+                                    dashboard_address=None, processes=True)
+        self.client = Client(self.cluster)
+
+    def simulate(self, design_parameters: dict) -> str:
+        futures: List[dask.distributed.Future] = []
+        for i in range(self.n_simulations):
+            future = self.client.submit(self.base_simulation.simulate, design_parameters, str(i))
+            futures.append(future)
+            
+        self.client.gather(futures)
+        self.merge_function(self.base_simulation.simulation_dir)
+    
+    def close(self):
+        if hasattr(self, 'client') and self.client:
+            self.client.close()
+        if hasattr(self, 'cluster') and self.cluster:
+            self.cluster.close()
+    
+    def __del__(self):
+        try:
+            self.close()
+        except:
+            pass

@@ -1,6 +1,7 @@
 # flake8: noqa: E402
 import os
 import pathlib
+import pickle
 import sys
 import numpy as np
 from typing import Union
@@ -38,7 +39,7 @@ def train(
     model_path: Union[str, os.PathLike],
 ):
     print(input_df_path, output_df_path, model_path)
-    simulation_df: pd.DataFrame = pd.read_parquet(input_df_path)
+    simulation_df: pd.DataFrame = pd.read_parquet(input_df_path, engine='fastparquet')
     isval = False
 
     if isVal:
