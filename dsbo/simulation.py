@@ -1,9 +1,10 @@
-from collections.abc import Sequence
 import os
 import shutil
-from abc import ABC, abstractmethod
-from typing import List, Optional
+from uuid import uuid4
 import dask.distributed
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from typing import List, Optional
 from dask.distributed import Client, LocalCluster
 
 from dsbo.utils import ContainerWrapperBase
@@ -56,7 +57,7 @@ class DaskSimulationWrapper(SimulationBase):
         assert n_simulations > 1, "n_simulations must be greater than 1"
         assert n_workers >= 1, "n_workers must be at least 1"
         assert threads_per_worker >= 1, "threads_per_worker must be at least 1"
-        assert not isinstance(base_simulation, DaskSimulationWrapper), "Nested DaskSimulationWrapper is not allowed."
+        assert not isinstance(base_simulation, DaskSimulationWrapper), "Nested DaskSimulationWrapper are not allowed."
 
         self.base_simulation = base_simulation
         self.merge_function = merge_function
@@ -66,7 +67,7 @@ class DaskSimulationWrapper(SimulationBase):
                                     dashboard_address=None, processes=True)
         self.client = Client(self.cluster)
 
-    def simulate(self, design_parameters: dict) -> str:
+    def simulate(self, design_parameters: dict) -> None:
         futures: List[dask.distributed.Future] = []
         for i in range(self.n_simulations):
             future = self.client.submit(self.base_simulation.simulate, design_parameters, str(i))
