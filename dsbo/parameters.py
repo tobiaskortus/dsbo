@@ -51,8 +51,9 @@ class VectorDesignParameter(CompositeDesignParameter):
 
 
 class ValueRegistry:
-    def __init__(self, registry: Optional[dict] = None) -> None:
+    def __init__(self, registry: Optional[dict] = None, design: Optional[Union[CompositeDesignParameter, DesignParameter]] = None) -> None:
         object.__setattr__(self, '_registry', registry if registry is not None else {})
+        object.__setattr__(self, '_design', design)
     
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("ValueRegistry is immutable")
@@ -73,7 +74,7 @@ class ValueRegistry:
         if transform:
             sampled_values = transform(sampled_values)
         
-        return cls(sampled_values)
+        return cls(sampled_values, design)
     
     @classmethod
     def sample_batch(cls, design: Union[CompositeDesignParameter, DesignParameter],
@@ -81,6 +82,65 @@ class ValueRegistry:
                      batch_size: int) -> Sequence['ValueRegistry']:
         return [cls.sample_from(design, sampler_callback) for _ in range(batch_size)]
     
+    @classmethod
+    def from_design_vector(cls, design: Union[CompositeDesignParameter, DesignParameter],
+                           design_vector: Sequence[float],
+                           one_hot_categorical: bool = True) -> 'ValueRegistry':
+
+        design_vector = list(design_vector)
+        index = 0
+        
+        def _assign_recursive(param: DesignParameter) -> Any:
+            nonlocal index
+            
+            if isinstance(param, CompositeDesignParameter):
+                return {p.name: _assign_recursive(p) for p in param.parameters}
+            elif isinstance(param, CategoricalDesignParameter) and one_hot_categorical:
+                num_choices = len(param.choices)
+                one_hot = design_vector[index:index + num_choices]
+                index += num_choices
+                
+                if len(one_hot) < num_choices:
+                    raise ValueError(f"Insufficient vector length for one-hot encoding of {param.name}")
+                
+                choice_idx = int(np.argmax(one_hot))
+                return param.choices[choice_idx]
+            else:
+                value = design_vector[index]
+                index += 1
+                return value
+        
+        structured_values = _assign_recursive(design)
+        
+        if index != len(design_vector):
+            raise ValueError(f"Design vector length mismatch: expected {index} elements, got {len(design_vector)}")
+        
+        return cls(structured_values, design)
+    
+
+    def to_design_vector(self, one_hot_categorical: bool = True) -> list:
+        def _flatten(param: Optional[DesignParameter], value: Any) -> list:
+            if isinstance(value, dict):
+                result = []
+                if param and isinstance(param, CompositeDesignParameter):
+                    for p in param.parameters:
+                        result.extend(_flatten(p, value[p.name]))
+                else:
+                    for v in value.values():
+                        result.extend(_flatten(None, v))
+                return result
+            
+            if one_hot_categorical and param and isinstance(param, CategoricalDesignParameter):
+                one_hot = [0.0] * len(param.choices)
+                choice_idx = param.choices.index(value)
+                one_hot[choice_idx] = 1.0
+                return one_hot
+            
+            return [value]
+        
+        return _flatten(self._design, self._registry)
+    
+
     def to_dict(self, flatten: bool = True) -> dict:
         if not flatten:
             import copy
