@@ -10,6 +10,9 @@ class ConstraintBase(ABC):
 
     def binary(self, c: Sequence[float]) -> Sequence[float]:
         return tuple(min(1.0, max(0.0, v)) for v in c)
+    
+    def __repr__(self) -> str:
+        return self.__class__.__name__
 
 
 class GeometryConstraintBase(ConstraintBase):
