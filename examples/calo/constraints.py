@@ -1,5 +1,4 @@
 from dsbo.constraints import GeometryConstraintBase
-from examples.calo.optimize import CaloDesignParameterization
 
 
 class G4CaloCostConstraint(GeometryConstraintBase):
