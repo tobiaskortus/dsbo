@@ -55,7 +55,6 @@ class DataFrameMergeTransform(SimulationTransform):
         self.pattern = pattern
 
     def __call__(self, simulation_dir: str) -> str:
-        print(simulation_dir)
         simulation_files = Path(simulation_dir).glob(self.pattern)
         simulation_dfs = []
         for simulation_file in simulation_files:
