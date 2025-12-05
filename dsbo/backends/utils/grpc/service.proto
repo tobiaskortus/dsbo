@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+service RoDeOCallbackService {
+    rpc EvaluateGeometryConstraints (DesignVector) returns (ConstraintValues);
+    rpc EvaluateObjective (DesignVector) returns (ObjectiveValues);
+}
+
+message DesignVector {
+    repeated double values = 1;
+}
+
+message ConstraintValues {
+    repeated double values = 1;
+}
+
+message ObjectiveValues {
+    repeated double value = 1;
+}
