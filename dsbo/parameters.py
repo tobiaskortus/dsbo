@@ -2,18 +2,34 @@ import numpy as np
 from abc import abstractmethod
 from dataclasses import dataclass
 from collections.abc import Callable
-from typing import Any, Callable, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Generator, Optional, Sequence, Tuple, Union
 
 
 class DesignParameter:
     def __init__(self, name: str) -> None:
         self.name: str = name
 
+    def iterate_flatten(self) -> Generator['DesignParameter', None, None]:
+        yield self
+    
+    def num_parameters(self, one_hot_categorical: bool = True) -> int:
+        return 1
+
 
 class CompositeDesignParameter(DesignParameter):
     def __init__(self, name: str, parameters: Sequence[DesignParameter]) -> None:
         super().__init__(name)
         self._parameters = parameters
+
+    def iterate_flatten(self) -> Generator['DesignParameter', None, None]:
+        for param in self._parameters:
+            if isinstance(param, CompositeDesignParameter):
+                yield from param.iterate_flatten()
+            else:
+                yield param
+
+    def num_parameters(self, one_hot_categorical: bool = True) -> int:
+        return sum(p.num_parameters(one_hot_categorical) for p in self._parameters)
 
     def __repr__(self) -> str:
         return f"CompositeDesignParameter(name={self.name}, parameters={self._parameters})"
@@ -36,6 +52,9 @@ class CategoricalDesignParameter(DesignParameter):
     def __init__(self, name: str, choices: Sequence[Any]) -> None:
         super().__init__(name)
         self.choices = choices
+
+    def num_parameters(self, one_hot_categorical: bool = True) -> int:
+        return len(self.choices) if one_hot_categorical else 1
 
     def __repr__(self) -> str:
         return f"ContinuousDesignParameter(name={self.name}, choices={self.choices})"
