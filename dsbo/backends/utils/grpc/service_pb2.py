@@ -24,19 +24,21 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rservice.proto\"\x1e\n\x0c\x44\x65signVector\x12\x0e\n\x06values\x18\x01 \x03(\x01\"\"\n\x10\x43onstraintValues\x12\x0e\n\x06values\x18\x01 \x03(\x01\" \n\x0fObjectiveValues\x12\r\n\x05value\x18\x01 \x03(\x01\x32\x8d\x01\n\x14RoDeOCallbackService\x12?\n\x1b\x45valuateGeometryConstraints\x12\r.DesignVector\x1a\x11.ConstraintValues\x12\x34\n\x11\x45valuateObjective\x12\r.DesignVector\x1a\x10.ObjectiveValuesb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rservice.proto\"R\n\x11\x43onstraintRequest\x12$\n\rdesign_vector\x18\x01 \x01(\x0b\x32\r.DesignVector\x12\x17\n\x0f\x63onstraint_name\x18\x02 \x01(\t\"\x1e\n\x0c\x44\x65signVector\x12\x0e\n\x06values\x18\x01 \x03(\x01\"\"\n\x10\x43onstraintValues\x12\x0e\n\x06values\x18\x01 \x03(\x01\" \n\x0fObjectiveValues\x12\r\n\x05value\x18\x01 \x03(\x01\x32\x92\x01\n\x14RoDeOCallbackService\x12\x44\n\x1b\x45valuateGeometryConstraints\x12\x12.ConstraintRequest\x1a\x11.ConstraintValues\x12\x34\n\x11\x45valuateObjective\x12\r.DesignVector\x1a\x10.ObjectiveValuesb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'service_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_DESIGNVECTOR']._serialized_start=17
-  _globals['_DESIGNVECTOR']._serialized_end=47
-  _globals['_CONSTRAINTVALUES']._serialized_start=49
-  _globals['_CONSTRAINTVALUES']._serialized_end=83
-  _globals['_OBJECTIVEVALUES']._serialized_start=85
-  _globals['_OBJECTIVEVALUES']._serialized_end=117
-  _globals['_RODEOCALLBACKSERVICE']._serialized_start=120
-  _globals['_RODEOCALLBACKSERVICE']._serialized_end=261
+  _globals['_CONSTRAINTREQUEST']._serialized_start=17
+  _globals['_CONSTRAINTREQUEST']._serialized_end=99
+  _globals['_DESIGNVECTOR']._serialized_start=101
+  _globals['_DESIGNVECTOR']._serialized_end=131
+  _globals['_CONSTRAINTVALUES']._serialized_start=133
+  _globals['_CONSTRAINTVALUES']._serialized_end=167
+  _globals['_OBJECTIVEVALUES']._serialized_start=169
+  _globals['_OBJECTIVEVALUES']._serialized_end=201
+  _globals['_RODEOCALLBACKSERVICE']._serialized_start=204
+  _globals['_RODEOCALLBACKSERVICE']._serialized_end=350
 # @@protoc_insertion_point(module_scope)

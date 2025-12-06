@@ -8,7 +8,7 @@ from dsbo.backends.utils.grpc import service_pb2, service_pb2_grpc
 class RoDeOCallbackServicer(service_pb2_grpc.RoDeOCallbackServiceServicer):
     def __init__(self, 
                  objective_callback: Callable[[list], list],
-                 constraint_callback: Optional[Callable[[list], list]] = None):
+                 constraint_callback: Optional[Callable[[list, str], list]] = None):
         self.objective_callback = objective_callback
         self.constraint_callback = constraint_callback
     
@@ -21,15 +21,16 @@ class RoDeOCallbackServicer(service_pb2_grpc.RoDeOCallbackServiceServicer):
         if self.constraint_callback is None:
             return service_pb2.ConstraintValues(values=[])
         
-        design_vector = list(request.values)
-        constraint_values = self.constraint_callback(design_vector)
+        design_vector = list(request.design_vector.values)
+        constraint_name = request.constraint_name
+        constraint_values = self.constraint_callback(design_vector, constraint_name)
         return service_pb2.ConstraintValues(values=constraint_values)
 
 
 class GrpcServer:
     def __init__(self, 
                  objective_callback: Callable[[list], list],
-                 constraint_callback: Optional[Callable[[list], list]] = None,
+                 constraint_callback: Optional[Callable[[list, str], list]] = None,
                  address: str = "localhost:50051",
                  max_workers: int = 10):
         

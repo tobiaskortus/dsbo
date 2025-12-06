@@ -36,7 +36,7 @@ class RoDeOCallbackServiceStub(object):
         """
         self.EvaluateGeometryConstraints = channel.unary_unary(
                 '/RoDeOCallbackService/EvaluateGeometryConstraints',
-                request_serializer=service__pb2.DesignVector.SerializeToString,
+                request_serializer=service__pb2.ConstraintRequest.SerializeToString,
                 response_deserializer=service__pb2.ConstraintValues.FromString,
                 _registered_method=True)
         self.EvaluateObjective = channel.unary_unary(
@@ -66,7 +66,7 @@ def add_RoDeOCallbackServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'EvaluateGeometryConstraints': grpc.unary_unary_rpc_method_handler(
                     servicer.EvaluateGeometryConstraints,
-                    request_deserializer=service__pb2.DesignVector.FromString,
+                    request_deserializer=service__pb2.ConstraintRequest.FromString,
                     response_serializer=service__pb2.ConstraintValues.SerializeToString,
             ),
             'EvaluateObjective': grpc.unary_unary_rpc_method_handler(
@@ -100,7 +100,7 @@ class RoDeOCallbackService(object):
             request,
             target,
             '/RoDeOCallbackService/EvaluateGeometryConstraints',
-            service__pb2.DesignVector.SerializeToString,
+            service__pb2.ConstraintRequest.SerializeToString,
             service__pb2.ConstraintValues.FromString,
             options,
             channel_credentials,

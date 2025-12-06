@@ -16,8 +16,9 @@ class GRPCClient:
         response = self.stub.EvaluateObjective(request)
         return list(response.value)
     
-    def evaluate_constraints(self, design_vector: List[float]) -> List[float]:
-        request = service_pb2.DesignVector(values=design_vector)
+    def evaluate_constraints(self, design_vector: List[float], constraint_name: str = "") -> List[float]:
+        dv = service_pb2.DesignVector(values=design_vector)
+        request = service_pb2.ConstraintRequest(design_vector=dv, constraint_name=constraint_name)
         response = self.stub.EvaluateGeometryConstraints(request)
         return list(response.values)
     
@@ -40,18 +41,21 @@ if __name__ == "__main__":
     sys.path.insert(0, str(project_root))
 
     argparse = ArgumentParser()
-    argparse.add_argument("-w", "--workdir", type=str, default="/scratch/nyl93mev/dsbo/files/run_rodeo_0/rodeo") #required=True
-    #argparse.add_argument("-q", "--query", type=str, required=True)
-    #argparse.add_argument("-a", "--address", type=str, default="localhost:50051")
+    argparse.add_argument("-w", "--workdir", type=str, required=True)
+    argparse.add_argument("-q", "--query",   type=str, required=True)
+    argparse.add_argument("-a", "--address", type=str, default="localhost:50051")
 
     args = argparse.parse_args()
 
     with open(os.path.join(args.workdir, 'dv.dat'), "r") as f:
-        design = list(map(float, f.readlines()))      
+        design = list(map(float, f.readlines()))
 
-    with GRPCClient("localhost:50051") as client:
-        objective = client.evaluate_objective(design)
-
-        with open(os.path.join(args.workdir, 'objective.dat'), "w") as f:
-            f.write(f"{float(objective[0])}")
-        
+    with GRPCClient(args.address) as client:
+        if args.query == "objective":
+            objective = client.evaluate_objective(design)
+            with open(os.path.join(args.workdir, 'objective.dat'), "w") as f:
+                f.write(f"{float(objective[0])}\n")
+        else:
+            constraints = client.evaluate_constraints(design, args.query)
+            with open(os.path.join(args.workdir, f'constraints_{args.query}.dat'), "w") as f:
+                f.write(f"{float(constraints[0])}\n")

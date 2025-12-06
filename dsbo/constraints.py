@@ -33,6 +33,10 @@ class MultiConstraint(GeometryConstraintBase):
         assert not any(isinstance(c, MultiConstraint) for c in constraints), "Nested MultiConstraint is not supported"
         super().__init__(binary=False) #Just propopagate the output of the individual constraints
         self.constraints = constraints
+        self.lookup = {str(c): c for c in constraints}
 
     def evaluate(self, design: dict) -> Sequence[float]:
         return tuple(v for c in self.constraints for v in c(design))
+    
+    def get_by_name(self, name: str) -> GeometryConstraintBase:
+        return self.lookup[name]
