@@ -57,7 +57,7 @@ class G4CaloSimulation(SimulationContainerWrapperBase):
         with open(design_path, "w") as f:
             json.dump(design, f)
 
-        args = python_script_args("examples/calo_multitask/container_scripts/simulation.py", [design_path, simulation_path])
+        args = python_script_args("examples/calo_multiobjective/container_scripts/simulation.py", [design_path, simulation_path])
         super().call_container(args, True)
 
 
