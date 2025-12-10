@@ -45,7 +45,7 @@ class DaskSlurmWorker:
         self.cluster = SLURMCluster(cores=1, memory=worker_config.memory, 
                     walltime=worker_config.walltime, worker_extra_args=worker_extra_args,
                     job_extra_directives=job_extra_directives, log_directory=logdir, 
-                    processes=1, job_cpu=8)
+                    processes=1, job_cpu=worker_config.job_cpu)
         
         self.cluster.scale(n_worker)
         self.client = Client(self.cluster)
