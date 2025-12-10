@@ -11,7 +11,7 @@ from dsbo.workflow import Workflow
 
 @dataclass
 class SlurmWorkerConfig:
-    walltime: str = "1:00:00"
+    walltime: str = "48:00:00"
     memory: str = "32GB"
     processes: int = 1
     job_cpu: int = 10
