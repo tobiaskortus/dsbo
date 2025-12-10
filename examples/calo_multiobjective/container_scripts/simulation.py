@@ -81,7 +81,7 @@ class Simulation():
                 minEnergy_GeV=self.minEnergy_GeV*sum(Ns) if not self.sharedEnergy else self.minEnergy_GeV,
                 maxEnergy_GeV=self.maxEnergy_GeV*sum(Ns) if not self.sharedEnergy else self.maxEnergy_GeV,
                 no_mp=True,
-                manual_seed=42,
+                manual_seed=random.randint(1, 1e6),
             )
             mfs.append(mf)
             for j in range(len(Ns)):

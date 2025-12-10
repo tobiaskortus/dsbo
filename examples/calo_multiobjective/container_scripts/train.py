@@ -3,7 +3,7 @@ import os
 import pickle
 import pathlib
 import sys
-from typing import Union
+from typing import Optional, Union
 from sklearn.model_selection import train_test_split
 
 
@@ -19,7 +19,7 @@ from reconstruction.model import Reconstruction
 from reconstruction.validation_reconstruction import ReconstructionValidation
 from classification.dataset import ClassificationDataset
 from classification.dataset import FlipAugmentation, RotationAugmentation, ShiftAugmentation
-from classification.model import Classification
+from classification.model import Classification, Classification2
 from classification.validation_classification import ClassificationValidation
 
 
@@ -120,6 +120,7 @@ def train(
     output_df_path: Union[str, os.PathLike],
     isVal: bool,
     model_path: Union[str, os.PathLike],
+    results_dir: Optional[Union[str, os.PathLike]] = None,
 ):  
     #iteration = int(re.search(r"iteration=(\d+)", input_mf_path).group(1))
     print (f'Loading {input_mf_path}')
@@ -211,9 +212,12 @@ def train(
         torch.save(reco_model, reco_model_previous_path)
 
         reco_validator = ReconstructionValidation(reco_model)
-        #train_loss = reco_validator.validate(reco_train_dataset)
-        val_loss_reco = reco_validator.validate(reco_valid_dataset)
+        train_dict_reco, train_loss_reco = reco_validator.validate(reco_train_dataset)
+        val_dict_reco, val_loss_reco = reco_validator.validate(reco_valid_dataset)
 
+        del reco_train_dataset
+        del reco_valid_dataset
+        del reco_model
         #reco_loss_plotter.plot(
         #    os.path.join(
         #        results_dir,
@@ -251,13 +255,14 @@ def train(
         class_model_previous_path = os.path.join(model_path, "class.pt")
         class_loss_plotter = LossPlotting()
         class_early_stopping = EarlyStopping(patience=config["classification"]["early_stopping"])
+        
 
         #class_weights = torch.tensor([1.,1.,10.,10.])
 
 
         if os.path.exists(class_model_previous_path):
             print ('Loading class model')
-            class_model: Classification = torch.load(class_model_previous_path,weights_only=False)
+            class_model: Classification2 = torch.load(class_model_previous_path,weights_only=False)
             print (class_model)
             print("Parameters:", sum([p.numel() for p in class_model.parameters()]))
             print ('Creating class dataset')
@@ -298,7 +303,7 @@ def train(
                 stds = class_train_dataset.stds,
             )
             print ('Creating class model')
-            class_model = Classification(
+            class_model = Classification2(
                 *class_train_dataset.shape,
                 initial_means = class_train_dataset.means,
                 initial_stds = class_train_dataset.stds,
@@ -335,46 +340,40 @@ def train(
         torch.save(class_model, class_model_previous_path)
 
         class_validator = ClassificationValidation(class_model)
-        #train_loss = class_validator.validate(class_train_dataset)
-        val_loss_class = class_validator.validate(class_valid_dataset)
+        train_dict_class, train_loss_class = class_validator.validate(class_train_dataset)
+        val_dict_class, val_loss_class = class_validator.validate(class_valid_dataset)
         print("Finished")
 
+        if results_dir is not None:
 
-        #class_loss_plotter.plot(
-        #    os.path.join(
-        #        results_dir,
-        #        "plots",
-        #        "validation",
-        #        "class_model",
-        #        "losses",
-        #        f"loss_{iteration}.png",
-        #    )
-        #)
-        #class_validator.plot(
-        #    class_train_mf,
-        #    os.path.join(
-        #        results_dir,
-        #        "plots",
-        #        "validation",
-        #        "class_model",
-        #        "on_trainingData",
-        #        f"validation_{iteration}.png",
-        #    )
-        #)
-        #class_validator.plot(
-        #    class_valid_mf,
-        #    os.path.join(
-        #        results_dir,
-        #        "plots",
-        #        "validation",
-        #        "class_model",
-        #        "on_validationData",
-        #        f"validation_{iteration}.png",
-        #    )
-        #)
+            os.makedirs(os.path.join(results_dir,"plots"), exist_ok=True)
+
+            class_loss_plotter.plot(
+                os.path.join(
+                    results_dir,
+                    "plots",
+                    f"loss.png",
+                )
+            )
+            class_validator.plot(
+                train_dict_class,
+                os.path.join(
+                    results_dir,
+                    "plots",
+                    f"validation_train.png",
+                )
+            )
+            class_validator.plot(
+                val_dict_class,
+                os.path.join(
+                    results_dir,
+                    "plots",
+                    f"validation_val.png",
+                )
+            )
 
         val_losses = np.array([val_loss_reco, val_loss_class])
-        np.savetxt(os.path.join(output_df_path, "val_losses.npy"), val_losses)
+        np.savetxt(output_df_path, val_losses)
 
         # Combined mf for surrogate task #
         #reco_mf = super_concat([reco_train_mf,reco_valid_mf])
@@ -393,4 +392,6 @@ if __name__ == "__main__":
     output_mf_path = sys.argv[2]
     isVal = sys.argv[3].strip().lower() == "true"
     model_path = sys.argv[4]
-    train(input_mf_path, output_mf_path, isVal, model_path)
+    results_dir = sys.argv[5] if len(sys.argv) > 5 else None
+
+    train(input_mf_path, output_mf_path, isVal, model_path, results_dir)

@@ -44,13 +44,12 @@ class ReconstructionValidation():
             batch_size (int): Batch size for validation
         """
         val_result, val_losses, val_loss = self.reco_model.apply_model_in_batches(val_dataset, batch_size=batch_size)
-        #output_mf = deepcopy(val_dataset.mf)
-        #del output_mf._data['Inputs']
+        output_dict = deepcopy(val_dataset.input_data)
+        del output_dict['Inputs']
 
-        #reco_mf = MiniFrame({"true_energy": val_result})
-        #output_mf.add('Reconstructed',reco_mf)
-        #output_mf.add('Loss',MiniFrame({'Reco_loss':val_loss}))
-        return val_loss
+        output_dict.update({'Reconstructed': {"true_energy": val_result}})
+        output_dict.update({'Loss': {"Reco_loss": val_loss}})
+        return output_dict, val_loss
 
     @classmethod
     def plot(cls, validation_df: pd.DataFrame, fig_savepath: Union[str, None]) -> None:

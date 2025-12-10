@@ -46,6 +46,17 @@ class ClassificationValidation():
         """
         val_dataset.augmentations = []
         val_result, val_losses, val_loss = self.class_model.apply_model_in_batches(val_dataset, batch_size=batch_size)
+        output_dict = deepcopy(val_dataset.input_data)
+        del output_dict['Inputs']
+
+        output_dict.update({"Reconstructed":
+            {f"true_logits_{i}": val_result[:,i]
+            for i in range(val_result.shape[-1])}
+        })
+
+        output_dict.update({"Loss":
+            {"Class_loss": val_losses}
+        })
         #output_mf = deepcopy(val_dataset.mf)
         #del output_mf._data['Inputs']
 
@@ -57,7 +68,7 @@ class ClassificationValidation():
         #)
         #output_mf.add('Reconstructed',reco_mf)
         #output_mf.add('Loss',MiniFrame({'Class_loss':val_loss}))
-        return val_loss
+        return output_dict, val_loss
 
     @classmethod
     def plot(cls, validation_mf: pd.DataFrame, fig_savepath: Union[str, None]) -> None:
