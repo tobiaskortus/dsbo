@@ -1,9 +1,14 @@
 import optuna
-from typing import Any, Optional, Callable, Sequence
+from torch import seed
+from typing import Any, Optional, Callable, Sequence, Union
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
 
 from dsbo.workflow import Workflow
+from dsbo.worker import DaskSlurmWorker
 from dsbo.parameters import ValueRegistry
 from dsbo.constraints import GeometryConstraintBase
+from dsbo.objectives import Objective, check_objective_vals, is_single_objective
 from dsbo.parameters import DesignParameter, CompositeDesignParameter, ContinuousDesignParameter, CategoricalDesignParameter
 
 
@@ -20,34 +25,60 @@ def get_optuna_sampler_callback(trial: optuna.Trial) -> Callable[[DesignParamete
     
     return callback
 
+def get_directions(objective: Union[Objective, Sequence[Objective]]) -> Sequence[str]:
+    if isinstance(objective, Objective):
+        return ["minimize" if objective.minimize else "maximize"]
+    else:
+        return ["minimize" if obj.minimize else "maximize" for obj in objective]
+
+class TrialFailedError(Exception):
+    pass
+
 
 class OptunaBackend:
     def __init__(self, study_name: str, workflow: Workflow, design: CompositeDesignParameter, 
-                 constraint: Optional[GeometryConstraintBase], seed: int = 42) -> None:
+                 constraint: Optional[GeometryConstraintBase], objective: Union[Objective, Sequence[Objective]],
+                 worker: Optional[DaskSlurmWorker] = None,
+                 seed: int = 42) -> None:
+        
+        self.seed = seed
         self.design = design
+        self.worker = worker
         self.workflow = workflow
+        self.objective = objective
         self.constraint = constraint
         self.study_name = study_name
         constraint_fn = self.constraint_fn if self.constraint is not None else None
-        self.sampler = optuna.samplers.TPESampler(constraints_func=constraint_fn, seed=seed)
+        self.sampler = optuna.samplers.TPESampler(n_startup_trials=10, constraints_func=constraint_fn, seed=seed)
 
-    def sample_and_evaluate(self, trial: optuna.trial.Trial) -> float:
+    def sample_and_evaluate(self, trial: optuna.trial.Trial) -> Union[float, Sequence[float]]:
         sampler_callback = get_optuna_sampler_callback(trial)
         sampled_design = ValueRegistry.sample_from(self.design, sampler_callback)
-
-        objective_val = self.workflow.run(sampled_design.to_dict(flatten=True))
         
-        if self.constraint is not None:
-            trial.set_user_attr("constraint", self.constraint(sampled_design.to_dict(flatten=True)))
+        try:
+            objective_val = self.workflow.run(sampled_design.to_dict(flatten=True))\
+                  if self.worker is None\
+                      else self.worker.submit(self.workflow, sampled_design.to_dict(flatten=True), trial.number).result()
+            
+            #Assert that returned objective values matches the expected objective structure
+            check_objective_vals(objective_val, self.objective)
+            
+            if self.constraint is not None:
+                trial.set_user_attr("constraint", self.constraint(sampled_design.to_dict(flatten=True)))
 
-        return objective_val[0]
+            return objective_val[0] if is_single_objective(self.objective) else objective_val
+        except Exception as e:
+            print(f"Trial {trial.number} failed with error: {e}")
+            raise TrialFailedError()
     
     def constraint_fn(self, trial: optuna.trial.FrozenTrial) -> Sequence[float]:
         return trial.user_attrs["constraint"]
 
     def optimize(self, n_trials: int = 10):
-        storage = f"sqlite:///{self.study_name}.db"
-        study = optuna.create_study(study_name=self.study_name, storage=storage, sampler=self.sampler, 
-                                    load_if_exists=False,  directions=["minimize"])
-
-        study.optimize(self.sample_and_evaluate, n_trials=n_trials)
+        #storage = f"sqlite:///{self.study_name}_{self.seed}.db"
+        storage = JournalStorage(JournalFileBackend(f"{self.study_name}_{self.seed}.log"))
+        study = optuna.create_study(study_name=f"{self.study_name}_{self.seed}", storage=storage, sampler=self.sampler, 
+                                    load_if_exists=False, directions=get_directions(self.objective),)
+    
+        n_jobs = self.worker.n_worker if self.worker is not None else 1
+        study.optimize(self.sample_and_evaluate, n_trials=n_trials, catch=(TrialFailedError,), n_jobs=n_jobs)

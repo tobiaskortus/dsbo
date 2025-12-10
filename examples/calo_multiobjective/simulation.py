@@ -15,10 +15,10 @@ class G4CaloSimulation(SimulationContainerWrapperBase):
     def __init__(self, workdir: str, container_path: str, container_extra_flags: Optional[str] = ""):
         super().__init__(workdir, container_path, container_extra_flags)
 
-    def simulate(self, design: dict, suffix: Optional[str] = None) -> None:
+    def simulate(self, design: dict, suffix: Optional[str] = None, trial_id: Optional[int] = None) -> None:
         suffix_str = f"_{suffix}" if suffix else ""
         # Make design file unique per worker to avoid race conditions
-        design_path = os.path.join(self._workdir, f"design{suffix_str}.json")
+        design_path = os.path.join(self.workdir, f"design{suffix_str}.json")
         simulation_path = os.path.join(self.simulation_dir, f"output_df{suffix_str}.npy")
 
         extra_args = {
