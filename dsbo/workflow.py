@@ -16,7 +16,7 @@ class Workflow:
         self.reconstruction = reconstruction
 
     def run(self, design: dict, trial_id: Optional[int] = None) -> Sequence[float]:
-        self.simulation.simulate(design)
+        self.simulation.simulate(design, trial_id=trial_id)
 
         if self.postprocessing is not None:
             self.postprocessing(self.simulation.simulation_dir)
