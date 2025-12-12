@@ -1,3 +1,4 @@
+import time
 from typing import Optional
 from typing import Sequence
 
@@ -16,6 +17,7 @@ class Workflow:
         self.reconstruction = reconstruction
 
     def run(self, design: dict, trial_id: Optional[int] = None) -> Sequence[float]:
+        
         self.simulation.simulate(design, trial_id=trial_id)
 
         if self.postprocessing is not None:
@@ -23,6 +25,8 @@ class Workflow:
             
         self.reconstruction.train(self.simulation.simulation_dir, trial_id)
         objective_vals = self.reconstruction.validate(self.simulation.simulation_dir, trial_id)
+
+        self.simulation.remove_simulation_files()
 
         assert isinstance(objective_vals, Sequence), "Objective must be a sequence of floats."
         return objective_vals
