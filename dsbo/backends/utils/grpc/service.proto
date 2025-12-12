@@ -1,8 +1,13 @@
 syntax = "proto3";
 
 service RoDeOCallbackService {
-    rpc EvaluateGeometryConstraints (DesignVector) returns (ConstraintValues);
+    rpc EvaluateGeometryConstraints (ConstraintRequest) returns (ConstraintValues);
     rpc EvaluateObjective (DesignVector) returns (ObjectiveValues);
+}
+
+message ConstraintRequest {
+    DesignVector design_vector = 1;
+    string constraint_name = 2;
 }
 
 message DesignVector {
