@@ -17,8 +17,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-optuna = ["optuna"]
-all = ["optuna"]
+optuna = [
+    "optuna",
+    optuna-integration[botorch]
+]
+
+all = [
+    "optuna",
+    optuna-integration[botorch]
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
