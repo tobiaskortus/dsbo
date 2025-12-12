@@ -218,38 +218,33 @@ def train(
         del reco_train_dataset
         del reco_valid_dataset
         del reco_model
-        #reco_loss_plotter.plot(
-        #    os.path.join(
-        #        results_dir,
-        #        "plots",
-        #        "validation",
-        #        "reco_model",
-        #        "losses",
-        #        f"loss_{iteration}.png",
-        #    )
-        #)
-        #reco_validator.plot(
-        #    reco_train_mf,
-        #    os.path.join(
-        #        results_dir,
-        #        "plots",
-        #        "validation",
-        #        "reco_model",
-        #        "on_trainingData",
-        #        f"validation_{iteration}.png",
-        #    )
-        #)
-        #reco_validator.plot(
-        #    reco_valid_mf,
-        #    os.path.join(
-        #        results_dir,
-        #        "plots",
-        #        "validation",
-        #        "reco_model",
-        #        "on_validationData",
-        #        f"validation_{iteration}.png",
-        #    )
-        #)
+        
+        if results_dir is not None:
+            os.makedirs(os.path.join(results_dir,"plots"), exist_ok=True)
+
+        reco_loss_plotter.plot(
+            os.path.join(
+                results_dir,
+                "plots",
+                "loss_reco.png",
+            )
+        )
+        reco_validator.plot(
+            train_dict_reco,
+            os.path.join(
+                results_dir,
+                "plots",
+                f"validation_reco_train.png",
+            )
+        )
+        reco_validator.plot(
+            val_dict_reco,
+            os.path.join(
+                results_dir,
+                "plots",
+                f"validation_reco_val.png",
+            )
+        )
 
         # Classification training:
         class_model_previous_path = os.path.join(model_path, "class.pt")
@@ -344,33 +339,29 @@ def train(
         val_dict_class, val_loss_class = class_validator.validate(class_valid_dataset)
         print("Finished")
 
-        if results_dir is not None:
-
-            os.makedirs(os.path.join(results_dir,"plots"), exist_ok=True)
-
-            class_loss_plotter.plot(
-                os.path.join(
-                    results_dir,
-                    "plots",
-                    f"loss.png",
-                )
+        class_loss_plotter.plot(
+            os.path.join(
+                results_dir,
+                "plots",
+                f"loss_class.png",
             )
-            class_validator.plot(
-                train_dict_class,
-                os.path.join(
-                    results_dir,
-                    "plots",
-                    f"validation_train.png",
-                )
+        )
+        class_validator.plot(
+            train_dict_class,
+            os.path.join(
+                results_dir,
+                "plots",
+                f"validation_class_train.png",
             )
-            class_validator.plot(
-                val_dict_class,
-                os.path.join(
-                    results_dir,
-                    "plots",
-                    f"validation_val.png",
-                )
+        )
+        class_validator.plot(
+            val_dict_class,
+            os.path.join(
+                results_dir,
+                "plots",
+                f"validation_class_val.png",
             )
+        )
 
         val_losses = np.array([val_loss_reco, val_loss_class])
         np.savetxt(output_df_path, val_losses)

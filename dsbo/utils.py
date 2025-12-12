@@ -20,7 +20,7 @@ class ContainerType(Enum):
 
 class ContainerWrapperBase:
     def __init__(self, container_path, container_extra_flags: Optional[str], 
-                 cuda_enabled: bool = False, verbose: bool = True, **kwargs) -> None:
+                 cuda_enabled: bool = False, verbose: bool = False, **kwargs) -> None:
         
         super().__init__(**kwargs)
         self._container_path = container_path

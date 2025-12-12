@@ -12,11 +12,11 @@ from dsbo.objectives import Objective, check_objective_vals, is_single_objective
 from dsbo.parameters import DesignParameter, CompositeDesignParameter, ContinuousDesignParameter, CategoricalDesignParameter
 
 
-def get_optuna_sampler_callback(trial: optuna.Trial) -> Callable[[DesignParameter], Any]:
+def get_optuna_sampler_callback(trial: optuna.Trial, log: bool = False) -> Callable[[DesignParameter], Any]:
     def callback(param: DesignParameter) -> Any:
         match param:
             case ContinuousDesignParameter():
-                return trial.suggest_float(param.name, param.min_value, param.max_value)
+                return trial.suggest_float(param.name, param.min_value, param.max_value, log=log)
             case CategoricalDesignParameter():
                 return trial.suggest_categorical(param.name, param.choices)
             case _:
@@ -49,10 +49,12 @@ class OptunaBackend:
         self.constraint = constraint
         self.study_name = study_name
         constraint_fn = self.constraint_fn if self.constraint is not None else None
-        self.sampler = optuna.samplers.TPESampler(n_startup_trials=10, constraints_func=constraint_fn, seed=seed)
+        #self.sampler = optuna.samplers.TPESampler(n_startup_trials=30, multivariate=True, constant_liar=True,
+        #                                          constraints_func=constraint_fn, seed=seed)
+        self.sampler = optuna.samplers.GPSampler(n_startup_trials=50, constraints_func=constraint_fn, seed=seed)
 
     def sample_and_evaluate(self, trial: optuna.trial.Trial) -> Union[float, Sequence[float]]:
-        sampler_callback = get_optuna_sampler_callback(trial)
+        sampler_callback = get_optuna_sampler_callback(trial, log=True)
         sampled_design = ValueRegistry.sample_from(self.design, sampler_callback)
         
         try:
