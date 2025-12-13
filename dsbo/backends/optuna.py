@@ -1,5 +1,4 @@
 import optuna
-from torch import seed
 from typing import Any, Optional, Callable, Sequence, Union
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
@@ -51,7 +50,8 @@ class OptunaBackend:
         constraint_fn = self.constraint_fn if self.constraint is not None else None
         #self.sampler = optuna.samplers.TPESampler(n_startup_trials=30, multivariate=True, constant_liar=True,
         #                                          constraints_func=constraint_fn, seed=seed)
-        self.sampler = optuna.samplers.GPSampler(n_startup_trials=50, constraints_func=constraint_fn, seed=seed)
+        #self.sampler = optuna.samplers.GPSampler(n_startup_trials=50, constraints_func=constraint_fn, seed=seed)
+        self.sampler = optuna.integration.BoTorchSampler(n_startup_trials=50, constraints_func=constraint_fn, consider_running_trials=True, seed=seed)
 
     def sample_and_evaluate(self, trial: optuna.trial.Trial) -> Union[float, Sequence[float]]:
         sampler_callback = get_optuna_sampler_callback(trial, log=True)
@@ -66,7 +66,7 @@ class OptunaBackend:
             check_objective_vals(objective_val, self.objective)
             
             if self.constraint is not None:
-                trial.set_user_attr("constraint", self.constraint(sampled_design.to_dict(flatten=True)))
+                trial.set_user_attr("constraints", self.constraint(sampled_design.to_dict(flatten=True)))
 
             return objective_val[0] if is_single_objective(self.objective) else objective_val
         except Exception as e:
@@ -74,7 +74,7 @@ class OptunaBackend:
             raise TrialFailedError()
     
     def constraint_fn(self, trial: optuna.trial.FrozenTrial) -> Sequence[float]:
-        return trial.user_attrs["constraint"]
+        return trial.user_attrs["constraints"]
 
     def optimize(self, n_trials: int = 10):
         #storage = f"sqlite:///{self.study_name}_{self.seed}.db"
@@ -83,4 +83,4 @@ class OptunaBackend:
                                     load_if_exists=False, directions=get_directions(self.objective),)
     
         n_jobs = self.worker.n_worker if self.worker is not None else 1
-        study.optimize(self.sample_and_evaluate, n_trials=n_trials, catch=(TrialFailedError,), n_jobs=n_jobs)
+        study.optimize(self.sample_and_evaluate, n_trials=n_trials, catch=(TrialFailedError,), n_jobs=n_jobs, gc_after_trial=True)
