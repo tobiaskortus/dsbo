@@ -12,6 +12,7 @@ dependencies = [
     "numpy",
     "pandas",
     "dask[distributed]",
+    "dask-jobqueue",
     "grpcio",
     "grpcio-tools",
 ]
@@ -19,12 +20,12 @@ dependencies = [
 [project.optional-dependencies]
 optuna = [
     "optuna",
-    optuna-integration[botorch]
+    "optuna-integration[botorch]"
 ]
 
 all = [
     "optuna",
-    optuna-integration[botorch]
+    "optuna-integration[botorch]"
 ]
 
 [tool.setuptools.packages.find]

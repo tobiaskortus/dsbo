@@ -8,8 +8,8 @@ from dsbo.utils import python_script_args
 from dsbo.reconstruction import ReconstructionContainerWrapper
 
 class G4CaloReconstruction(ReconstructionContainerWrapper):
-    def __init__(self, workdir, container_path: str):
-        super().__init__(workdir= workdir, container_path=container_path, cuda_enabled=True)
+    def __init__(self, workdir, container_path: str, **kwargs):
+        super().__init__(workdir= workdir, container_path=container_path, cuda_enabled=True, **kwargs)
         self.script_path = "examples/calo_multiobjective/container_scripts/train.py"
 
     def train(self, simulation_dir: str, trial_id: Optional[int] = None) -> None:
