@@ -1,7 +1,8 @@
 import optuna
-from typing import Any, Optional, Callable, Sequence, Union
 from optuna.storages import JournalStorage
+from optuna.samplers._base import _CONSTRAINTS_KEY
 from optuna.storages.journal import JournalFileBackend
+from typing import Any, Optional, Callable, Sequence, Union
 
 from dsbo.workflow import Workflow
 from dsbo.worker import DaskSlurmWorker
@@ -66,7 +67,7 @@ class OptunaBackend:
             check_objective_vals(objective_val, self.objective)
             
             if self.constraint is not None:
-                trial.set_user_attr("constraints", self.constraint(sampled_design.to_dict(flatten=True)))
+                trial.set_user_attr(_CONSTRAINTS_KEY, self.constraint(sampled_design.to_dict(flatten=True)))
 
             return objective_val[0] if is_single_objective(self.objective) else objective_val
         except Exception as e:
@@ -74,7 +75,7 @@ class OptunaBackend:
             raise TrialFailedError()
     
     def constraint_fn(self, trial: optuna.trial.FrozenTrial) -> Sequence[float]:
-        return trial.user_attrs["constraints"]
+        return trial.user_attrs[_CONSTRAINTS_KEY]
 
     def optimize(self, n_trials: int = 10):
         #storage = f"sqlite:///{self.study_name}_{self.seed}.db"
