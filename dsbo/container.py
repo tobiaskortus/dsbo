@@ -13,6 +13,7 @@ def which_python():
 def python_script_args(script_path: str, args: List[str]):
     return [which_python(), script_path] + args
 
+
 class ContainerType(Enum):
     SINGULARITY = "singularity"
     APPTAINER = "apptainer"
