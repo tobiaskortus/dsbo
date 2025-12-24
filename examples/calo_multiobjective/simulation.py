@@ -2,7 +2,7 @@ from sqlalchemy import false
 from dsbo.simulation import SimulationContainerWrapperBase
 from dsbo.transforms import SimulationTransform, load_df_by_extension
 from dsbo.minipandas import MiniFrame, concat
-from dsbo.utils import python_script_args
+from dsbo.container import python_script_args
 from typing import Optional, List
 import pandas as pd
 import numpy as np
@@ -10,16 +10,16 @@ import pickle
 import json
 import os
 
+from dsbo.utils.io import DefaultPaths, Workdir
+
 
 class G4CaloSimulation(SimulationContainerWrapperBase):
-    def __init__(self, workdir: str, container_path: str, container_extra_flags: Optional[str] = ""):
-        super().__init__(workdir, container_path, container_extra_flags)
+    def __init__(self, container_path: str, container_extra_flags: Optional[str] = ""):
+        super().__init__(container_path, container_extra_flags)
 
-    def simulate(self, design: dict, suffix: Optional[str] = None, trial_id: Optional[int] = None) -> None:
-        suffix_str = f"_{suffix}" if suffix else ""
-        # Make design file unique per worker to avoid race conditions
-        design_path = os.path.join(self.workdir, f"design{suffix_str}.json")
-        simulation_path = os.path.join(self.simulation_dir, f"output_df{suffix_str}.npy")
+    def simulate(self, design: dict) -> None:
+        design_path = os.path.join(self.input_dir(), "design.json")
+        simulation_path = os.path.join(self.output_dir(), "output_df.npy")
 
         extra_args = {
             "num_layers": 5,
@@ -29,14 +29,14 @@ class G4CaloSimulation(SimulationContainerWrapperBase):
             "granularity:2": 25,
             "granularity:3": 25,
             "granularity:4": 25,
-            "N:pi+": {
-                "min_value":0,
-                "max_value":1,
-            },
-            "N:proton":{
-                "min_value":0,
-                "max_value":1,
-            },
+            #"N:pi+": {
+            #    "min_value":0,
+            #    "max_value":1,
+            #},
+            #"N:proton":{
+            #    "min_value":0,
+            #   "max_value":1,
+            #},
             "N:e+":{
                 "min_value":0,
                 "max_value":1,
@@ -49,7 +49,6 @@ class G4CaloSimulation(SimulationContainerWrapperBase):
             "maxEnergy_GeV": 100.0,
             "sharedEnergy": False,
             "exclusiveSimulation": True,
-            
         }
 
         design.update(extra_args)
@@ -66,11 +65,14 @@ class G4CaloSimToReco(SimulationTransform):
         super().__init__()
         self.input_keys = ['sensor_energy', 'sensor_x', 'sensor_y', 'sensor_z', 'sensor_dx', 'sensor_dy', 'sensor_dz', 'sensor_layer']
         self.target_keys = ['true_energy']
-        self.classes_keys = ['contains:e+', 'contains:gamma', 'contains:pi+', 'contains:proton']
+        self.classes_keys = ['contains:e+', 'contains:gamma'] #'contains:pi+', 'contains:proton'
 
-    def __call__(self, simulation_dir: str) -> None:
-        simulation_path = os.path.join(simulation_dir, "output_df.npy")
-        output_path = os.path.join(simulation_dir, "output_df.pkl")
+        self.input_dir = Workdir.register(DefaultPaths.SIMULATION)
+        self.output_dir = Workdir.register(DefaultPaths.SIMULATION)
+
+    def __call__(self, design: dict, **kwargs) -> None:
+        simulation_path = os.path.join(self.input_dir(), "output_df.npy")
+        output_path = os.path.join(self.output_dir(), "output_df.pkl")
 
         df = MiniFrame.read_pickle(simulation_path)
 
