@@ -7,16 +7,16 @@ from dask_jobqueue import SLURMCluster
 from typing import Any, Generator, Optional
 
 
+from dsbo.simulation import DaskSimulationWrapper
 from dsbo.workflow import WorkflowTask
 from dsbo.worker.config import SlurmWorkerConfig
-
 
 
 class DaskWorkerBase:
     def __init__(self):
         pass
 
-    def submit(self, task: WorkflowTask, design: dict, trial_id: Optional[int] = None) -> Future:
+    def submit(self, task: WorkflowTask, design: dict) -> Future:
         raise NotImplementedError("submit method must be implemented by subclasses.")
 
 
@@ -78,11 +78,11 @@ class DaskSlurmWorker(DaskWorkerBase):
 
         self.client = Client(self.cluster)
 
-    def submit(self, task: WorkflowTask, design: dict, trial_id: Optional[int] = None) -> Future: 
-        #if isinstance(workflow.simulation, DaskSimulationWrapper):
-        #    assert workflow.simulation.init_on_demand, "DaskSimulationWrapper inside DaskSlurmWorker must be initialized with init_on_demand=True"
-        
-        return self.client.submit(task.run, design, trial_id)
+    def submit(self, task: WorkflowTask, design: dict) -> Future: 
+        if isinstance(task.task, DaskSimulationWrapper):
+            assert task.task.init_on_demand, "DaskSimulationWrapper inside DaskSlurmWorker must be initialized with init_on_demand=True"
+
+        return self.client.submit(task.run, design)
 
     def __enter__(self):
         return self
@@ -105,7 +105,7 @@ class AdaptiveHeterogenousDaskSlurmWorker(DaskWorkerBase):
             worker.client.close()
             worker.cluster.close()
 
-    def submit(self, task: WorkflowTask, design: dict, trial_id: Optional[int] = None) -> Future:
+    def submit(self, task: WorkflowTask, design: dict) -> Future:
         if task.worker_config is None:
             raise ValueError("Task does not have a worker_config defined.")
         
@@ -115,5 +115,5 @@ class AdaptiveHeterogenousDaskSlurmWorker(DaskWorkerBase):
                 n_worker=self.max_workers, worker_config=task.worker_config, adaptive=True,
                 logdir=os.path.join(self.logdir, self.worker_type))
         
-        return self.workers[task.worker_config].submit(task.run, design=design, trial_id=trial_id)
+        return self.workers[task.worker_config].submit(task, design=design)
         
