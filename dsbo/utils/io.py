@@ -93,24 +93,29 @@ class Workdir(dict):
 
     @classmethod
     def register(cls, path: Union[str, DefaultPaths]) -> Callable[[], str]:
-        def get_workdir_path() -> str:
-            workdir = cls._current_workdir.get()
-            if workdir is None:
-                print("Warning: No current workdir set. Using cwd instead.")
-                return os.path.join(os.getcwd())
-            
-            workdir_path = os.path.join(workdir.root, path)
-            if not os.path.exists(workdir_path):
-                print(f"Path {workdir_path} has not been registered. Creating it once.")
-                os.makedirs(workdir_path, exist_ok=True)
+        class WorkdirPath:
+            def __call__(self, *args, **kwds):
+                workdir = cls._current_workdir.get()
+                if workdir is None:
+                    print("Warning: No current workdir set. Using cwd instead.")
+                    return os.path.join(os.getcwd())
+                
+                workdir_path = os.path.join(workdir.root, path)
+                if not os.path.exists(workdir_path):
+                    print(f"Path {workdir_path} has not been registered. Creating it once.")
+                    os.makedirs(workdir_path, exist_ok=True)
 
-            return workdir_path
-        
+                return workdir_path
+
+            @property
+            def name(self) -> str:
+                return path
+            
         if isinstance(path, DefaultPaths):
             path = path.value
             
         cls._registered_paths.add(path)
-        return get_workdir_path
+        return WorkdirPath()
     
     @classmethod
     def get_registered_paths(cls) -> Set[str]:
