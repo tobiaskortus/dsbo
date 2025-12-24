@@ -74,13 +74,12 @@ class WorkflowTaskGraph:
         assert_no_duplicate_nodes(self._repr)
         assert_no_disconnected_nodes(self._repr)
 
-    def run(self, design: dict, trial_id: Optional[int] = None) -> tuple[float]:
+    def run(self, design: dict) -> tuple[float]:
         """ Sequential execution of the task graph without worker distribution 
         For distributed execution, use TODO: Something?!?!?!
         
         Args:
             design (dict): Design parameters that should be used to evaluate the defined workflow.
-            trial_id (Optional[int], optional): The trial identifier (incremental integer). Defaults to None.
         """
         results = []
         from dsbo.worker.dask import WorkerContext
@@ -92,16 +91,13 @@ class WorkflowTaskGraph:
             
             for task in batch:
                 if worker is None:
-                    result = task.run(design=design, trial_id=trial_id)
+                    result = task.run(design=design)
                     if is_output_task(self._repr, task):
                         results.extend(result)
                 else:
-                    future = worker.submit(task, design=design, trial_id=trial_id)
+                    future = worker.submit(task, design=design)
                     futures.append(future)
-
-            for future in as_completed(futures):
-                #TODO: check if output task
-                result = future.result()
+                    results = [f.result() for f in futures]
                 
         return tuple(results)
 
