@@ -1,5 +1,6 @@
-import contextvars
 import os
+import threading
+import contextvars
 from distributed import Future
 from dask.distributed import Client
 from contextlib import contextmanager
@@ -96,24 +97,28 @@ class AdaptiveHeterogenousDaskSlurmWorker(DaskWorkerBase):
         self.logdir = logdir
         self.max_workers = max_workers
         self.workers: dict[SlurmWorkerConfig, DaskSlurmWorker] = {}
+        self._lock = threading.Lock()
 
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        for worker in self.workers.values():
-            worker.client.close()
-            worker.cluster.close()
+        with self._lock:
+            for worker in self.workers.values():
+                worker.client.close()
+                worker.cluster.close()
 
     def submit(self, task: WorkflowTask, design: dict) -> Future:
         if task.worker_config is None:
             raise ValueError("Task does not have a worker_config defined.")
-        
-        if task.worker_config not in self.workers:
-            self.worker_type = "cpu" if task.worker_config.gpu_resources is None else "gpu"
-            self.workers[task.worker_config] = DaskSlurmWorker(
-                n_worker=self.max_workers, worker_config=task.worker_config, adaptive=True,
-                logdir=os.path.join(self.logdir, self.worker_type))
-        
-        return self.workers[task.worker_config].submit(task, design=design)
+
+        with self._lock:
+            if task.worker_config not in self.workers:
+                self.worker_type = "cpu" if task.worker_config.gpu_resources is None else "gpu"
+                self.workers[task.worker_config] = DaskSlurmWorker(
+                    n_worker=self.max_workers, worker_config=task.worker_config, adaptive=True,
+                    logdir=os.path.join(self.logdir, self.worker_type))
+            worker = self.workers[task.worker_config]
+
+        return worker.submit(task, design=design)
         
