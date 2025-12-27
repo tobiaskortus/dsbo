@@ -1,9 +1,10 @@
+import builtins
 import os
 import shutil
 import contextvars
 from enum import Enum
-from contextlib import contextmanager
-from typing import Callable, Generator, Generator, List, Optional, Set, Union
+from contextlib import contextmanager, nullcontext
+from typing import Callable, Generator, Generator, List, Optional, Set, Union, final
 
 
 class DefaultPaths(Enum):
@@ -11,8 +12,52 @@ class DefaultPaths(Enum):
     RECONSTRUCTION = "reconstruction"
     LOGS = "logs"
 
+
+class AbstractPath:
+    def __init__(self, path: str):
+        self._path = path
+
+    def __call__(self):
+        root = Workdir._current_workdir.get()
+        if root is None:
+            print("Warning: No workdir root is set. Using cwd instead.")
+            return os.path.join(os.getcwd(), self._path)
+        
+        workdir_path =  os.path.join(root.root, self._path)
+        if not os.path.exists(workdir_path):
+            print(f"Path {workdir_path} has not been registered. Creating it once.")
+            os.makedirs(workdir_path, exist_ok=True)
+        
+        return workdir_path
+
+    @property
+    def pathname(self) -> str:
+        return self._path
+    
+
+class AbstractFilePath:
+    def __init__(self, path: AbstractPath, filename: str, unique: bool = True):
+        self._filename = filename
+        self._unique = unique
+        self._path = path
+
+    def __call__(self):
+        suffix = Workdir._current_file_context.get()
+        if suffix and self._unique:
+            name, ext = os.path.splitext(self._filename)
+            filename = f"{name}_{suffix}{ext}"
+        else:
+            filename = self._filename
+        return os.path.join(self._path(), filename)
+
+    @property
+    def filename(self) -> str:
+        return self._filename
+
+
 class Workdir(dict):
     _current_workdir = contextvars.ContextVar("current_workdir", default=None)
+    _current_file_context = contextvars.ContextVar("current_file_context", default=None)
     _registered_paths: Set[str] = set()
 
     def __init__(self, workdir_root: str, stages: Optional[List[str]] = None,
@@ -63,6 +108,15 @@ class Workdir(dict):
         
         return registry
     
+    @classmethod
+    @contextmanager
+    def use_file_suffix(cls, suffix: str) -> Generator[None, None, None]:
+        try:
+            token = cls._current_file_context.set(suffix)
+            yield
+        finally:
+            cls._current_file_context.reset(token)
+    
 
     @classmethod
     @contextmanager
@@ -93,29 +147,16 @@ class Workdir(dict):
 
     @classmethod
     def register(cls, path: Union[str, DefaultPaths]) -> Callable[[], str]:
-        class WorkdirPath:
-            def __call__(self, *args, **kwds):
-                workdir = cls._current_workdir.get()
-                if workdir is None:
-                    print("Warning: No current workdir set. Using cwd instead.")
-                    return os.path.join(os.getcwd())
-                
-                workdir_path = os.path.join(workdir.root, path)
-                if not os.path.exists(workdir_path):
-                    print(f"Path {workdir_path} has not been registered. Creating it once.")
-                    os.makedirs(workdir_path, exist_ok=True)
-
-                return workdir_path
-
-            @property
-            def name(self) -> str:
-                return path
-            
         if isinstance(path, DefaultPaths):
             path = path.value
             
         cls._registered_paths.add(path)
-        return WorkdirPath()
+        return AbstractPath(path)
+    
+    @classmethod
+    def register_file(cls, path: str, filename: str, unique_filename: bool = True) -> str:
+        workdir_path = Workdir.register(path)
+        return AbstractFilePath(workdir_path, filename, unique_filename)
     
     @classmethod
     def get_registered_paths(cls) -> Set[str]:
@@ -130,7 +171,7 @@ class Workdir(dict):
         return self.workdir_root
     
 
-def get_workdir():
+def get_workdir() -> Workdir:
     workdir = Workdir._current_workdir.get()
     if workdir is None:
         raise RuntimeError("No current workdir set.")
@@ -142,3 +183,12 @@ def get_workdir_path(stage: str) -> str:
     if path is workdir.root:
         print(f"Warning: Stage '{stage}' not found in workdir registry. Using root path instead.")
     return path
+
+def with_remote_workdir(func):
+    def wrapper(self, *args, **kwargs):
+        workdir = kwargs.pop("workdir", None)
+        suffix = kwargs.pop("suffix", None)
+        with Workdir.load(workdir) if workdir else nullcontext():
+            with Workdir.use_file_suffix(suffix) if suffix else nullcontext():
+                return func(self, *args, **kwargs)
+    return wrapper
