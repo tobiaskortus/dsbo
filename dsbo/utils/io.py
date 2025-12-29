@@ -1,10 +1,10 @@
-import builtins
 import os
+from pathlib import Path
 import shutil
 import contextvars
 from enum import Enum
 from contextlib import contextmanager, nullcontext
-from typing import Callable, Generator, Generator, List, Optional, Set, Union, final
+from typing import Any, Callable, Generator, Generator, List, Optional, Set, Union, final
 
 
 class DefaultPaths(Enum):
@@ -53,24 +53,44 @@ class AbstractFilePath:
     @property
     def filename(self) -> str:
         return self._filename
+    
+    @property
+    def pathname(self) -> str:
+        return self._path.pathname
 
+
+class AbstractFilePatternPath:
+    def __init__(self, path: AbstractPath, filename_pattern: str):
+        self._filename_pattern = filename_pattern
+        self._path = path
+
+    def __call__(self):
+        return Path(self._path()).glob(self._filename_pattern)
+
+    @property
+    def filename_pattern(self) -> str:
+        return self._filename_pattern
+    
+    @property
+    def pathname(self) -> str:
+        return self._path.pathname
 
 class Workdir(dict):
     _current_workdir = contextvars.ContextVar("current_workdir", default=None)
     _current_file_context = contextvars.ContextVar("current_file_context", default=None)
     _registered_paths: Set[str] = set()
 
-    def __init__(self, workdir_root: str, stages: Optional[List[str]] = None,
-                 timestamp: bool = False, error_if_exists: bool = True):
+    def __init__(self, workdir_root: str, paths: Optional[List[str]] = None,
+                 error_if_exists: bool = True):
         
         super().__init__()
         self.workdir_root = workdir_root
         self.error_if_exists = error_if_exists
 
-        if stages is not None:
-            for stage in stages:
-                stage_dir = os.path.join(self.workdir_root, stage)
-                self[stage] = stage_dir
+        if paths is not None:
+            for path in paths:
+                path_dir = os.path.join(self.workdir_root, path)
+                self[path] = path_dir
 
     def __getattr__(self, item):
         try:
@@ -86,13 +106,13 @@ class Workdir(dict):
     
     @classmethod
     @contextmanager
-    def create(cls, workdir_root: str, stages: Optional[List[str]] = None, 
+    def create(cls, workdir_root: str, paths: Optional[List[str]] = None, 
                     error_if_exists: bool = True, keep: bool = False) -> Generator["Workdir", None, None]:
         
-        if stages is None:
-            stages = cls.get_registered_paths()
+        if paths is None:
+            paths = cls.get_registered_paths()
 
-        registry = cls(workdir_root, stages, error_if_exists)
+        registry = cls(workdir_root, paths, error_if_exists)
         token = cls._current_workdir.set(registry)
         
         try:
@@ -158,6 +178,12 @@ class Workdir(dict):
         workdir_path = Workdir.register(path)
         return AbstractFilePath(workdir_path, filename, unique_filename)
     
+
+    @classmethod
+    def register_file_pattern(cls, path: str, filename_pattern: str) -> str:
+        workdir_path = Workdir.register(path)
+        return AbstractFilePatternPath(workdir_path, filename_pattern)
+    
     @classmethod
     def get_registered_paths(cls) -> Set[str]:
         return cls._registered_paths
@@ -176,6 +202,9 @@ def get_workdir() -> Workdir:
     if workdir is None:
         raise RuntimeError("No current workdir set.")
     return workdir
+    
+def get_file_suffix() -> Optional[str]:
+    return Workdir._current_file_context.get()
 
 def get_workdir_path(stage: str) -> str:
     workdir = get_workdir()       
@@ -184,8 +213,8 @@ def get_workdir_path(stage: str) -> str:
         print(f"Warning: Stage '{stage}' not found in workdir registry. Using root path instead.")
     return path
 
-def with_remote_workdir(func):
-    def wrapper(self, *args, **kwargs):
+def with_remote_workdir(func: Callable) -> Callable:
+    def wrapper(self, *args, **kwargs) -> Any:
         workdir = kwargs.pop("workdir", None)
         suffix = kwargs.pop("suffix", None)
         with Workdir.load(workdir) if workdir else nullcontext():
