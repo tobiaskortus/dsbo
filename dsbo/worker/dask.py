@@ -8,7 +8,8 @@ from dask_jobqueue import SLURMCluster
 from typing import Any, Generator, Optional
 
 
-from dsbo.simulation import DaskSimulationWrapper
+from dsbo.modules.simulation import DaskSimulationWrapper
+from dsbo.utils.io import get_file_suffix, get_workdir
 from dsbo.workflow import WorkflowTask
 from dsbo.worker.config import SlurmWorkerConfig
 
@@ -67,7 +68,7 @@ class DaskSlurmWorker(DaskWorkerBase):
         self.n_worker = n_worker
         self.adaptive = adaptive
         
-        self.cluster = SLURMCluster(cores=1, memory=worker_config.memory, 
+        self.cluster = SLURMCluster(cores=1, queue=worker_config.partition, memory=worker_config.memory, 
                     walltime=worker_config.walltime, worker_extra_args=worker_extra_args,
                     job_extra_directives=job_extra_directives, log_directory=logdir, 
                     processes=1, job_cpu=worker_config.job_cpu)
@@ -82,8 +83,10 @@ class DaskSlurmWorker(DaskWorkerBase):
     def submit(self, task: WorkflowTask, design: dict) -> Future: 
         if isinstance(task.task, DaskSimulationWrapper):
             assert task.task.init_on_demand, "DaskSimulationWrapper inside DaskSlurmWorker must be initialized with init_on_demand=True"
-
-        return self.client.submit(task.run, design)
+        
+        workdir = get_workdir()
+        suffix = get_file_suffix()
+        return self.client.submit(task.run, design, workdir=workdir.workdir_root, suffix=suffix)
 
     def __enter__(self):
         return self
