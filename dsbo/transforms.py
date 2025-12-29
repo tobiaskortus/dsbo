@@ -1,7 +1,11 @@
+from abc import abstractmethod
 import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
+
+from dsbo.modules import Module
+from dsbo.utils.io import Workdir, with_remote_workdir
 
 READERS = {
     ".csv":     pd.read_csv,
@@ -41,11 +45,16 @@ def save_df_by_extension(df: pd.DataFrame, path: str, **kwargs):
     WRITERS[ext](df, path, **kwargs)
 
 
-class SimulationTransform:
+class SimulationTransform(Module):
     def __init__(self) -> None:
-        pass
+        super().__init__()
+    
+    @with_remote_workdir
+    def __call__(self, design: dict, **kwargs) -> None:
+        return self.transform(design, **kwargs)
 
-    def __call__(self, simulation_dir: str) -> None:
+    @abstractmethod
+    def transform(self, design: dict, **kwargs) -> None:
         pass
 
 
@@ -53,9 +62,11 @@ class DataFrameMergeTransform(SimulationTransform):
     def __init__(self, pattern: str) -> None:
         super().__init__()
         self.pattern = pattern
+        self.simulation_dir = Workdir.register("simulation")
+        self.output_file = Workdir.register_file("simulation", "output_df.npy", unique_filename=False)
 
-    def __call__(self, simulation_dir: str) -> str:
-        simulation_files = Path(simulation_dir).glob(self.pattern)
+    def transform(self, design, **kwargs):
+        simulation_files = Path(self.simulation_dir()).glob(self.pattern)
         simulation_dfs = []
         for simulation_file in simulation_files:
             df, ext = load_df_by_extension(simulation_file)
@@ -64,26 +75,27 @@ class DataFrameMergeTransform(SimulationTransform):
         assert len(simulation_dfs) > 0, "No simulation files found to merge."
             
         df = pd.concat(simulation_dfs, ignore_index=True)
-        output_path = os.path.join(simulation_dir, "output_df.npy")
+        output_path = self.output_file()
         save_df_by_extension(df, output_path)
 
+        
 class MiniframeMergeTransform(SimulationTransform):
     def __init__(self, pattern: str) -> None:
         super().__init__()
         self.pattern = pattern
+        self.simulation_files = Workdir.register_file_pattern("simulation", pattern)
+        self.output_file = Workdir.register_file("simulation", "output_df.npy", unique_filename=False)
 
-    def __call__(self, simulation_dir: str) -> str:
+    def transform(self, design: dict) -> str:
         from dsbo.minipandas import MiniFrame, concat
 
-        simulation_files = Path(simulation_dir).glob(self.pattern)
         simulation_mfs = []
-        for simulation_file in simulation_files:
+        for simulation_file in self.simulation_files():
+            print(f"Loading simulation file: {simulation_file}")
             mf = MiniFrame.read_pickle(simulation_file)
             simulation_mfs.append(mf)
 
         assert len(simulation_mfs) > 0, "No simulation files found to merge."
             
         merged_mf = concat(simulation_mfs, ignore_index=True)
-        output_path = os.path.join(simulation_dir, "output_df.npy")
-        merged_mf.to_pickle(output_path)
-        return output_path
+        merged_mf.to_pickle(self.output_file())

@@ -1,66 +1,34 @@
-import os
-import shutil
-from uuid import uuid4
+
 import dask.distributed
+from contextlib import nullcontext
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
-from typing import List, Optional
+from typing import List, Optional, Union
 from dask.distributed import Client, LocalCluster
+from sqlalchemy import null
 
-from dsbo.utils import ContainerWrapperBase
+from dsbo.modules import Module
+from dsbo.container import ContainerWrapperBase
 from dsbo.transforms import SimulationTransform
+from dsbo.utils.io import Workdir, get_file_suffix, get_workdir, with_remote_workdir
 
 
-class SimulationBase(ABC):
-    def __init__(self, workdir: str, **kwargs) -> None:
+class SimulationBase(Module):
+    def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._workdir = workdir
-        self._trial_id = None
 
-    def __init_subclass__(cls, **kwargs):
-        """Automatically wrap simulate() to handle trial_id and directory setup."""
-        super().__init_subclass__(**kwargs)
-        
-        # Store original implementation
-        original_simulate = cls.simulate
-        cls._simulate_impl = original_simulate
-        
-        # Create a new simulate method that wraps the original
-        def simulate_wrapper(self, design: dict, suffix: Optional[str] = None, trial_id: Optional[int] = None) -> None:
-            self._trial_id = trial_id
-            if not os.path.exists(self.simulation_dir):
-                os.makedirs(self.simulation_dir, exist_ok=True)
-            # Call the stored implementation
-            return type(self)._simulate_impl(self, design, suffix, trial_id)
-        
-        # Set proper metadata for serialization
-        simulate_wrapper.__name__ = 'simulate'
-        simulate_wrapper.__qualname__ = f'{cls.__qualname__}.simulate'
-        cls.simulate = simulate_wrapper
-    
+    @with_remote_workdir
+    def __call__(self, design: dict, **kwargs) -> None:
+        return self.simulate(design, **kwargs)
+
     @abstractmethod
-    def simulate(self, design: dict, suffix: Optional[str] = None, trial_id: Optional[int] = None) -> None:
+    def simulate(self, design: dict) -> None:
         pass
-
-    def remove_simulation_files(self) -> None:
-        if os.path.exists(self.simulation_dir):
-            shutil.rmtree(self.simulation_dir, ignore_errors=True)
-
-    @property
-    def simulation_dir(self) -> str:
-        return os.path.join(self.workdir, "output")
-
-    @property
-    def workdir(self) -> str:
-        if self._trial_id is None:
-            return self._workdir
-
-        return os.path.join(self._workdir, f"trial_{self._trial_id}")
 
 
 class SimulationContainerWrapperBase(SimulationBase, ContainerWrapperBase):
-    def __init__(self, workdir: str, container_path: str, container_extra_flags: Optional[str] = ""):
-        super().__init__(workdir, container_path=container_path, container_extra_flags=container_extra_flags)
+    def __init__(self, container_path: str, container_extra_flags: Optional[str] = ""):
+        SimulationBase.__init__(self)
+        ContainerWrapperBase.__init__(self, container_path, container_extra_flags)
 
     def call_container(self, arguments: list, is_exec: bool = False) -> None:
         if is_exec: super().exec_container(arguments)
@@ -71,7 +39,7 @@ class DaskSimulationWrapper(SimulationBase):
     def __init__(self, base_simulation: SimulationBase, n_simulations, n_workers: int, 
                 threads_per_worker: int, merge_function: SimulationTransform, init_on_demand: bool = False) -> None:
         
-        super().__init__(workdir=base_simulation.workdir)
+        super().__init__()
 
         assert n_simulations > 1, "n_simulations must be greater than 1"
         assert n_workers >= 1, "n_workers must be at least 1"
@@ -96,18 +64,26 @@ class DaskSimulationWrapper(SimulationBase):
         self.cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker,
                                     dashboard_address=None, processes=False)
         self.client = Client(self.cluster)
-
-    def simulate(self, design: dict, suffix: Optional[str] = None, trial_id: Optional[int] = None) -> None:
+    
+    def simulate(self, design: dict) -> None:
         if self.init_on_demand:
             self.initialize_local_cluster(self.n_workers, self.threads_per_worker)
 
+        #Initialize input/output dirs before submitting jobs
+        #self.base_simulation.input_dir()
+        #self.base_simulation.output_dir()
+        
         futures: List[dask.distributed.Future] = []
         for i in range(self.n_simulations):
-            future = self.client.submit(self.base_simulation.simulate, design, str(i), trial_id)
-            futures.append(future)
+            with Workdir.use_file_suffix(str(i)):
+                print(f"Submitting simulation {i+1}/{self.n_simulations}")
+                workdir = get_workdir()
+                suffix = get_file_suffix()
+                future = self.client.submit(self.base_simulation, design, workdir=workdir.workdir_root, suffix=suffix)
+                futures.append(future)
             
         self.client.gather(futures)
-        self.merge_function(self.simulation_dir)
+        self.merge_function(design)
 
         if self.init_on_demand:
             self.close()

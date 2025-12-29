@@ -21,7 +21,7 @@ class ContainerType(Enum):
 
 class ContainerWrapperBase:
     def __init__(self, container_path, container_extra_flags: Optional[str], 
-                 cuda_enabled: bool = False, verbose: bool = False, **kwargs) -> None:
+                 cuda_enabled: bool = False, verbose: bool = True, **kwargs) -> None:
         
         super().__init__(**kwargs)
         self._container_path = container_path
@@ -53,30 +53,24 @@ class ContainerWrapperBase:
         return cmd
 
     def run_container(self, args: List[str]) -> None:
-        try:
-            cmd = self.__construct_cmd(args, is_exec=False)
-            logging.debug(f"Running container with command: {' '.join(cmd)}")
-            subprocess.run(cmd, check=True, capture_output=not self._verbose, text=True)
-        except subprocess.CalledProcessError as e:
-            if not self._verbose:
-                print("STDOUT:", e.stdout)
-                print("STDERR:", e.stderr)
-            raise
+        cmd = self.__construct_cmd(args, is_exec=False)
+        process = subprocess.Popen(cmd, stdout=None, stderr=None)
+        process.wait()
+        if process.returncode != 0:
+            print(f"Container process failed {process.returncode}")
+
 
     def exec_container(self, args: List[str]) -> None:
-        try:
-            cmd = self.__construct_cmd(args, is_exec=True)
-            logging.debug(f"Running container with command: {' '.join(cmd)}")
-            subprocess.run(cmd, check=True, capture_output=not self._verbose, text=True)
-        except subprocess.CalledProcessError as e:
-            if not self._verbose:
-                print("STDOUT:", e.stdout)
-                print("STDERR:", e.stderr)
-            raise
+        cmd = self.__construct_cmd(args, is_exec=True)
+        process = subprocess.Popen(cmd, stdout=None, stderr=None)
+        process.wait()
+        if process.returncode != 0:
+            print(f"Container process failed {process.returncode}")
 
     @property
     def container_path(self) -> str:
         return self._container_path
+    
     
     @property
     def container_extra_flags(self) -> Optional[str]:

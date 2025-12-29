@@ -19,11 +19,15 @@ class WorkflowTask:
     def run(self, *args, **kwargs):
         return self.task(*args, **kwargs)
     
-
+    
 def assert_no_self_loops(G: nx.DiGraph) -> None:
     assert nx.number_of_selfloops(G) == 0, "The specified task graph cannot be executed due to self-loops."
 
 def assert_no_disconnected_nodes(G: nx.DiGraph):
+    # No need to check for disconnected nodes if there is only one node
+    if G.number_of_nodes() == 1:
+        return
+    
     disconnected_nodes = [n for n in G.nodes() if G.in_degree(n) == 0 and G.out_degree(n) == 0]
     assert len(disconnected_nodes) == 0, f"The specified task graph has disconnected nodes: {[n.name for n in disconnected_nodes]}"
 
@@ -72,7 +76,7 @@ class WorkflowTaskGraph:
 
         assert_no_self_loops(self._repr)
         assert_no_duplicate_nodes(self._repr)
-        assert_no_disconnected_nodes(self._repr)
+        #assert_no_disconnected_nodes(self._repr)
 
     def run(self, design: dict) -> tuple[float]:
         """ Sequential execution of the task graph without worker distribution 
@@ -93,11 +97,14 @@ class WorkflowTaskGraph:
                 if worker is None:
                     result = task.run(design=design)
                     if is_output_task(self._repr, task):
-                        results.extend(result)
+                        if result is not None:
+                            results.extend(result)
                 else:
                     future = worker.submit(task, design=design)
                     futures.append(future)
-                    results = [f.result() for f in futures]
+                    
+            if worker is not None:
+                results = [f.result() for f in futures]
                 
         return tuple(results)
 

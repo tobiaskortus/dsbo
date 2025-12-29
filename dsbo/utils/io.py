@@ -21,9 +21,9 @@ class AbstractPath:
         root = Workdir._current_workdir.get()
         if root is None:
             print("Warning: No workdir root is set. Using cwd instead.")
-            return os.path.join(os.getcwd(), self._path)
+            return os.path.join(os.getcwd(), self._path) if self._path else os.getcwd()
         
-        workdir_path =  os.path.join(root.root, self._path)
+        workdir_path =  os.path.join(root.root, self._path) if self._path else root.root
         if not os.path.exists(workdir_path):
             print(f"Path {workdir_path} has not been registered. Creating it once.")
             os.makedirs(workdir_path, exist_ok=True)
