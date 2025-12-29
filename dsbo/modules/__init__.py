@@ -11,11 +11,11 @@ class Module(ABC):
         pass
 
     def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+
         if isinstance(value, AbstractFilePath):
             self._registered_files[name] = value
                 
-        super().__setattr__(name, value)
-
     @property
     def registered_files(self) -> dict[str, AbstractFilePath]:
         return self._registered_files
