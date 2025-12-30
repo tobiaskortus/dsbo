@@ -1,10 +1,11 @@
+import functools
 import os
 from pathlib import Path
 import shutil
 import contextvars
 from enum import Enum
 from contextlib import contextmanager, nullcontext
-from typing import Any, Callable, Generator, Generator, List, Optional, Set, Union, final
+from typing import Any, Callable, Generator, Generator, List, Optional, Set, Union
 
 
 class DefaultPaths(Enum):
@@ -174,7 +175,7 @@ class Workdir(dict):
         return AbstractPath(path)
     
     @classmethod
-    def register_file(cls, path: str, filename: str, unique_filename: bool = True) -> str:
+    def register_file(cls, path: Optional[str], filename: str, unique_filename: bool = True) -> str:
         workdir_path = Workdir.register(path)
         return AbstractFilePath(workdir_path, filename, unique_filename)
     
@@ -214,6 +215,7 @@ def get_workdir_path(stage: str) -> str:
     return path
 
 def with_remote_workdir(func: Callable) -> Callable:
+    @functools.wraps(func)
     def wrapper(self, *args, **kwargs) -> Any:
         workdir = kwargs.pop("workdir", None)
         suffix = kwargs.pop("suffix", None)

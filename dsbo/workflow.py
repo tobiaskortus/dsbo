@@ -5,6 +5,8 @@ import matplotlib
 import networkx as nx
 from itertools import groupby
 from dask.distributed import Future
+from dsbo.logger import WorkflowTaskLogger
+from dsbo.utils.io import with_remote_workdir
 from dsbo.worker.config import SlurmWorkerConfig
 from concurrent.futures import as_completed
 from typing import Callable, Optional, Sequence
@@ -16,8 +18,10 @@ class WorkflowTask:
         self.task = task
         self.worker_config = worker_config
 
+    @with_remote_workdir
     def run(self, *args, **kwargs):
-        return self.task(*args, **kwargs)
+        with WorkflowTaskLogger(self) as logger:
+            return self.task(*args, **kwargs)
     
     
 def assert_no_self_loops(G: nx.DiGraph) -> None:

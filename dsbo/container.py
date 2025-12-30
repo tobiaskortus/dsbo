@@ -1,7 +1,8 @@
-from enum import Enum
 import logging
 import subprocess
-from typing import List, Optional
+from enum import Enum
+from typing import Callable, List, Optional
+from dsbo.logger import WorkflowTaskLogger
 
 def which_python():
     import shutil
@@ -19,6 +20,38 @@ class ContainerType(Enum):
     APPTAINER = "apptainer"
     DOCKER = "docker"
 
+
+import subprocess
+
+def subprocess_run(cmd: List[str], 
+                   stdout_callback: Callable[[str], None], 
+                   stderr_callback: Callable[[str], None]) -> int:
+    
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1
+    )
+
+    from threading import Thread
+
+    def stream(pipe, callback):
+        for line in iter(pipe.readline, ''):
+            callback(line)
+        pipe.close()
+
+    threads = [
+        Thread(target=stream, args=(process.stdout, stdout_callback)),
+        Thread(target=stream, args=(process.stderr, stderr_callback)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return process.wait()
+
 class ContainerWrapperBase:
     def __init__(self, container_path, container_extra_flags: Optional[str], 
                  cuda_enabled: bool = False, verbose: bool = True, **kwargs) -> None:
@@ -27,7 +60,6 @@ class ContainerWrapperBase:
         self._container_path = container_path
         self._container_extra_flags = container_extra_flags
         self._container_type = ContainerType.SINGULARITY
-        self._logger = logging.getLogger(__name__)
         self._verbose = verbose
 
         if cuda_enabled:
@@ -54,18 +86,38 @@ class ContainerWrapperBase:
 
     def run_container(self, args: List[str]) -> None:
         cmd = self.__construct_cmd(args, is_exec=False)
-        process = subprocess.Popen(cmd, stdout=None, stderr=None)
-        process.wait()
-        if process.returncode != 0:
-            print(f"Container process failed {process.returncode}")
-
+        
+        logger = WorkflowTaskLogger.get_current()
+        
+        if logger is not None:
+            logger.log(f"Running container: {self.container_path} with args: {' '.join(cmd)}")
+            stdout = logger.get_log_callback(logging.INFO)
+            stderr = logger.get_log_callback(logging.ERROR)
+        else:
+            stdout = lambda x: print(x)
+            stderr = lambda x: print(x)
+        
+        process_returncode = subprocess_run(cmd, stdout, stderr)
+        if process_returncode != 0:
+            logger.log(f"Container process failed with return code {process_returncode}", level=logging.ERROR)
 
     def exec_container(self, args: List[str]) -> None:
         cmd = self.__construct_cmd(args, is_exec=True)
-        process = subprocess.Popen(cmd, stdout=None, stderr=None)
-        process.wait()
-        if process.returncode != 0:
-            print(f"Container process failed {process.returncode}")
+
+        logger = WorkflowTaskLogger.get_current()
+        
+        if logger is not None:
+            logger.log(f"Running container: {self.container_path} with args: {' '.join(cmd)}")
+            stdout = logger.get_log_callback(logging.INFO)
+            stderr = logger.get_log_callback(logging.ERROR)
+        else:
+            stdout = lambda x: print(x)
+            stderr = lambda x: print(x)
+        
+        process_returncode = subprocess_run(cmd, stdout, stderr)
+        if process_returncode != 0:
+            logger.log(f"Container process failed with return code {process_returncode}", level=logging.ERROR)
+
 
     @property
     def container_path(self) -> str:
