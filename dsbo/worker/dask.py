@@ -18,7 +18,7 @@ class DaskWorkerBase:
     def __init__(self):
         pass
 
-    def submit(self, task: WorkflowTask, design: dict) -> Future:
+    def submit(self, task: WorkflowTask, design: dict, priority: int = 0) -> Future:
         raise NotImplementedError("submit method must be implemented by subclasses.")
 
 
@@ -80,13 +80,15 @@ class DaskSlurmWorker(DaskWorkerBase):
 
         self.client = Client(self.cluster)
 
-    def submit(self, task: WorkflowTask, design: dict) -> Future: 
+    def submit(self, task: WorkflowTask, design: dict, priority: int = 0) -> Future: 
         if isinstance(task.task, DaskSimulationWrapper):
             assert task.task.init_on_demand, "DaskSimulationWrapper inside DaskSlurmWorker must be initialized with init_on_demand=True"
         
         workdir = get_workdir()
         suffix = get_file_suffix()
-        return self.client.submit(task.run, design, workdir=workdir.workdir_root, suffix=suffix)
+        return self.client.submit(task.run, design, 
+                                  workdir=workdir.workdir_root, suffix=suffix, 
+                                  priority=priority)
 
     def __enter__(self):
         return self
@@ -111,7 +113,7 @@ class AdaptiveHeterogenousDaskSlurmWorker(DaskWorkerBase):
                 worker.client.close()
                 worker.cluster.close()
 
-    def submit(self, task: WorkflowTask, design: dict) -> Future:
+    def submit(self, task: WorkflowTask, design: dict, priority: int = 0) -> Future:
         if task.worker_config is None:
             raise ValueError("Task does not have a worker_config defined.")
 
@@ -123,5 +125,5 @@ class AdaptiveHeterogenousDaskSlurmWorker(DaskWorkerBase):
                     logdir=os.path.join(self.logdir, self.worker_type))
             worker = self.workers[task.worker_config]
 
-        return worker.submit(task, design=design)
+        return worker.submit(task, design=design, priority=priority)
         

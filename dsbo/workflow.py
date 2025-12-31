@@ -8,7 +8,6 @@ from dask.distributed import Future
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import with_remote_workdir
 from dsbo.worker.config import SlurmWorkerConfig
-from concurrent.futures import as_completed
 from typing import Callable, Optional, Sequence
 
 
@@ -22,6 +21,23 @@ class WorkflowTask:
     def run(self, *args, **kwargs):
         with WorkflowTaskLogger(self) as logger:
             return self.task(*args, **kwargs)
+
+class DaskWorkflowRepeater:
+    def __init__(self, task: WorkflowTask, repetitions: int) -> None:
+        self.task = task
+        self.repetitions = repetitions
+
+    def run(self, design: dict) -> Sequence[Future]:
+        raise NotImplementedError("DaskWorkflowRepeater.run is not implemented yet.")
+    
+
+class DynamicDaskWorkflowRepeater:
+    def __init__(self, task: WorkflowTask, file_pattern: str) -> None:
+        self.task = task
+        self.file = None
+    
+    def run(self, design: dict) -> Sequence[Future]:
+        raise NotImplementedError("DynamicDaskWorkflowRepeater.run is not implemented yet.")
     
     
 def assert_no_self_loops(G: nx.DiGraph) -> None:
@@ -66,7 +82,7 @@ def task_layout(G: nx.DiGraph, x_spacing=1, y_spacing=0.5):
 def is_output_task(G: nx.DiGraph, task: WorkflowTask) -> bool:
     return G.out_degree(task) == 0
 
-def get_parallel_batches(G: nx.DiGraph):
+def get_dependent_task_groups(G: nx.DiGraph):
     levels_dict = task_levels(G)
     return [
         [node for node, _ in group]
@@ -94,7 +110,9 @@ class WorkflowTaskGraph:
         worker = WorkerContext.get_current_worker()
         print(f"Using worker: {type(worker)}")
         
-        for batch in self.iterate_task_batches():
+        #TODO: improve parallel execution within dependent task groups
+        for depth, batch in enumerate(self.iterate_dependent_task_groups()):
+            print(f"Running batch with tasks: {[task.name for task in batch]}")
             futures = []
             
             for task in batch:
@@ -104,16 +122,20 @@ class WorkflowTaskGraph:
                         if result is not None:
                             results.extend(result)
                 else:
-                    future = worker.submit(task, design=design)
+                    #TODO: replace with reasonable priority calculation
+                    future = worker.submit(task, design=design, priority=depth)
                     futures.append(future)
                     
             if worker is not None:
                 results = [f.result() for f in futures]
+            print(f"Completed batch with tasks: {[task.name for task in batch]}")
+
+
                 
         return tuple(results)
 
-    def iterate_task_batches(self):
-        for batch in get_parallel_batches(self._repr):
+    def iterate_dependent_task_groups(self):
+        for batch in get_dependent_task_groups(self._repr):
             yield batch
 
     def get_unique_workers(self):
