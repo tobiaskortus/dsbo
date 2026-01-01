@@ -71,6 +71,7 @@ class DataFrameMergeTransform(SimulationTransform):
         for simulation_file in simulation_files:
             df, ext = load_df_by_extension(simulation_file)
             simulation_dfs.append(df)
+            os.remove(simulation_file)
 
         assert len(simulation_dfs) > 0, "No simulation files found to merge."
             
@@ -94,6 +95,7 @@ class MiniframeMergeTransform(SimulationTransform):
             print(f"Loading simulation file: {simulation_file}")
             mf = MiniFrame.read_pickle(simulation_file)
             simulation_mfs.append(mf)
+            os.remove(simulation_file)
 
         assert len(simulation_mfs) > 0, "No simulation files found to merge."
             
