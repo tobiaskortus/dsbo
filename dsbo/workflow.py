@@ -1,10 +1,11 @@
 import math
-import time
-from matplotlib import pyplot as plt
 import matplotlib
 import networkx as nx
+from typing import List
+from copy import deepcopy
 from itertools import groupby
 from dask.distributed import Future
+from matplotlib import pyplot as plt
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import with_remote_workdir
 from dsbo.worker.config import SlurmWorkerConfig
@@ -22,6 +23,26 @@ class WorkflowTask:
         with WorkflowTaskLogger(self) as logger:
             return self.task(*args, **kwargs)
 
+
+class FusedWorkflowTask(WorkflowTask):
+    def __init__(self, *tasks):
+        self.tasks = tasks
+        for task in tasks:
+            assert self.tasks[0].worker_config == task.worker_config, \
+                    "All tasks in CompositeWorkflowTask must have the same worker configuration."
+
+    def run(self, *args, **kwargs):
+        for task in self.tasks:
+            task.run(*args, **kwargs)
+    
+    @property
+    def worker_config(self):
+        return self.tasks[0].worker_config
+    
+    @property
+    def name(self):
+        return "[" + ",".join(task.name for task in self.tasks) + "]"
+
 class DaskWorkflowRepeater:
     def __init__(self, task: WorkflowTask, repetitions: int) -> None:
         self.task = task
@@ -30,7 +51,6 @@ class DaskWorkflowRepeater:
     def run(self, design: dict) -> Sequence[Future]:
         raise NotImplementedError("DaskWorkflowRepeater.run is not implemented yet.")
     
-
 class DynamicDaskWorkflowRepeater:
     def __init__(self, task: WorkflowTask, file_pattern: str) -> None:
         self.task = task
@@ -105,6 +125,7 @@ class WorkflowTaskGraph:
         Args:
             design (dict): Design parameters that should be used to evaluate the defined workflow.
         """
+        #TODO: improve aggregation of results from output tasks
         results = []
         from dsbo.worker.dask import WorkerContext
         worker = WorkerContext.get_current_worker()
@@ -112,26 +133,30 @@ class WorkflowTaskGraph:
         
         #TODO: improve parallel execution within dependent task groups
         for depth, batch in enumerate(self.iterate_dependent_task_groups()):
-            print(f"Running batch with tasks: {[task.name for task in batch]}")
             futures = []
-            
             for task in batch:
                 if worker is None:
                     result = task.run(design=design)
                     if is_output_task(self._repr, task):
+                        #TODO: well...
                         if result is not None:
-                            results.extend(result)
+                            if isinstance(result, (list, tuple)):
+                                results.extend([r for r in result if r is not None])
+                            else:
+                                results.append(result)
                 else:
-                    #TODO: replace with reasonable priority calculation
                     future = worker.submit(task, design=design, priority=depth)
                     futures.append(future)
-                    
+
             if worker is not None:
-                results = [f.result() for f in futures]
-            print(f"Completed batch with tasks: {[task.name for task in batch]}")
-
-
-                
+                #TODO: well ...
+                batch_results = tuple(f.result() for f in futures if f is not None)
+                for r in batch_results:
+                    if r is not None:
+                        if isinstance(r, (list, tuple)):
+                            results.extend([x for x in r if x is not None])
+                        else:
+                            results.append(r)
         return tuple(results)
 
     def iterate_dependent_task_groups(self):
@@ -207,3 +232,48 @@ class WorkflowTaskGraph:
     @property
     def max_depth(self):
         return max(self.levels.values()) + 1 if self.levels else 0
+    
+
+def mergeable_components(task_graph: WorkflowTaskGraph, attr="worker_config") -> List[List[WorkflowTask]]:
+    G = task_graph._repr
+    in_deg = dict(G.in_degree())
+    out_deg = dict(G.out_degree())
+
+    contractible_edges = [
+        (u, v)
+        for u, v in G.edges()
+        if (getattr(u, attr) == getattr(v, attr)
+            and out_deg[u] == 1
+            and in_deg[v] == 1)
+    ]
+
+    H = nx.DiGraph(contractible_edges)
+    node_order = list(G.nodes())
+    return [
+        [n for n in node_order if n in comp]
+        for comp in nx.weakly_connected_components(H)
+        if len(comp) > 1
+    ]
+
+
+def update_task_graph(task_graph: WorkflowTaskGraph, groups: list[list[WorkflowTask]]) -> WorkflowTaskGraph:
+    G = task_graph._repr.copy()
+    for group in groups:
+        merged = FusedWorkflowTask(*group)
+        preds = set().union(*(G.predecessors(t) for t in group)) - set(group)
+        succs = set().union(*(G.successors(t) for t in group)) - set(group)
+
+        G.remove_nodes_from(group)
+        G.add_node(merged)
+
+        for p in preds: G.add_edge(p, merged)
+        for s in succs: G.add_edge(merged, s)
+
+    updated_task_graph= deepcopy(task_graph)
+    updated_task_graph._repr = G
+
+    return updated_task_graph
+
+
+def optimize(workflow: WorkflowTaskGraph) -> WorkflowTaskGraph:
+    return update_task_graph(workflow, mergeable_components(workflow))
