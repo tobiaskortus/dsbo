@@ -5,7 +5,7 @@ from typing import Optional
 from collections.abc import Sequence
 
 from dsbo.container import python_script_args
-from dsbo.reconstruction import ReconstructionContainerWrapper
+from dsbo.modules.reconstruction import ReconstructionContainerWrapper
 from dsbo.utils.io import DefaultPaths, Workdir
 
 class G4CaloReconstruction(ReconstructionContainerWrapper):

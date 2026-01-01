@@ -1,9 +1,10 @@
-from sqlalchemy import false
-from dsbo.simulation import SimulationContainerWrapperBase
+from enum import unique
+from dsbo.modules.simulation import SimulationContainerWrapperBase
 from dsbo.transforms import SimulationTransform, load_df_by_extension
 from dsbo.minipandas import MiniFrame, concat
 from dsbo.container import python_script_args
-from typing import Optional, List
+from typing import Optional
+from filelock import FileLock
 import pandas as pd
 import numpy as np
 import pickle
@@ -12,15 +13,21 @@ import os
 
 from dsbo.utils.io import DefaultPaths, Workdir
 
+def write_design_threadsafe(design: dict, design_path: str) -> None:
+    lock_path = design_path + ".lock"
+    with FileLock(lock_path):
+        with open(design_path, "w") as f:
+            json.dump(design, f)
+
 
 class G4CaloSimulation(SimulationContainerWrapperBase):
     def __init__(self, container_path: str, container_extra_flags: Optional[str] = ""):
         super().__init__(container_path, container_extra_flags)
+        self.design_path = Workdir.register_file(DefaultPaths.SIMULATION, "design.json", unique_filename=False)
+        self.simulation_path = Workdir.register_file(DefaultPaths.SIMULATION, "output_df.npy", unique_filename=True)
+        self.script_path = "examples/calo_multiobjective/container_scripts/simulation.py"
 
     def simulate(self, design: dict) -> None:
-        design_path = os.path.join(self.input_dir(), "design.json")
-        simulation_path = os.path.join(self.output_dir(), "output_df.npy")
-
         extra_args = {
             "num_layers": 5,
             "num_events": 200,
@@ -52,11 +59,9 @@ class G4CaloSimulation(SimulationContainerWrapperBase):
         }
 
         design.update(extra_args)
+        write_design_threadsafe(design, self.design_path())
 
-        with open(design_path, "w") as f:
-            json.dump(design, f)
-
-        args = python_script_args("examples/calo_multiobjective/container_scripts/simulation.py", [design_path, simulation_path])
+        args = python_script_args(self.script_path, [self.design_path(), self.simulation_path()])
         super().call_container(args, True)
 
 
@@ -67,14 +72,11 @@ class G4CaloSimToReco(SimulationTransform):
         self.target_keys = ['true_energy']
         self.classes_keys = ['contains:e+', 'contains:gamma'] #'contains:pi+', 'contains:proton'
 
-        self.input_dir = Workdir.register(DefaultPaths.SIMULATION)
-        self.output_dir = Workdir.register(DefaultPaths.SIMULATION)
+        self.simulation_path = Workdir.register_file(DefaultPaths.SIMULATION, "output_df.npy", unique_filename=False)
+        self.output_path = Workdir.register_file(DefaultPaths.SIMULATION, "output_df.pkl", unique_filename=False)
 
-    def __call__(self, design: dict, **kwargs) -> None:
-        simulation_path = os.path.join(self.input_dir(), "output_df.npy")
-        output_path = os.path.join(self.output_dir(), "output_df.pkl")
-
-        df = MiniFrame.read_pickle(simulation_path)
+    def transform(self, design: dict, **kwargs) -> None:
+        df = MiniFrame.read_pickle(self.simulation_path())
 
         reco_dict = {
             "Inputs": {key: df[key] for key in self.input_keys},
@@ -82,5 +84,5 @@ class G4CaloSimToReco(SimulationTransform):
             "Classes": {key: df[key] for key in self.classes_keys}
         }
 
-        with open(output_path, "wb") as f:
+        with open(self.output_path(), "wb") as f:
             pickle.dump(reco_dict, f)   
