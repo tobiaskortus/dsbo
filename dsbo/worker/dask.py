@@ -81,8 +81,9 @@ class DaskSlurmWorker(DaskWorkerBase):
         self.client = Client(self.cluster)
 
     def submit(self, task: WorkflowTask, design: dict, priority: int = 0) -> Future: 
-        if isinstance(task.task, DaskSimulationWrapper):
-            assert task.task.init_on_demand, "DaskSimulationWrapper inside DaskSlurmWorker must be initialized with init_on_demand=True"
+        # TODO: fix with fused tasks
+        #if isinstance(task.task, DaskSimulationWrapper):
+        #    assert task.task.init_on_demand, "DaskSimulationWrapper inside DaskSlurmWorker must be initialized with init_on_demand=True"
         
         workdir = get_workdir()
         suffix = get_file_suffix()
@@ -116,7 +117,7 @@ class AdaptiveHeterogenousDaskSlurmWorker(DaskWorkerBase):
     def submit(self, task: WorkflowTask, design: dict, priority: int = 0) -> Future:
         if task.worker_config is None:
             raise ValueError("Task does not have a worker_config defined.")
-
+        
         with self._lock:
             if task.worker_config not in self.workers:
                 self.worker_type = "cpu" if task.worker_config.gpu_resources is None else "gpu"
