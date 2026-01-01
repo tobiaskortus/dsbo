@@ -116,7 +116,7 @@ class ContainerWrapperBase:
         
         process_returncode = subprocess_run(cmd, stdout, stderr)
         if process_returncode != 0:
-            logger.log(f"Container process failed with return code {process_returncode}", level=logging.ERROR)
+            logger.log(f"Container process failed with return code {process_returncode}", log_type=logging.ERROR)
 
 
     @property
