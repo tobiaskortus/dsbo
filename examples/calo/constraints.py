@@ -16,7 +16,8 @@ class G4CaloCostConstraint(GeometryConstraintBase):
                 thickness = design[thickness_param]
                 total_cost += self.material_costs[value] * thickness
 
-        return (max(0.0, total_cost - self.max_cost),)  
+        #return (max(0.0, total_cost - self.max_cost),)  
+        return (total_cost - self.max_cost,)
 
 
 class G4CaloLengthConstraint(GeometryConstraintBase):
@@ -30,4 +31,5 @@ class G4CaloLengthConstraint(GeometryConstraintBase):
             if "thickness" in parameter:
                 total_length += value
 
-        return (max(0.0, total_length - self.max_length),)
+        #return (max(0.0, total_length - self.max_length),)
+        return (total_length - self.max_length,)
