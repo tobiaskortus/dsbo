@@ -1,4 +1,5 @@
 import os
+import dask
 import threading
 import contextvars
 from distributed import Future
@@ -7,12 +8,18 @@ from contextlib import contextmanager
 from dask_jobqueue import SLURMCluster
 from typing import Any, Generator, Optional
 
-
 from dsbo.modules.simulation import DaskSimulationWrapper
 from dsbo.utils.io import get_file_suffix, get_workdir
 from dsbo.workflow import WorkflowTask
 from dsbo.worker.config import SlurmWorkerConfig
 
+
+dask.config.set({
+    "distributed.worker.memory.target": 0.85,
+    "distributed.worker.memory.spill": 0.90,
+    "distributed.worker.memory.pause": 0.95,
+    "distributed.worker.memory.terminate": 0.98,
+})
 
 class DaskWorkerBase:
     def __init__(self):

@@ -1,6 +1,5 @@
 import logging
 from time import time
-from tkinter import W
 from distributed import Worker, get_worker
 from dsbo.utils.io import Workdir
 from contextvars import ContextVar

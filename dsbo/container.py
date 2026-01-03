@@ -21,8 +21,6 @@ class ContainerType(Enum):
     DOCKER = "docker"
 
 
-import subprocess
-
 def subprocess_run(cmd: List[str], 
                    stdout_callback: Callable[[str], None], 
                    stderr_callback: Callable[[str], None]) -> int:
@@ -51,6 +49,7 @@ def subprocess_run(cmd: List[str],
     for t in threads:
         t.join()
     return process.wait()
+
 
 class ContainerWrapperBase:
     def __init__(self, container_path, container_extra_flags: Optional[str], 
@@ -118,11 +117,9 @@ class ContainerWrapperBase:
         if process_returncode != 0:
             logger.log(f"Container process failed with return code {process_returncode}", log_type=logging.ERROR)
 
-
     @property
     def container_path(self) -> str:
         return self._container_path
-    
     
     @property
     def container_extra_flags(self) -> Optional[str]:
