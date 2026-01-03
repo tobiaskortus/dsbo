@@ -1,13 +1,15 @@
+from contextlib import nullcontext
 import math
+import os
 import matplotlib
 import networkx as nx
 from typing import List
 from copy import deepcopy
 from itertools import groupby
-from dask.distributed import Future
+from dask.distributed import Future, performance_report
 from matplotlib import pyplot as plt
 from dsbo.logger import WorkflowTaskLogger
-from dsbo.utils.io import with_remote_workdir
+from dsbo.utils.io import get_workdir, get_workdir_path, with_remote_workdir
 from dsbo.worker.config import SlurmWorkerConfig
 from typing import Callable, Optional, Sequence
 
@@ -22,6 +24,19 @@ class WorkflowTask:
     def run(self, *args, **kwargs):
         with WorkflowTaskLogger(self) as logger:
             return self.task(*args, **kwargs)
+
+
+def workflow_task(name, config)-> Callable[..., Callable[..., WorkflowTask]]:
+    def decorator(obj) -> Callable[..., WorkflowTask]:
+        task = None
+        def wrapper(*args, **kwargs):
+            nonlocal task
+            if task is None:
+                instance = obj(*args, **kwargs)
+                task = WorkflowTask(name, instance, config)
+            return task
+        return wrapper
+    return decorator
 
 
 class FusedWorkflowTask(WorkflowTask):
@@ -130,8 +145,7 @@ class WorkflowTaskGraph:
         from dsbo.worker.dask import WorkerContext
         worker = WorkerContext.get_current_worker()
         print(f"Using worker: {type(worker)}")
-        
-        #TODO: improve parallel execution within dependent task groups
+
         for depth, batch in enumerate(self.iterate_dependent_task_groups()):
             futures = []
             for task in batch:
@@ -234,6 +248,15 @@ class WorkflowTaskGraph:
         return max(self.levels.values()) + 1 if self.levels else 0
     
 
+class DefaultSimRecoWorkflow(WorkflowTaskGraph):
+    def __init__(self, sim_task: WorkflowTask, transform_task: WorkflowTaskGraph, reco_task: WorkflowTask) -> None:
+        dependencies = {
+            sim_task: [transform_task],
+            transform_task: [reco_task]
+        }
+        super().__init__(dependencies)
+
+
 def mergeable_components(task_graph: WorkflowTaskGraph, attr="worker_config") -> List[List[WorkflowTask]]:
     G = task_graph._repr
     in_deg = dict(G.in_degree())
@@ -277,3 +300,5 @@ def update_task_graph(task_graph: WorkflowTaskGraph, groups: list[list[WorkflowT
 
 def optimize(workflow: WorkflowTaskGraph) -> WorkflowTaskGraph:
     return update_task_graph(workflow, mergeable_components(workflow))
+
+
