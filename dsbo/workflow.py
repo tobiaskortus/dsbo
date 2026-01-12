@@ -47,8 +47,19 @@ class FusedWorkflowTask(WorkflowTask):
                     "All tasks in CompositeWorkflowTask must have the same worker configuration."
 
     def run(self, *args, **kwargs):
+        fused_resuts = []
+        results = []
         for task in self.tasks:
-            task.run(*args, **kwargs)
+            results.append(task.run(*args, **kwargs))
+
+        for r in results:
+            if r is not None:
+                if isinstance(r, (list, tuple)):
+                    fused_resuts.extend([x for x in r if x is not None])
+                else:
+                    fused_resuts.append(r)
+
+        return fused_resuts
     
     @property
     def worker_config(self):
@@ -171,6 +182,7 @@ class WorkflowTaskGraph:
                             results.extend([x for x in r if x is not None])
                         else:
                             results.append(r)
+                            
         return tuple(results)
 
     def iterate_dependent_task_groups(self):
@@ -249,7 +261,7 @@ class WorkflowTaskGraph:
     
 
 class DefaultSimRecoWorkflow(WorkflowTaskGraph):
-    def __init__(self, sim_task: WorkflowTask, transform_task: WorkflowTaskGraph, reco_task: WorkflowTask) -> None:
+    def __init__(self, sim_task: WorkflowTask, transform_task: WorkflowTask, reco_task: WorkflowTask) -> None:
         dependencies = {
             sim_task: [transform_task],
             transform_task: [reco_task]
