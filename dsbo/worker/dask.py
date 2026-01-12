@@ -43,7 +43,7 @@ class WorkerContext:
             cls._current_worker.reset(token)
 
     @classmethod
-    def get_current_worker(cls) -> DaskWorkerBase:
+    def get_current_worker(cls) -> Optional[DaskWorkerBase]:
         return cls._current_worker.get()
 
 
