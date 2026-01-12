@@ -117,6 +117,7 @@ class Workdir(dict):
         token = cls._current_workdir.set(registry)
         
         try:
+            os.makedirs(workdir_root, exist_ok=True)
             for path in registry.values():
                 if error_if_exists and os.path.exists(path):
                     raise FileExistsError(f"Directory {path} already exists.")
@@ -175,7 +176,7 @@ class Workdir(dict):
         return AbstractPath(path)
     
     @classmethod
-    def register_file(cls, path: Optional[str], filename: str, unique_filename: bool = True) -> str:
+    def register_file(cls, path: Optional[str], filename: str, unique_filename: bool = True) -> AbstractFilePath:
         workdir_path = Workdir.register(path)
         return AbstractFilePath(workdir_path, filename, unique_filename)
     
