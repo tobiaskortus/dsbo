@@ -171,8 +171,10 @@ class Workdir(dict):
     def register(cls, path: Union[str, DefaultPaths]) -> Callable[[], str]:
         if isinstance(path, DefaultPaths):
             path = path.value
-            
-        cls._registered_paths.add(path)
+
+        if path is not None:
+            cls._registered_paths.add(path)
+
         return AbstractPath(path)
     
     @classmethod
