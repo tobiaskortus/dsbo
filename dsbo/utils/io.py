@@ -117,6 +117,9 @@ class Workdir(dict):
         token = cls._current_workdir.set(registry)
         
         try:
+            if error_if_exists and os.path.exists(workdir_root):
+                raise FileExistsError(f"Directory {workdir_root} already exists.")
+            
             os.makedirs(workdir_root, exist_ok=True)
             for path in registry.values():
                 if error_if_exists and os.path.exists(path):
