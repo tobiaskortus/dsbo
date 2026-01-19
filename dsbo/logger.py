@@ -1,5 +1,6 @@
 import logging
 from time import time
+from typing import Optional
 from distributed import Worker, get_worker
 from dsbo.utils.io import Workdir
 from contextvars import ContextVar
@@ -7,11 +8,34 @@ from contextvars import ContextVar
 
 class WorkflowTaskLogger:
     _current_logger = ContextVar("current_logger", default=None)
+    _default_instance: Optional["WorkflowTaskLogger"] = None
 
-    def __init__(self, workflow_task, log_level: int = logging.INFO):
+    def __init__(self, workflow_task=None, log_level: int = logging.INFO, use_stdout: bool = False):
         self.log_level = log_level
-        self.task_name = workflow_task.name.lower()
-        self.log_file = Workdir.register_file(None, f"{self.task_name}.log")
+        self.use_stdout = use_stdout
+        self.file_handler = None
+        
+        if workflow_task is not None:
+            self.task_name = workflow_task.name.lower()
+            self.log_file = Workdir.register_file(None, f"{self.task_name}.log")
+        else:
+            self.task_name = "stdout"
+            self.log_file = None
+        
+        if use_stdout:
+            self._setup_stdout_logger()
+
+    def _setup_stdout_logger(self):
+        self.logger = logging.getLogger(self.task_name)
+        self.logger.setLevel(self.log_level)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setLevel(self.log_level)
+            fmt = logging.Formatter(
+                "%(name)s: %(asctime)s | %(levelname)s | %(filename)s >>> %(message)s"
+            )
+            handler.setFormatter(fmt)
+            self.logger.addHandler(handler)
 
     def log(self, string: str, log_type: int = logging.INFO):
         self.logger.log(log_type, string)
@@ -43,10 +67,22 @@ class WorkflowTaskLogger:
     def __exit__(self, exc_type, exc_value, traceback):
         self.end_time = time()
         self.log(f"Task {self.task_name} finished after {self.end_time-self.start_time} seconds.")
-        self.logger.removeHandler(self.file_handler)
-        self.file_handler.close()
+        if self.file_handler:
+            self.logger.removeHandler(self.file_handler)
+            self.file_handler.close()
         WorkflowTaskLogger._current_logger.reset(self._token)
 
     @classmethod
+    def _get_default_logger(cls) -> "WorkflowTaskLogger":
+        if cls._default_instance is None:
+            cls._default_instance = cls(workflow_task=None, use_stdout=True)
+        return cls._default_instance
+
+    @classmethod
     def get_current(cls) -> "WorkflowTaskLogger":
-        return cls._current_logger.get()
+        logger = cls._current_logger.get()
+        if logger is None:
+            return cls._get_default_logger()
+        return logger
+
+
