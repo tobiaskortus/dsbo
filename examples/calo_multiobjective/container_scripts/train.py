@@ -19,7 +19,7 @@ from reconstruction.model import Reconstruction
 from reconstruction.validation_reconstruction import ReconstructionValidation
 from classification.dataset import ClassificationDataset
 from classification.dataset import FlipAugmentation, RotationAugmentation, ShiftAugmentation
-from classification.model import Classification, Classification2
+from classification.model import Classification, Classification, Classification2
 from classification.validation_classification import ClassificationValidation
 
 
@@ -53,15 +53,15 @@ config = {
         "classes": [
             "contains:e+",
             "contains:gamma",
-            "contains:pi+",
-            "contains:proton"
+            #"contains:pi+",
+            #"contains:proton"
         ],
         "multiclass": True,
         "weight": [
             1.0,
             1.0,
-            5.0,
-            5.0
+            #5.0,
+            #5.0
         ]
     }
 }
@@ -100,7 +100,8 @@ def pre_train(
 
 def split(reco_data: dict):
     idx = np.arange(len(reco_data["Inputs"]["sensor_energy"]))
-    train_idx, valid_idx = train_test_split(idx, test_size=0.2, shuffle=True)
+    train_idx, valid_idx = train_test_split(idx, test_size=0.4, shuffle=True)
+    valid_idx, test_idx = train_test_split(valid_idx, test_size=0.5, shuffle=True)
 
     train_data = {
         "Inputs": {key: val[train_idx] for key, val in reco_data["Inputs"].items()},
@@ -112,8 +113,14 @@ def split(reco_data: dict):
         "Targets": {key: val[valid_idx] for key, val in reco_data["Targets"].items()},
         "Classes": {key: val[valid_idx] for key, val in reco_data["Classes"].items()},
     }
+
+    test_data = {
+        "Inputs": {key: val[test_idx] for key, val in reco_data["Inputs"].items()},
+        "Targets": {key: val[test_idx] for key, val in reco_data["Targets"].items()},
+        "Classes": {key: val[test_idx] for key, val in reco_data["Classes"].items()},
+    }
     
-    return train_data, val_data
+    return train_data, val_data, test_data
 
 def train(
     input_mf_path: Union[str, os.PathLike],
@@ -128,7 +135,7 @@ def train(
         reco_data = pickle.load(f)
 
     print (f'Simulation dataframe : {len(reco_data["Inputs"]["sensor_energy"])} events')
-    train_data, valid_data = split(reco_data)
+    train_data, valid_data, test_data = split(reco_data)
     print (f'Train dataset : {len(train_data["Inputs"]["sensor_energy"])} / Validation dataset : {len(valid_data["Inputs"]["sensor_energy"])}')
 
     if isVal:
@@ -151,23 +158,24 @@ def train(
         reco_early_stopping = EarlyStopping(patience=config["reconstruction"]["early_stopping"])
 
         if os.path.exists(reco_model_previous_path):
-            print ('Loading reco model')
-            reco_model: Reconstruction = torch.load(reco_model_previous_path,weights_only=False)
-            print (reco_model)
-            print("Parameters:", sum([p.numel() for p in reco_model.parameters()]))
-            print ('Creating reco dataset')
-            reco_train_dataset = ReconstructionDataset(
-                targets = config["reconstruction"]["targets"],
-                input_data = train_data,
-                means = reco_model.means,
-                stds = reco_model.stds,
-            )
-            reco_valid_dataset = ReconstructionDataset(
-                targets = config["reconstruction"]["targets"],
-                input_data = valid_data,
-                means = reco_model.means,
-                stds = reco_model.stds,
-            )
+            raise Exception()
+            #print ('Loading reco model')
+            #reco_model: Reconstruction = torch.load(reco_model_previous_path,weights_only=False)
+            #print (reco_model)
+            #print("Parameters:", sum([p.numel() for p in reco_model.parameters()]))
+            #print ('Creating reco dataset')
+            #reco_train_dataset = ReconstructionDataset(
+            #    targets = config["reconstruction"]["targets"],
+            #    input_data = train_data,
+            #    means = reco_model.means,
+            #    stds = reco_model.stds,
+            #)
+            #reco_valid_dataset = ReconstructionDataset(
+            #    targets = config["reconstruction"]["targets"],
+            #    input_data = valid_data,
+            #    means = reco_model.means,
+            #    stds = reco_model.stds,
+            #)
         else:
             print ('Creating reco dataset')
             reco_train_dataset = ReconstructionDataset(
@@ -175,6 +183,12 @@ def train(
                 input_data = train_data,
             )
             reco_valid_dataset = ReconstructionDataset(
+                targets = config["reconstruction"]["targets"],
+                input_data = valid_data,
+                means = reco_train_dataset.means,
+                stds = reco_train_dataset.stds,
+            )
+            reco_test_dataset = ReconstructionDataset(
                 targets = config["reconstruction"]["targets"],
                 input_data = valid_data,
                 means = reco_train_dataset.means,
@@ -213,7 +227,7 @@ def train(
 
         reco_validator = ReconstructionValidation(reco_model)
         train_dict_reco, train_loss_reco = reco_validator.validate(reco_train_dataset)
-        val_dict_reco, val_loss_reco = reco_validator.validate(reco_valid_dataset)
+        val_dict_reco, val_loss_reco = reco_validator.validate(reco_test_dataset)
 
         del reco_train_dataset
         del reco_valid_dataset
@@ -256,28 +270,30 @@ def train(
 
 
         if os.path.exists(class_model_previous_path):
-            print ('Loading class model')
-            class_model: Classification2 = torch.load(class_model_previous_path,weights_only=False)
-            print (class_model)
-            print("Parameters:", sum([p.numel() for p in class_model.parameters()]))
-            print ('Creating class dataset')
-            class_train_dataset = ClassificationDataset(
-                classes = config["classification"]["classes"],
-                input_data = train_data,
-                means = class_model.means,
-                stds = class_model.stds,
-                augmentations = [
-                    FlipAugmentation(),
-                    RotationAugmentation(),
-                    ShiftAugmentation(),
-                ],
-            )
-            class_valid_dataset = ClassificationDataset(
-                classes = config["classification"]["classes"],
-                input_data = train_data,
-                means = class_model.means,
-                stds = class_model.stds,
-            )
+            #print ('Loading class model')
+            #class_model: Classification2 = torch.load(class_model_previous_path,weights_only=False)
+            #print (class_model)
+            #print("Parameters:", sum([p.numel() for p in class_model.parameters()]))
+            #print ('Creating class dataset')
+            #class_train_dataset = ClassificationDataset(
+            #    classes = config["classification"]["classes"],
+            #    input_data = train_data,
+            #    means = class_model.means,
+            #    stds = class_model.stds,
+            #    augmentations = [
+            #        FlipAugmentation(),
+            #        RotationAugmentation(),
+            #        ShiftAugmentation(),
+            #    ],
+            #)
+            #class_valid_dataset = ClassificationDataset(
+            #    classes = config["classification"]["classes"],
+            #    input_data = train_data,
+            #    means = class_model.means,
+            #    stds = class_model.stds,
+            #)
+            pass
+            
         else:
             print ('Creating class dataset')
             print ('Training')
@@ -293,7 +309,14 @@ def train(
             print ('Validation')
             class_valid_dataset = ClassificationDataset(
                 classes = config["classification"]["classes"],
-                input_data = train_data,
+                input_data = valid_data,
+                means = class_train_dataset.means,
+                stds = class_train_dataset.stds,
+            )
+
+            class_test_dataset = ClassificationDataset(
+                classes = config["classification"]["classes"],
+                input_data = test_data,
                 means = class_train_dataset.means,
                 stds = class_train_dataset.stds,
             )
@@ -336,7 +359,7 @@ def train(
 
         class_validator = ClassificationValidation(class_model)
         train_dict_class, train_loss_class = class_validator.validate(class_train_dataset)
-        val_dict_class, val_loss_class = class_validator.validate(class_valid_dataset)
+        val_dict_class, val_loss_class = class_validator.validate(class_test_dataset)
         print("Finished")
 
         class_loss_plotter.plot(
