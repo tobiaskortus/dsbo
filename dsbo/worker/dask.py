@@ -34,8 +34,8 @@ class WorkerContext:
 
     @classmethod
     @contextmanager
-    def use_worker(cls, worker: DaskWorkerBase) -> Generator[None, Any, None]:
-        assert isinstance(worker, DaskWorkerBase), "Worker must be an instance of DaskWorkerBase"
+    def use_worker(cls, worker: Optional[DaskWorkerBase]) -> Generator[None, Any, None]:
+        assert worker == None or isinstance(worker, DaskWorkerBase), "Worker must be an instance of DaskWorkerBase"
         token = cls._current_worker.set(worker)
         try:
             yield

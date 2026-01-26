@@ -16,7 +16,6 @@ class SimulationBase(Module):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
 
-    @with_remote_workdir
     def __call__(self, design: dict, **kwargs) -> None:
         return self.simulate(design, **kwargs)
 
@@ -65,7 +64,7 @@ class DaskSimulationWrapper(SimulationBase):
                                     dashboard_address=None, processes=False)
         self.client = Client(self.cluster)
     
-    def simulate(self, design: dict) -> None:
+    def simulate(self, design: dict) -> Optional[dict[str, float]]:
         if self.init_on_demand:
             self.initialize_local_cluster(self.n_workers, self.threads_per_worker)
 

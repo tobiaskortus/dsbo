@@ -7,6 +7,10 @@ from enum import Enum
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Generator, Generator, List, Optional, Set, Union
 
+def _is_dry_run():
+    from dsbo.modules.compile import is_dry_run
+    return is_dry_run()
+
 
 class DefaultPaths(Enum):
     SIMULATION = "simulation"
@@ -19,6 +23,9 @@ class AbstractPath:
         self._path = path
 
     def __call__(self):
+        if _is_dry_run():
+            return None
+        
         root = Workdir._current_workdir.get()
         if root is None:
             print("Warning: No workdir root is set. Using cwd instead.")
@@ -223,6 +230,9 @@ def get_workdir_path(stage: str) -> str:
 def with_remote_workdir(func: Callable) -> Callable:
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs) -> Any:
+        if _is_dry_run():
+            return func(self, *args, **kwargs)
+        
         workdir = kwargs.pop("workdir", None)
         suffix = kwargs.pop("suffix", None)
         with Workdir.load(workdir) if workdir else nullcontext():

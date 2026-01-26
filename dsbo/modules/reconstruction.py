@@ -4,16 +4,14 @@ from typing import Optional
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
+from dsbo.modules import Module
 from dsbo.container import ContainerWrapperBase
-from dsbo.utils.io import with_remote_workdir
 
-class ReconstructionBase(ABC):
-    """Abstract base class for reconstruction modules."""
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)
+class ReconstructionBase(Module):
+    def __init__(self) -> None:
+        super().__init__()
 
-    @with_remote_workdir
-    def __call__(self, *args, **kwds):
+    def __call__(self, *args, **kwds) -> Optional[dict[str, float]]:
         self.train()
         return self.validate()
     
@@ -22,14 +20,16 @@ class ReconstructionBase(ABC):
         pass
     
     @abstractmethod
-    def validate(self) -> Sequence[float]:
+    def validate(self) -> Optional[dict[str, float]]:
         pass
 
 
 class ReconstructionContainerWrapper(ReconstructionBase, ContainerWrapperBase):
     def __init__(self, container_path: str, container_extra_flags: Optional[str] = None, cuda_enabled: bool = True) -> None:
-        super().__init__(container_path=container_path, 
-                         container_extra_flags=container_extra_flags, cuda_enabled=cuda_enabled)
+        ReconstructionBase.__init__(self)
+        ContainerWrapperBase.__init__(self, container_path=container_path,
+                                      container_extra_flags=container_extra_flags,
+                                      cuda_enabled=cuda_enabled)
 
     def call_container(self, arguments: list, is_exec: bool = False) -> None:
         if is_exec: super().exec_container(arguments)

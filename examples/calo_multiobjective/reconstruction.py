@@ -28,5 +28,6 @@ class G4CaloReconstruction(ReconstructionContainerWrapper):
         train_args = python_script_args(self.script_path, args=args)
         super().call_container(train_args, True)
     
-    def validate(self, **kwargs) -> Sequence[float]:
-        return tuple(map(float, np.loadtxt(self.reco_path)))
+    def validate(self, **kwargs) -> Optional[dict[str, float]]:
+        losses = tuple(map(float, np.loadtxt(self.reco_path)))
+        return {"energy_resolution": losses[0], "particle_id": losses[1]}
