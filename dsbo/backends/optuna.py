@@ -6,14 +6,14 @@ from contextlib import nullcontext
 from optuna.storages import JournalStorage
 from optuna.samplers._base import _CONSTRAINTS_KEY
 from optuna.storages.journal import JournalFileBackend
-from typing import Any, Optional, Callable, Sequence, Union
+from typing import Any, Iterable, Optional, Callable, Sequence, Union
 
 from dsbo.utils.io import Workdir
 from dsbo.worker.dask import AdaptiveHeterogenousDaskSlurmWorker, DaskSlurmWorker, WorkerContext
 from dsbo.workflow import  WorkflowTaskGraph
 from dsbo.parameters import ValueRegistry
 from dsbo.constraints import GeometryConstraintBase
-from dsbo.objectives import Objective, check_objective_vals, is_single_objective
+from dsbo.objectives import Objective, is_single_objective, check_workflow_validity, get_objective_vals
 from dsbo.parameters import DesignParameter, CompositeDesignParameter, ContinuousDesignParameter, CategoricalDesignParameter
 from optuna_integration.botorch import qehvi_candidates_func
 
@@ -69,7 +69,7 @@ def get_directions(objective: Union[Objective, Sequence[Objective]]) -> Sequence
 
 class OptunaBackend:
     def __init__(self, study_name: str, workflow: WorkflowTaskGraph, design: CompositeDesignParameter, 
-                 constraint: Optional[GeometryConstraintBase], objective: Union[Objective, Sequence[Objective]],
+                 constraint: Optional[GeometryConstraintBase], objective: Union[Objective, Iterable[Objective]],
                  worker: Optional[Union[DaskSlurmWorker, AdaptiveHeterogenousDaskSlurmWorker]] = None,
                  seed: int = 42) -> None:
         
@@ -88,6 +88,8 @@ class OptunaBackend:
                                                          consider_running_trials=True, seed=seed, device="cuda")
         #self.sampler = optuna.samplers.RandomSampler(seed=seed)
 
+        check_workflow_validity(self.workflow, self.objective)
+
     def sample_design(self, trial: optuna.trial.Trial) -> Any:
         """
         Only sample the design parameters for a trial (this triggers GP fitting in the sampler).
@@ -104,14 +106,15 @@ class OptunaBackend:
             try:
                 workdir_root = os.path.join("files", f"run{self.seed}", f"trial_{trial_number}")
                 with Workdir.create(workdir_root):
-                    objective_val = self.workflow.run(sampled_design.to_dict(flatten=True))
-                    check_objective_vals(objective_val, self.objective)
+                    result = self.workflow.run(sampled_design.to_dict(flatten=True))
+                    objective_val = get_objective_vals(result, self.objective)
                     
                     constraints = None
                     if self.constraint is not None:
                         constraints = self.constraint(sampled_design.to_dict(flatten=True))
                     
                     return objective_val[0] if is_single_objective(self.objective) else objective_val, constraints
+                
             except Exception as e:
                 print(f"Trial {trial_number} failed with error: {e}")
                 raise TrialFailedError()

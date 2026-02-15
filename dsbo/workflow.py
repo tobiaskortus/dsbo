@@ -9,6 +9,7 @@ from itertools import groupby
 from dask.distributed import Future, performance_report
 from matplotlib import pyplot as plt
 from dsbo.logger import WorkflowTaskLogger
+from dsbo.modules.compile import is_dry_run
 from dsbo.utils.io import get_workdir, get_workdir_path, with_remote_workdir
 from dsbo.worker.config import SlurmWorkerConfig
 from typing import Callable, Optional, Sequence
@@ -22,7 +23,7 @@ class WorkflowTask:
 
     @with_remote_workdir
     def run(self, *args, **kwargs):
-        with WorkflowTaskLogger(self) as logger:
+        with WorkflowTaskLogger(self) if not is_dry_run() else nullcontext() as logger:
             return self.task(*args, **kwargs)
 
 
@@ -47,19 +48,11 @@ class FusedWorkflowTask(WorkflowTask):
                     "All tasks in CompositeWorkflowTask must have the same worker configuration."
 
     def run(self, *args, **kwargs):
-        fused_resuts = []
-        results = []
+        results = {}
         for task in self.tasks:
-            results.append(task.run(*args, **kwargs))
+            results.update(task.run(*args, **kwargs))
 
-        for r in results:
-            if r is not None:
-                if isinstance(r, (list, tuple)):
-                    fused_resuts.extend([x for x in r if x is not None])
-                else:
-                    fused_resuts.append(r)
-
-        return fused_resuts
+        return results
     
     @property
     def worker_config(self):
@@ -144,15 +137,14 @@ class WorkflowTaskGraph:
         assert_no_duplicate_nodes(self._repr)
         #assert_no_disconnected_nodes(self._repr)
 
-    def run(self, design: dict) -> tuple[float]:
+    def run(self, design: dict) -> dict[str, float]:
         """ Sequential execution of the task graph without worker distribution 
         For distributed execution, use TODO: Something?!?!?!
         
         Args:
             design (dict): Design parameters that should be used to evaluate the defined workflow.
         """
-        #TODO: improve aggregation of results from output tasks
-        results = []
+        results = {}
         from dsbo.worker.dask import WorkerContext
         worker = WorkerContext.get_current_worker()
         print(f"Using worker: {type(worker)}")
@@ -162,28 +154,20 @@ class WorkflowTaskGraph:
             for task in batch:
                 if worker is None:
                     result = task.run(design=design)
-                    if is_output_task(self._repr, task):
-                        #TODO: well...
-                        if result is not None:
-                            if isinstance(result, (list, tuple)):
-                                results.extend([r for r in result if r is not None])
-                            else:
-                                results.append(result)
+                    results.update(result)
                 else:
                     future = worker.submit(task, design=design, priority=depth)
                     futures.append(future)
 
             if worker is not None:
-                #TODO: well ...
+                #TODO: Change this to when_ready
                 batch_results = tuple(f.result() for f in futures if f is not None)
                 for r in batch_results:
                     if r is not None:
-                        if isinstance(r, (list, tuple)):
-                            results.extend([x for x in r if x is not None])
-                        else:
-                            results.append(r)
+                        results.update(r)
                             
-        return tuple(results)
+                            
+        return results
 
     def iterate_dependent_task_groups(self):
         for batch in get_dependent_task_groups(self._repr):

@@ -5,7 +5,7 @@ from typing import Optional
 from collections.abc import Sequence
 
 from dsbo.utils import python_script_args
-from dsbo.reconstruction import ReconstructionContainerWrapper
+from dsbo.modules.reconstruction import ReconstructionContainerWrapper
 
 class G4CaloReconstruction(ReconstructionContainerWrapper):
     def __init__(self, workdir, container_path: str, container_extra_flags: Optional[str] = "--nv"):
