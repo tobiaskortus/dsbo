@@ -1,5 +1,6 @@
 import gc
 import os
+import torch
 import optuna
 import logging
 from contextlib import nullcontext
@@ -9,7 +10,7 @@ from optuna.storages.journal import JournalFileBackend
 from typing import Any, Iterable, Optional, Callable, Sequence, Union
 
 from dsbo.utils.io import Workdir
-from dsbo.worker.dask import AdaptiveHeterogenousDaskSlurmWorker, DaskSlurmWorker, WorkerContext
+from dsbo.worker.dask import  WorkerContext, DaskWorkerBase
 from dsbo.workflow import  WorkflowTaskGraph
 from dsbo.parameters import ValueRegistry
 from dsbo.constraints import GeometryConstraintBase
@@ -70,7 +71,7 @@ def get_directions(objective: Union[Objective, Sequence[Objective]]) -> Sequence
 class OptunaBackend:
     def __init__(self, study_name: str, workflow: WorkflowTaskGraph, design: CompositeDesignParameter, 
                  constraint: Optional[GeometryConstraintBase], objective: Union[Objective, Iterable[Objective]],
-                 worker: Optional[Union[DaskSlurmWorker, AdaptiveHeterogenousDaskSlurmWorker]] = None,
+                 worker: Optional[DaskWorkerBase] = None,
                  seed: int = 42) -> None:
         
         self.seed = seed
@@ -84,8 +85,9 @@ class OptunaBackend:
         #self.sampler = optuna.samplers.TPESampler(n_startup_trials=30, multivariate=True, constant_liar=True,
         #                                          constraints_func=constraint_fn, seed=seed)
         #self.sampler = optuna.samplers.GPSampler(n_startup_trials=50, constraints_func=constraint_fn, seed=seed)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.sampler = optuna.integration.BoTorchSampler(candidates_func=qehvi_candidates_func_wrapper, n_startup_trials=100, constraints_func=constraint_fn, 
-                                                         consider_running_trials=True, seed=seed, device="cuda")
+                                                         consider_running_trials=True, seed=seed, device=self.device)
         #self.sampler = optuna.samplers.RandomSampler(seed=seed)
 
         check_workflow_validity(self.workflow, self.objective)

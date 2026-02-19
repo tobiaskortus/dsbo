@@ -6,7 +6,7 @@ import networkx as nx
 from typing import List
 from copy import deepcopy
 from itertools import groupby
-from dask.distributed import Future, performance_report
+from dask.distributed import Future, performance_report, as_completed
 from matplotlib import pyplot as plt
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.modules.compile import is_dry_run
@@ -149,22 +149,25 @@ class WorkflowTaskGraph:
         worker = WorkerContext.get_current_worker()
         print(f"Using worker: {type(worker)}")
 
+        future_map: dict[WorkflowTask, Future] = {}
+
         for depth, batch in enumerate(self.iterate_dependent_task_groups()):
-            futures = []
             for task in batch:
                 if worker is None:
                     result = task.run(design=design)
                     results.update(result)
                 else:
-                    future = worker.submit(task, design=design, priority=depth)
-                    futures.append(future)
+                    pred_futures = [future_map[p] for p in self._repr.predecessors(task)]
 
-            if worker is not None:
-                #TODO: Change this to when_ready
-                batch_results = tuple(f.result() for f in futures if f is not None)
-                for r in batch_results:
-                    if r is not None:
-                        results.update(r)
+                    future = worker.submit(task, design=design, priority=depth, dependencies=pred_futures)
+                    future_map[task] = future
+
+        if worker is not None:
+            futures = future_map.values()
+            for f in as_completed(futures):
+                r = f.result()
+                if r is not None:
+                    results.update(r)
                             
                             
         return results

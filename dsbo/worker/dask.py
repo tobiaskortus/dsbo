@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import dask
 import threading
@@ -6,13 +7,13 @@ from distributed import Future
 from dask.distributed import Client
 from contextlib import contextmanager
 from dask_jobqueue import SLURMCluster
-from typing import Any, Generator, Optional
-
-from dsbo.modules.simulation import DaskSimulationWrapper
+from dask_heterogeneous.slurm import HeterogeneousSlurmCluster
+from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 from dsbo.utils.io import get_file_suffix, get_workdir
-from dsbo.workflow import WorkflowTask
-from dsbo.worker.config import SlurmWorkerConfig
 
+if TYPE_CHECKING:
+    from dsbo.worker.config import SlurmWorkerConfig
+    from dsbo.workflow import WorkflowTask, WorkflowTaskGraph
 
 dask.config.set({
     "distributed.worker.memory.target": 0.85,
@@ -24,8 +25,8 @@ dask.config.set({
 class DaskWorkerBase:
     def __init__(self):
         pass
-
-    def submit(self, task: WorkflowTask, design: dict, priority: int = 0) -> Future:
+    def submit(self, task: WorkflowTask, design: dict, priority: int = 0,
+               dependencies: Optional[Iterable[Future]] = None, **client_kwargs) -> Future:
         raise NotImplementedError("submit method must be implemented by subclasses.")
 
 
@@ -53,7 +54,7 @@ def get_num_gpus(worker_config: SlurmWorkerConfig) -> int:
         return 0
     else:
         try:
-            resource_str = worker_config.gpu_resources 
+            resource_str = worker_config.gpu_resources
             return int(resource_str.split(":")[-1])
         except Exception as e:
             raise ValueError(f"Invalid gpu_resources format: {worker_config.gpu_resources}") from e
@@ -61,77 +62,125 @@ def get_num_gpus(worker_config: SlurmWorkerConfig) -> int:
 
 def get_extra_args(worker_config: SlurmWorkerConfig) -> tuple[list[str], list[str]]:
     """Generate extra arguments for the Dask SlurmCluster based on the worker configuration."""
+    resource_name = worker_config.resource_key
     if worker_config.gpu_resources is None:
-        return ([], [])
+        return ([f"--resources {resource_name}=1"], [])
     else:
         num_gpus = get_num_gpus(worker_config)
-        return ([f"--resources GPU={num_gpus}"],
+        return ([f"--resources {resource_name}={num_gpus}"],
                 [f"--gres={worker_config.gpu_resources}"])
     
 
-class DaskSlurmWorker(DaskWorkerBase):
-    def __init__(self, n_worker: int, worker_config: SlurmWorkerConfig, adaptive: bool = False, logdir: str = "logs"): 
-        worker_extra_args, job_extra_directives = get_extra_args(worker_config)
-        self.n_worker = n_worker
-        self.adaptive = adaptive
-        
-        self.cluster = SLURMCluster(cores=1, queue=worker_config.partition, memory=worker_config.memory, 
-                    walltime=worker_config.walltime, worker_extra_args=worker_extra_args,
-                    job_extra_directives=job_extra_directives, log_directory=logdir, 
-                    processes=1, job_cpu=worker_config.job_cpu)
-        
-        if not self.adaptive:
-            self.cluster.scale(n_worker)
-        else:
-            self.cluster.adapt(minimum=0, maximum=n_worker)
+#class DaskSlurmWorker(DaskWorkerBase):
+#    def __init__(self, n_worker: int, worker_config: SlurmWorkerConfig, adaptive: bool = False, logdir: str = "logs"):
+#        worker_extra_args, job_extra_directives = get_extra_args(worker_config)
+#        self.n_worker = n_worker
+#        self.adaptive = adaptive
+#
+#        self.cluster = SLURMCluster(cores=1, queue=worker_config.partition, memory=worker_config.memory,
+#                    walltime=worker_config.walltime, worker_extra_args=worker_extra_args,
+#                    job_extra_directives=job_extra_directives, log_directory=logdir,
+#                    processes=1, job_cpu=worker_config.job_cpu)
+#
+#        if not self.adaptive:
+#            self.cluster.scale(n_worker)
+#        else:
+#            self.cluster.adapt(minimum=0, maximum=n_worker)
+#
+#        self.client = Client(self.cluster)
+#
+#    def submit(self, task: "WorkflowTask", design: dict, priority: int = 0,
+#               dependencies: Optional[Iterable[Future]] = None, **client_kwargs) -> Future:
+#        """Submit a task using the Dask client.
+#
+#        Predecessor futures passed in `dependencies` are forwarded as extra
+#        positional arguments to `task.run` so that Dask builds the proper
+#        dependency edges automatically.
+#        """
+#        workdir = get_workdir()
+#
+#        # Base kwargs that should always be forwarded to the remote invocation
+#        submit_kwargs: dict = {
+#            "workdir": workdir.workdir_root,
+#            "suffix": get_file_suffix(),
+#            "priority": priority,
+#        }
+#
+#        # Merge any caller-specified client kwargs (e.g. resources)
+#        submit_kwargs.update(client_kwargs or {})
+#
+#        # If the task has a worker_config with resources, prefer that unless
+#        # caller explicitly provided `resources` in client_kwargs
+#        if (
+#            "resources" not in submit_kwargs
+#            and getattr(task, "worker_config", None)
+#            and getattr(task.worker_config, "resources", None)
+#        ):
+#            submit_kwargs["resources"] = task.worker_config.resources
+#
+#        deps = list(dependencies) if dependencies is not None else []
+#
+#        # Pass predecessor futures as positional args so Dask treats them as
+#        # dependencies of this submission.
+#        return self.client.submit(task.run, design, *deps, **submit_kwargs)
+#
+#    def __enter__(self):
+#        return self
+#
+#    def __exit__(self, exc_type, exc_val, exc_tb):
+#        self.client.close()
+#        self.cluster.close()
+
+
+class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
+    def __init__(self, job_specs: Iterable[SlurmWorkerConfig], logdir: str = "logs"):
+        super().__init__()
+        self.logdir = logdir
+
+        spec_dict = {
+            spec.resource_key: {
+                "cores": 1,
+                "queue": spec.partition,
+                "memory": spec.memory,
+                "walltime": spec.walltime,
+                "worker_extra_args": get_extra_args(spec)[0],
+                "job_extra_directives": get_extra_args(spec)[1],
+                "processes": 1,
+                "job_cpu": spec.job_cpu,
+                "resources": spec.resources,
+            }
+            for spec in job_specs
+        }
+
+        self.cluster = HeterogeneousSlurmCluster(spec=spec_dict, log_directory=logdir)
+        #TODO: change adapt call to specify min/max workers per spec_key based with reasonable values provided
+        self.cluster.adapt({spec_key: (0, 10) for spec_key in spec_dict.keys()})
 
         self.client = Client(self.cluster)
 
-    def submit(self, task: WorkflowTask, design: dict, priority: int = 0) -> Future: 
-        # TODO: fix with fused tasks
-        #if isinstance(task.task, DaskSimulationWrapper):
-        #    assert task.task.init_on_demand, "DaskSimulationWrapper inside DaskSlurmWorker must be initialized with init_on_demand=True"
-        
-        workdir = get_workdir()
-        suffix = get_file_suffix()
-        return self.client.submit(task.run, design, 
-                                  workdir=workdir.workdir_root, suffix=suffix, 
-                                  priority=priority)
-
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.client.close()
         self.cluster.close()
 
-class AdaptiveHeterogenousDaskSlurmWorker(DaskWorkerBase):
-    def __init__(self, max_workers: int, logdir: str = "logs"):
-        self.logdir = logdir
-        self.max_workers = max_workers
-        self.workers: dict[SlurmWorkerConfig, DaskSlurmWorker] = {}
-        self._lock = threading.Lock()
+    @classmethod
+    def from_workflow(cls, workflow: WorkflowTaskGraph, logdir: str = "logs") -> "AdaptiveHeterogeneousDaskSlurmWorker":
+        job_specs = workflow.get_unique_workers()
+        return cls(job_specs=job_specs, logdir=logdir)
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        with self._lock:
-            for worker in self.workers.values():
-                worker.client.close()
-                worker.cluster.close()
-
-    def submit(self, task: WorkflowTask, design: dict, priority: int = 0) -> Future:
-        if task.worker_config is None:
-            raise ValueError("Task does not have a worker_config defined.")
+    def submit(self, task: WorkflowTask, design: dict, priority: int = 0,
+               dependencies: Optional[Iterable[Future]] = None, **client_kwargs) -> Future:
         
-        with self._lock:
-            if task.worker_config not in self.workers:
-                self.worker_type = "cpu" if task.worker_config.gpu_resources is None else "gpu"
-                self.workers[task.worker_config] = DaskSlurmWorker(
-                    n_worker=self.max_workers, worker_config=task.worker_config, adaptive=True,
-                    logdir=os.path.join(self.logdir, self.worker_type))
-            worker = self.workers[task.worker_config]
+        workdir = get_workdir()
 
-        return worker.submit(task, design=design, priority=priority)
+        submit_kwargs: dict = {
+            "workdir": workdir.workdir_root, 
+            "suffix": get_file_suffix(), 
+            "priority": priority,
+            "resources": task.worker_config.resources}
         
+        submit_kwargs.update(client_kwargs or {})
+        deps = list(dependencies) if dependencies is not None else []
+        return self.client.submit(task.run, design, *deps, **submit_kwargs)
