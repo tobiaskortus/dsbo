@@ -5,7 +5,10 @@ import matplotlib
 import networkx as nx
 from typing import List
 from copy import deepcopy
+from graphviz import Digraph
 from itertools import groupby
+import matplotlib
+import matplotlib.colors as mcolors
 from dask.distributed import Future, performance_report, as_completed
 from matplotlib import pyplot as plt
 from dsbo.logger import WorkflowTaskLogger
@@ -13,6 +16,7 @@ from dsbo.modules.compile import is_dry_run
 from dsbo.utils.io import get_workdir, get_workdir_path, with_remote_workdir
 from dsbo.worker.config import SlurmWorkerConfig
 from typing import Callable, Optional, Sequence
+from IPython.display import Image, display
 
 
 class WorkflowTask:
@@ -102,22 +106,6 @@ def task_levels(G: nx.DiGraph):
         levels[node] = 0 if not preds else 1 + max(levels[p] for p in preds)
     return levels
 
-def task_layout(G: nx.DiGraph, x_spacing=1, y_spacing=0.5):
-    levels = task_levels(G)
-
-    pos = {}
-    for level in sorted(set(levels.values())):
-        nodes = [n for n, l in levels.items() if l == level]
-
-        # center nodes vertically
-        offset = (len(nodes) - 1) / 2
-        for i, node in enumerate(nodes):
-            x = level * x_spacing
-            y = (offset - i) * y_spacing
-            pos[node] = (x, y)
-
-    return pos
-
 def is_output_task(G: nx.DiGraph, task: WorkflowTask) -> bool:
     return G.out_degree(task) == 0
 
@@ -183,60 +171,79 @@ class WorkflowTaskGraph:
                 workers.add(node.worker_config)
         return workers
 
-    def visualize(self, fname: Optional[str] = None) -> None:
-        max_nodes_in_level = max((len([n for n, l in self.levels.items() if l == lvl]) \
-                                  for lvl in set(self.levels.values())), default=1)
-
-        width = min(max(2 + self.max_depth * 2.5, 6), 30)
-        height = min(max(1.5 + max_nodes_in_level * 1.2, 3.5), 20)
-
-        fig, ax = plt.subplots(figsize=(width, height))
-
-        pos = task_layout(self._repr, y_spacing=1, x_spacing=0.6)
+    def visualize(self, filename=None, format='png'):
         
-        worker_groups = {}
-        for node in self._repr.nodes():
-            if node.worker_config is not None:
-                wc = node.worker_config
-                key = f"mem={wc.memory}, cpu={wc.job_cpu}, gpu={wc.gpu_resources}"
+        def _node_label(node):
+            wc = getattr(node, 'worker_config', None)
+            name = ','.join(t.name for t in node.tasks) if isinstance(node, FusedWorkflowTask) else (node.name if isinstance(node, WorkflowTask) else str(node))
+            wk = 'default' if wc is None else f'gpu={wc.gpu_resources}, cpu={wc.job_cpu}, mem={wc.memory}'
+            return f"{name}\n{wk}"
+        
+        fmt = format
+        if filename:
+            base, ext = os.path.splitext(filename)
+            if ext:
+                filename = base
+                fmt = ext.lstrip('.')
+        dot = Digraph(format=fmt)
+        dot.attr(rankdir='LR')
+
+        def wc_key(n):
+            wc = getattr(n, 'worker_config', None)
+            return 'default' if wc is None else f"mem={wc.memory}, cpu={wc.job_cpu}, gpu={wc.gpu_resources}"
+
+        nodes = list(self._repr.nodes())
+        keys = []
+        groups = {}
+        for n in nodes:
+            k = wc_key(n)
+            groups.setdefault(k, []).append(n)
+            if k not in keys:
+                keys.append(k)
+
+        cmap = matplotlib.colormaps['Set3']
+        color_map = {k: mcolors.to_hex(cmap(i % cmap.N)) for i, k in enumerate(keys)}
+
+        rep_entry = {}
+        rep_exit = {}
+
+        for n in nodes:
+            color = color_map.get(wc_key(n), '#d3d3d3')
+            if isinstance(n, FusedWorkflowTask):
+                cluster_name = f"cluster_{id(n)}"
+                sub_ids = []
+                with dot.subgraph(name=cluster_name) as c:
+                    c.attr(label='', rank='same', style="dashed")
+                    for i, sub in enumerate(n.tasks):
+                        sid = f"{id(n)}_sub_{i}"
+                        c.node(sid, label=_node_label(sub), style='filled', fillcolor=color, shape='box', color='black', penwidth='1')
+                        sub_ids.append(sid)
+                    for a, b in zip(sub_ids, sub_ids[1:]):
+                        c.edge(a, b)
+                if sub_ids:
+                    rep_entry[n], rep_exit[n] = sub_ids[0], sub_ids[-1]
+                else:
+                    rep_entry[n] = rep_exit[n] = str(id(n))
             else:
-                key = "default"
-            worker_groups.setdefault(key, []).append(node)
+                nid = str(id(n))
+                dot.node(nid, label=_node_label(n), style='filled', fillcolor=color, shape='box', fontcolor='black')
+                rep_entry[n] = rep_exit[n] = nid
 
-        cmap = matplotlib.colormaps["Set3"]
-        keys = list(worker_groups.keys())
-        color_map = {k: cmap(i % cmap.N) for i, k in enumerate(keys)}
+        for u, v in self._repr.edges():
+            src = rep_exit.get(u, str(id(u)))
+            dst = rep_entry.get(v, str(id(v)))
+            dot.edge(src, dst)
 
-        #Remove arrows for now. TODO: fix the positioning otf arrows to avoid overlap
-        nx.draw_networkx_edges(self._repr, pos, arrowsize=0.001, ax=ax, connectionstyle='arc3,rad=0.0')
+        if keys:
+            rows = ''.join([f"<TR><TD BGCOLOR='{color_map[k]}' FIXEDSIZE='TRUE' WIDTH='20' HEIGHT='14'></TD><TD ALIGN='LEFT'>&nbsp;{k}</TD></TR>" for k in keys])
+            table = f"<TABLE BORDER='0' CELLBORDER='0' CELLSPACING='4'>{rows}</TABLE>"
+            dot.node('legend', label=f'<{table}>', shape='none')
 
-        for node in self._repr.nodes():
-            x, y = pos[node]
-            node_key = None
-            for k, ns in worker_groups.items():
-                if node in ns:
-                    node_key = k
-                    break
-            color = color_map.get(node_key, (0.8, 0.8, 0.8, 1.0))
-            ax.text(x, y, node.name, ha='center', va='center', zorder=3, fontsize=12,
-                bbox=dict(boxstyle='square,pad=0.3', facecolor=color, edgecolor='black', linewidth=0.8))
+        if filename is not None:
+            return dot.render(filename, cleanup=True)
+        img = dot.pipe(format=format)
+        display(Image(img))
 
-        import matplotlib.patches as mpatches
-        patches = [mpatches.Patch(color=color_map[k], label=k) for k in keys]
-        if patches:
-            ncol = 2
-            nrows = math.ceil(len(keys) / ncol)
-            bottom_pad = 0.1 + 0.06 * nrows
-            fig.legend(handles=patches, title="Worker Configuration (mem, cpu, gpu)", loc='lower center', ncol=2, bbox_to_anchor=(0.5, -0.05), 
-                       frameon=False, title_fontproperties={'weight':'bold'})
-            
-            fig.subplots_adjust(bottom=bottom_pad)
-
-        ax.axis('scaled')
-        ax.axis("off")
-
-        if fname is not None:
-            plt.savefig(fname, bbox_inches='tight', dpi=300)
 
     @property
     def levels(self):
