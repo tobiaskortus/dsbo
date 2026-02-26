@@ -4,7 +4,6 @@ import math
 from typing import Iterable, Mapping
 
 
-
 class DependencyDict(dict):
     def __init__(self, mapping: dict = {}):
         super().__init__(mapping)
@@ -18,6 +17,22 @@ class DependencyDict(dict):
                 return out
             case _:
                 raise TypeError(f"Unsupported operand type(s) for |: 'DependencyDict' and '{type(other).__name__}'")
+
+    def __mul__(self, other):
+        if isinstance(other, Dynamic):
+            other.subgraph = self
+            return other
+
+        if isinstance(other, int):
+            all_nodes = list(set(self.keys()) | set(x for vs in self.values() for x in vs))
+            out = {}
+            for i in range(other):
+                copied = {orig: orig.iter_copy(i) for orig in all_nodes}
+                for orig_k, orig_vs in self.items():
+                    out[copied[orig_k]] = [copied[v] for v in orig_vs]
+            return DependencyDict(out)
+
+        raise TypeError(f"Unsupported operand type(s) for *: 'DependencyDict' and '{type(other).__name__}'")
 
     def __rshift__(self, other):
         from collections.abc import Iterable
@@ -52,15 +67,23 @@ class DependencyDict(dict):
         rhs_map = _normalize(other)
 
         def _has_replicas(m: Mapping) -> bool:
-            return any(isinstance(getattr(k, 'iter', None), int) for k in m.keys())
+            return any(isinstance(getattr(k, 'i', None), int) for k in m.keys())
 
         if _has_replicas(self) and _has_replicas(rhs_map):
-            rhs_keys = {k for k in rhs_map.keys() if isinstance(getattr(k, 'iter', None), int)}
-            if not rhs_keys.issubset(self_leaves):
+            is_subgraph_dynamic = isinstance(other, Dynamic) and getattr(other, 'subgraph', None) is not None
+            if not is_subgraph_dynamic and isinstance(other, DependencyDict):
                 raise TypeError(
-                    "Ambiguous replicated-to-replicated operation: use dynamic() for the "
-                    "second expression (e.g. `a * 2 >> b * dynamic()`) to indicate a 1:1 mapping."
+                    "Ambiguous replicated-to-replicated operation: both sides use integer replication. "
+                    "Use `dynamic()` on the RHS (e.g. `a * n >> b * dynamic()`) to indicate a 1:1 mapping, "
+                    "or replicate a subgraph (e.g. `(subgraph) * n`)."
                 )
+            if not is_subgraph_dynamic:
+                rhs_keys = {k for k in rhs_map.keys() if isinstance(getattr(k, 'i', None), int)}
+                if not rhs_keys.issubset(self_leaves):
+                    raise TypeError(
+                        "Ambiguous replicated-to-replicated operation: use dynamic() for the "
+                        "second expression (e.g. `a * 2 >> b * dynamic()`) to indicate a 1:1 mapping."
+                    )
 
         # if rhs_map uses the None key it's an explicit list-of-targets
         if None in rhs_map:
@@ -97,16 +120,56 @@ class DependencyDict(dict):
 class Dynamic:
     def __init__(self):
         self.module: "Module" | None = None
+        self.subgraph: DependencyDict | None = None
 
     def __rrshift__(self, left_leaves):
         left_list = sorted(left_leaves, key=lambda x: getattr(x, 'i', 0))
-        mapping = {}
-        for i, left in enumerate(left_list):
-            idx = getattr(left, 'i', i)
-            if self.module is None:
-                raise TypeError("Dynamic not bound to a module")
-            mapping[left] = [self.module.iter_copy(idx)]
-        return mapping
+
+        # If bound to a single Module (Module * dynamic()), produce
+        # left -> [replica] mapping.
+        if self.module is not None and self.subgraph is None:
+            mapping = {}
+            for i, left in enumerate(left_list):
+                idx = getattr(left, 'i', i)
+                if self.module is None:
+                    raise TypeError("Dynamic not bound to a module")
+                mapping[left] = [self.module.iter_copy(idx)]
+            return mapping
+
+        elif self.subgraph is not None and self.module is None:
+            mapping = {}
+
+            # get roots of the subgraph
+            sub_keys = list(self.subgraph.keys())
+            sub_vals = set(x for vs in self.subgraph.values() for x in vs)
+            roots = [k for k in sub_keys if k not in sub_vals]
+            if not roots:
+                roots = sub_keys
+
+            for i, left in enumerate(left_list):
+                idx = getattr(left, 'i', i)
+
+                all_nodes = list(set(sub_keys) | set(x for vs in self.subgraph.values() for x in vs))
+                inner_iters = [getattr(n, 'i', None) for n in all_nodes]
+                max_inner = max((it for it in inner_iters if isinstance(it, int)), default=-1)
+                stride = max_inner + 1 if max_inner >= 0 else 1
+                copied = {}
+                for orig in all_nodes:
+                    orig_i = getattr(orig, 'i', None)
+                    if isinstance(orig_i, int):
+                        new_i = idx * stride + orig_i
+                    else:
+                        new_i = idx
+                    copied[orig] = orig.iter_copy(new_i)
+
+                for orig_k, orig_vs in self.subgraph.items():
+                    k_copy = copied[orig_k]
+                    mapping[k_copy] = [copied[v] for v in orig_vs]
+
+                mapping[left] = [copied[r] for r in roots]
+            return mapping
+
+        raise TypeError("Dynamic resolver is not bound to a Module or subgraph")
 
 
 def dynamic():
@@ -116,13 +179,14 @@ def dynamic():
 class Module:
     def __init__(self, name: str = None):
         self.name = name
+        
 
     def __call__(self, *args, **kwds):
         pass
 
     def iter_copy(self, i: int) -> Module:
         module = deepcopy(self)
-        module.iter = i
+        module.i = i
         return module
     
     def __or__(self: Module, other: Module | DependencyDict) -> DependencyDict:
