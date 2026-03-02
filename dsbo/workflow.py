@@ -11,76 +11,35 @@ import matplotlib
 import matplotlib.colors as mcolors
 from dask.distributed import Future, performance_report, as_completed
 from matplotlib import pyplot as plt
-from dsbo.logger import WorkflowTaskLogger
-from dsbo.modules.compile import is_dry_run
-from dsbo.utils.io import get_workdir, get_workdir_path, with_remote_workdir
+from dsbo.modules import Module
 from dsbo.worker.config import SlurmWorkerConfig
 from typing import Callable, Optional, Sequence
 from IPython.display import Image, display
 
 
-class WorkflowTask:
-    def __init__(self, name: str, task: Callable, worker_config: Optional[SlurmWorkerConfig] = None) -> None:
-        self.name = name
-        self.task = task
-        self.worker_config = worker_config
+class FusedModule(Module):
+    """A group of modules with identical resources, fused into a single graph node."""
 
-    @with_remote_workdir
-    def run(self, *args, **kwargs):
-        with WorkflowTaskLogger(self) if not is_dry_run() else nullcontext() as logger:
-            return self.task(*args, **kwargs)
+    def __init__(self, *modules: Module):
+        self.modules = modules
+        for m in modules:
+            assert self.modules[0].resources == m.resources, \
+                    "All modules in a FusedModule must have the same resources."
 
-
-def workflow_task(name, config)-> Callable[..., Callable[..., WorkflowTask]]:
-    def decorator(obj) -> Callable[..., WorkflowTask]:
-        task = None
-        def wrapper(*args, **kwargs):
-            nonlocal task
-            if task is None:
-                instance = obj(*args, **kwargs)
-                task = WorkflowTask(name, instance, config)
-            return task
-        return wrapper
-    return decorator
-
-
-class FusedWorkflowTask(WorkflowTask):
-    def __init__(self, *tasks):
-        self.tasks = tasks
-        for task in tasks:
-            assert self.tasks[0].worker_config == task.worker_config, \
-                    "All tasks in CompositeWorkflowTask must have the same worker configuration."
-
-    def run(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs):
         results = {}
-        for task in self.tasks:
-            results.update(task.run(*args, **kwargs))
-
+        for m in self.modules:
+            results.update(m.run(*args, **kwargs))
         return results
-    
+
     @property
-    def worker_config(self):
-        return self.tasks[0].worker_config
-    
+    def resources(self):
+        return self.modules[0].resources
+
     @property
     def name(self):
-        return "[" + ",".join(task.name for task in self.tasks) + "]"
+        return "[" + ",".join(m.name for m in self.modules) + "]"
 
-class DaskWorkflowRepeater:
-    def __init__(self, task: WorkflowTask, repetitions: int) -> None:
-        self.task = task
-        self.repetitions = repetitions
-
-    def run(self, design: dict) -> Sequence[Future]:
-        raise NotImplementedError("DaskWorkflowRepeater.run is not implemented yet.")
-    
-class DynamicDaskWorkflowRepeater:
-    def __init__(self, task: WorkflowTask, file_pattern: str) -> None:
-        self.task = task
-        self.file = None
-    
-    def run(self, design: dict) -> Sequence[Future]:
-        raise NotImplementedError("DynamicDaskWorkflowRepeater.run is not implemented yet.")
     
     
 def assert_no_self_loops(G: nx.DiGraph) -> None:
@@ -106,7 +65,7 @@ def task_levels(G: nx.DiGraph):
         levels[node] = 0 if not preds else 1 + max(levels[p] for p in preds)
     return levels
 
-def is_output_task(G: nx.DiGraph, task: WorkflowTask) -> bool:
+def is_output_task(G: nx.DiGraph, task: Module) -> bool:
     return G.out_degree(task) == 0
 
 def get_dependent_task_groups(G: nx.DiGraph):
@@ -118,7 +77,7 @@ def get_dependent_task_groups(G: nx.DiGraph):
 
 
 class WorkflowTaskGraph:
-    def __init__(self, dependencies: dict[WorkflowTask, list[WorkflowTask]]) -> None:
+    def __init__(self, dependencies: dict[Module, list[Module]]) -> None:
         self._repr = nx.DiGraph(dependencies)
 
         assert_no_self_loops(self._repr)
@@ -137,7 +96,7 @@ class WorkflowTaskGraph:
         worker = WorkerContext.get_current_worker()
         print(f"Using worker: {type(worker)}")
 
-        future_map: dict[WorkflowTask, Future] = {}
+        future_map: dict[Module, Future] = {}
 
         for depth, batch in enumerate(self.iterate_dependent_task_groups()):
             for task in batch:
@@ -164,19 +123,19 @@ class WorkflowTaskGraph:
         for batch in get_dependent_task_groups(self._repr):
             yield batch
 
-    def get_unique_workers(self):
+    def get_unique_workers(self) -> set[SlurmWorkerConfig]:
         workers = set()
         for node in self._repr.nodes():
-            if node.worker_config is not None:
-                workers.add(node.worker_config)
+            if node.resources is not None:
+                workers.add(node.resources)
         return workers
 
     def visualize(self, filename=None, format='png'):
         
         def _node_label(node):
-            wc = getattr(node, 'worker_config', None)
-            name = ','.join(t.name for t in node.tasks) if isinstance(node, FusedWorkflowTask) else (node.name if isinstance(node, WorkflowTask) else str(node))
-            wk = 'default' if wc is None else f'gpu={wc.gpu_resources}, cpu={wc.job_cpu}, mem={wc.memory}'
+            res = getattr(node, 'resources', None)
+            name = ','.join(m.name for m in node.modules) if isinstance(node, FusedModule) else (node.name if hasattr(node, 'name') else str(node))
+            wk = 'default' if res is None else f'gpu={res.gpu_resources}, cpu={res.job_cpu}, mem={res.memory}'
             return f"{name}\n{wk}"
         
         fmt = format
@@ -188,15 +147,15 @@ class WorkflowTaskGraph:
         dot = Digraph(format=fmt)
         dot.attr(rankdir='LR')
 
-        def wc_key(n):
-            wc = getattr(n, 'worker_config', None)
-            return 'default' if wc is None else f"mem={wc.memory}, cpu={wc.job_cpu}, gpu={wc.gpu_resources}"
+        def res_key(n):
+            res = getattr(n, 'resources', None)
+            return 'default' if res is None else f"mem={res.memory}, cpu={res.job_cpu}, gpu={res.gpu_resources}"
 
         nodes = list(self._repr.nodes())
         keys = []
         groups = {}
         for n in nodes:
-            k = wc_key(n)
+            k = res_key(n)
             groups.setdefault(k, []).append(n)
             if k not in keys:
                 keys.append(k)
@@ -208,13 +167,13 @@ class WorkflowTaskGraph:
         rep_exit = {}
 
         for n in nodes:
-            color = color_map.get(wc_key(n), '#d3d3d3')
-            if isinstance(n, FusedWorkflowTask):
+            color = color_map.get(res_key(n), '#d3d3d3')
+            if isinstance(n, FusedModule):
                 cluster_name = f"cluster_{id(n)}"
                 sub_ids = []
                 with dot.subgraph(name=cluster_name) as c:
                     c.attr(label='', rank='same', style="dashed")
-                    for i, sub in enumerate(n.tasks):
+                    for i, sub in enumerate(n.modules):
                         sid = f"{id(n)}_sub_{i}"
                         c.node(sid, label=_node_label(sub), style='filled', fillcolor=color, shape='box', color='black', penwidth='1')
                         sub_ids.append(sid)
@@ -255,15 +214,15 @@ class WorkflowTaskGraph:
     
 
 class DefaultSimRecoWorkflow(WorkflowTaskGraph):
-    def __init__(self, sim_task: WorkflowTask, transform_task: WorkflowTask, reco_task: WorkflowTask) -> None:
+    def __init__(self, sim: Module, transform: Module, reco: Module) -> None:
         dependencies = {
-            sim_task: [transform_task],
-            transform_task: [reco_task]
+            sim: [transform],
+            transform: [reco]
         }
         super().__init__(dependencies)
 
 
-def mergeable_components(task_graph: WorkflowTaskGraph, attr="worker_config") -> List[List[WorkflowTask]]:
+def mergeable_components(task_graph: WorkflowTaskGraph, attr="resources") -> List[List[Module]]:
     G = task_graph._repr
     in_deg = dict(G.in_degree())
     out_deg = dict(G.out_degree())
@@ -285,10 +244,10 @@ def mergeable_components(task_graph: WorkflowTaskGraph, attr="worker_config") ->
     ]
 
 
-def update_task_graph(task_graph: WorkflowTaskGraph, groups: list[list[WorkflowTask]]) -> WorkflowTaskGraph:
+def update_task_graph(task_graph: WorkflowTaskGraph, groups: list[list[Module]]) -> WorkflowTaskGraph:
     G = task_graph._repr.copy()
     for group in groups:
-        merged = FusedWorkflowTask(*group)
+        merged = FusedModule(*group)
         preds = set().union(*(G.predecessors(t) for t in group)) - set(group)
         succs = set().union(*(G.successors(t) for t in group)) - set(group)
 

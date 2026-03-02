@@ -13,7 +13,8 @@ from dsbo.utils.io import get_file_suffix, get_workdir
 
 if TYPE_CHECKING:
     from dsbo.worker.config import SlurmWorkerConfig
-    from dsbo.workflow import WorkflowTask, WorkflowTaskGraph
+    from dsbo.workflow import WorkflowTaskGraph
+    from dsbo.modules import Module
 
 dask.config.set({
     "distributed.worker.memory.target": 0.85,
@@ -25,7 +26,7 @@ dask.config.set({
 class DaskWorkerBase:
     def __init__(self):
         pass
-    def submit(self, task: WorkflowTask, design: dict, priority: int = 0,
+    def submit(self, task: Module, design: dict, priority: int = 0,
                dependencies: Optional[Iterable[Future]] = None, **client_kwargs) -> Future:
         raise NotImplementedError("submit method must be implemented by subclasses.")
 
@@ -139,13 +140,13 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
 
         spec_dict = {
             spec.resource_key: {
-                "cores": 1,
+                "cores": spec.job_cpu,
                 "queue": spec.partition,
                 "memory": spec.memory,
                 "walltime": spec.walltime,
                 "worker_extra_args": get_extra_args(spec)[0],
                 "job_extra_directives": get_extra_args(spec)[1],
-                "processes": 1,
+                "processes": spec.processes,
                 "job_cpu": spec.job_cpu,
                 "resources": spec.resources,
             }
@@ -170,7 +171,7 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
         job_specs = workflow.get_unique_workers()
         return cls(job_specs=job_specs, logdir=logdir)
 
-    def submit(self, task: WorkflowTask, design: dict, priority: int = 0,
+    def submit(self, module: Module, design: dict, priority: int = 0,
                dependencies: Optional[Iterable[Future]] = None, **client_kwargs) -> Future:
         
         workdir = get_workdir()
@@ -179,8 +180,8 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
             "workdir": workdir.workdir_root, 
             "suffix": get_file_suffix(), 
             "priority": priority,
-            "resources": task.worker_config.resources}
+            "resources": module.resources.resources if module.resources is not None else {}}
         
         submit_kwargs.update(client_kwargs or {})
         deps = list(dependencies) if dependencies is not None else []
-        return self.client.submit(task.run, design, *deps, **submit_kwargs)
+        return self.client.submit(module.run, design, *deps, **submit_kwargs)
