@@ -21,20 +21,31 @@ class FusedModule(Module):
     """A group of modules with identical resources, fused into a single graph node."""
 
     def __init__(self, *modules: Module):
+        super().__init__()
         self.modules = modules
         for m in modules:
             assert self.modules[0].resources == m.resources, \
                     "All modules in a FusedModule must have the same resources."
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, design: dict, **kwargs) -> dict:
         results = {}
         for m in self.modules:
-            results.update(m.run(*args, **kwargs))
+            results.update(m(design=design))
+        return results
+
+    def run(self, design: dict, **kwargs) -> dict:
+        results = {}
+        for m in self.modules:
+            results.update(m.run(design=design, **{k: v for k, v in kwargs.items()}))
         return results
 
     @property
     def resources(self):
         return self.modules[0].resources
+
+    @resources.setter
+    def resources(self, value):
+        pass  # derived from child modules; ignore assignment from super().__init__()
 
     @property
     def name(self):
@@ -115,8 +126,7 @@ class WorkflowTaskGraph:
                 r = f.result()
                 if r is not None:
                     results.update(r)
-                            
-                            
+                    
         return results
 
     def iterate_dependent_task_groups(self):

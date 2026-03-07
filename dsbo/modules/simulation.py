@@ -16,8 +16,8 @@ class SimulationBase(Module):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
 
-    def __call__(self, design: dict, **kwargs) -> None:
-        return self.simulate(design, **kwargs)
+    def __call__(self, design: dict, **kwargs) -> dict:
+        self.simulate(design, **kwargs)
 
     @abstractmethod
     def simulate(self, design: dict) -> None:
@@ -78,11 +78,11 @@ class DaskSimulationWrapper(SimulationBase):
                 print(f"Submitting simulation {i+1}/{self.n_simulations}")
                 workdir = get_workdir()
                 suffix = get_file_suffix()
-                future = self.client.submit(self.base_simulation, design, workdir=workdir.workdir_root, suffix=suffix)
+                future = self.client.submit(self.base_simulation.run, design=design, workdir=workdir.workdir_root, suffix=suffix)
                 futures.append(future)
             
         self.client.gather(futures)
-        self.merge_function(design)
+        self.merge_function(design=design)
 
         if self.init_on_demand:
             self.close()

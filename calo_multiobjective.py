@@ -3,9 +3,9 @@ from dsbo.constraints import MultiConstraint
 from dsbo.backends.optuna import OptunaBackend
 from dsbo.transforms import MiniframeMergeTransform
 from dsbo.modules.simulation import DaskSimulationWrapper
-from dsbo.worker.dask import AdaptiveHeterogenousDaskSlurmWorker
-from dsbo.worker.config import DEFAULT_CPU_CONFIG, DEFAULT_GPU_CONFIG
-from dsbo.workflow import DefaultSimRecoWorkflow, optimize, workflow_task
+from dsbo.worker.dask import AdaptiveHeterogeneousDaskSlurmWorker
+from dsbo.worker.config import DEFAULT_CPU_CONFIG, DEFAULT_GPU_CONFIG, SlurmWorkerConfig
+from dsbo.workflow import DefaultSimRecoWorkflow, WorkflowTaskGraph, optimize
 from dsbo.parameters import ContinuousDesignParameter, CategoricalDesignParameter, CompositeDesignParameter
 
 from examples.calo_multiobjective.reconstruction import G4CaloReconstruction
@@ -32,41 +32,27 @@ class CaloDesignParameterization(CompositeDesignParameter):
 
 
 if __name__ == "__main__":
-    seed = 5
+    seed = 43
     calo_design = CaloDesignParameterization("calo")
-
-    @workflow_task("simulation", DEFAULT_CPU_CONFIG)
-    def create_simulation(n_simulations=60, n_workers=15):
-        base_simulation = G4CaloSimulation(container_path="/home/nyl93mev/minicalosim_90baa21.sif")
-        merge_transform = MiniframeMergeTransform("output_df_*")
-        simulation      = DaskSimulationWrapper(base_simulation=base_simulation, n_simulations=n_simulations, n_workers=n_workers, 
-                                                threads_per_worker=1, merge_function=merge_transform, init_on_demand=True)
-        return simulation
-
-    @workflow_task("sim2reco", DEFAULT_CPU_CONFIG)
-    def create_sim2reco():
-        return G4CaloSimToReco() 
-
-    @workflow_task("reconstruction", DEFAULT_GPU_CONFIG)
-    def create_reconstruction():
-        return G4CaloReconstruction(container_path="/home/nyl93mev/minicalosim_90baa21.sif")
-
-
     constraint = MultiConstraint(G4CaloCostConstraint(max_cost=100_000),
                                  G4CaloLengthConstraint(max_length=200))
 
-    simulation = create_simulation()
-    sim2reco   = create_sim2reco()
-    reconstruction = create_reconstruction()
+    
+    SINGLE_CORE_CONFIG = SlurmWorkerConfig(processes=2, job_cpu=2, walltime="48:00:00", memory="16GB", partition="skylake-96")
+    DEFAULT_GPU_CONFIG = SlurmWorkerConfig(job_cpu=4, gpu_resources="gpu:1", memory="16GB", walltime="48:00:00")
 
-    workflow = DefaultSimRecoWorkflow(simulation, sim2reco, reconstruction)
+    simulation       = G4CaloSimulation("/home/nyl93mev/minicalosim_90baa21.sif").to(SINGLE_CORE_CONFIG)
+    simulation_merge = MiniframeMergeTransform("output_df_*").to(SINGLE_CORE_CONFIG)
+    sim2reco         = G4CaloSimToReco().to(SINGLE_CORE_CONFIG)
+    reconstruction   = G4CaloReconstruction("/home/nyl93mev/minicalosim_90baa21.sif").to(DEFAULT_GPU_CONFIG)
+
+    workflow = WorkflowTaskGraph(simulation * 10 >> simulation_merge >> sim2reco >> reconstruction)
     workflow = optimize(workflow)
-    workflow.visualize("calo_multiobjective_workflow.png")
+    workflow.visualize("workflow_dsl_example.png")
     
     objectives = [Objective(name="energy_resolution", minimize=True),
                   Objective(name="particle_id", minimize=True)]
     
-
-    with AdaptiveHeterogenousDaskSlurmWorker(max_workers=10, logdir="logs") as worker:
+    with AdaptiveHeterogeneousDaskSlurmWorker.from_workflow(workflow, logdir="logdir") as worker:
         OptunaBackend(f"calo_constrained", workflow, calo_design, constraint, objectives, worker, seed=seed).optimize_ask_tell(n_trials=500)
 

@@ -11,7 +11,7 @@ class ReconstructionBase(Module):
     def __init__(self) -> None:
         super().__init__()
 
-    def __call__(self, *args, **kwds) -> Optional[dict[str, float]]:
+    def __call__(self, design: dict, **kwargs) -> Optional[dict[str, float]]:
         self.train()
         return self.validate()
     

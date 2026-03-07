@@ -21,8 +21,8 @@ def check_workflow_validity(workflow: WorkflowTaskGraph, objectives: Union[Objec
 def get_objective_vals(returns: dict, objectives: list[Objective]) -> tuple[float]:
     return tuple([returns[obj.name] for obj in objectives])
 
-def is_single_objective(objective: Union[Objective, Sequence[Objective]]) -> bool:
+def is_single_objective(objective: Union[Objective, Iterable[Objective]]) -> bool:
     return isinstance(objective, Objective)
 
-def is_multi_objective(objective: Union[Objective, Sequence[Objective]]) -> bool:
-    return isinstance(objective, Sequence) and all(isinstance(obj, Objective) for obj in objective) and len(objective) > 1
+def is_multi_objective(objective: Union[Objective, Iterable[Objective]]) -> bool:
+    return isinstance(objective, Iterable) and all(isinstance(obj, Objective) for obj in objective) and len(objective) > 1

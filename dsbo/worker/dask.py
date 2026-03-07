@@ -70,67 +70,6 @@ def get_extra_args(worker_config: SlurmWorkerConfig) -> tuple[list[str], list[st
         num_gpus = get_num_gpus(worker_config)
         return ([f"--resources {resource_name}={num_gpus}"],
                 [f"--gres={worker_config.gpu_resources}"])
-    
-
-#class DaskSlurmWorker(DaskWorkerBase):
-#    def __init__(self, n_worker: int, worker_config: SlurmWorkerConfig, adaptive: bool = False, logdir: str = "logs"):
-#        worker_extra_args, job_extra_directives = get_extra_args(worker_config)
-#        self.n_worker = n_worker
-#        self.adaptive = adaptive
-#
-#        self.cluster = SLURMCluster(cores=1, queue=worker_config.partition, memory=worker_config.memory,
-#                    walltime=worker_config.walltime, worker_extra_args=worker_extra_args,
-#                    job_extra_directives=job_extra_directives, log_directory=logdir,
-#                    processes=1, job_cpu=worker_config.job_cpu)
-#
-#        if not self.adaptive:
-#            self.cluster.scale(n_worker)
-#        else:
-#            self.cluster.adapt(minimum=0, maximum=n_worker)
-#
-#        self.client = Client(self.cluster)
-#
-#    def submit(self, task: "WorkflowTask", design: dict, priority: int = 0,
-#               dependencies: Optional[Iterable[Future]] = None, **client_kwargs) -> Future:
-#        """Submit a task using the Dask client.
-#
-#        Predecessor futures passed in `dependencies` are forwarded as extra
-#        positional arguments to `task.run` so that Dask builds the proper
-#        dependency edges automatically.
-#        """
-#        workdir = get_workdir()
-#
-#        # Base kwargs that should always be forwarded to the remote invocation
-#        submit_kwargs: dict = {
-#            "workdir": workdir.workdir_root,
-#            "suffix": get_file_suffix(),
-#            "priority": priority,
-#        }
-#
-#        # Merge any caller-specified client kwargs (e.g. resources)
-#        submit_kwargs.update(client_kwargs or {})
-#
-#        # If the task has a worker_config with resources, prefer that unless
-#        # caller explicitly provided `resources` in client_kwargs
-#        if (
-#            "resources" not in submit_kwargs
-#            and getattr(task, "worker_config", None)
-#            and getattr(task.worker_config, "resources", None)
-#        ):
-#            submit_kwargs["resources"] = task.worker_config.resources
-#
-#        deps = list(dependencies) if dependencies is not None else []
-#
-#        # Pass predecessor futures as positional args so Dask treats them as
-#        # dependencies of this submission.
-#        return self.client.submit(task.run, design, *deps, **submit_kwargs)
-#
-#    def __enter__(self):
-#        return self
-#
-#    def __exit__(self, exc_type, exc_val, exc_tb):
-#        self.client.close()
-#        self.cluster.close()
 
 
 class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
@@ -144,7 +83,6 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
                 "queue": spec.partition,
                 "memory": spec.memory,
                 "walltime": spec.walltime,
-                "worker_extra_args": get_extra_args(spec)[0],
                 "job_extra_directives": get_extra_args(spec)[1],
                 "processes": spec.processes,
                 "job_cpu": spec.job_cpu,
@@ -154,7 +92,6 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
         }
 
         self.cluster = HeterogeneousSlurmCluster(spec=spec_dict, log_directory=logdir)
-        #TODO: change adapt call to specify min/max workers per spec_key based with reasonable values provided
         self.cluster.adapt({spec_key: (0, 10) for spec_key in spec_dict.keys()})
 
         self.client = Client(self.cluster)
@@ -173,7 +110,6 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
 
     def submit(self, module: Module, design: dict, priority: int = 0,
                dependencies: Optional[Iterable[Future]] = None, **client_kwargs) -> Future:
-        
         workdir = get_workdir()
 
         submit_kwargs: dict = {
@@ -183,5 +119,6 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
             "resources": module.resources.resources if module.resources is not None else {}}
         
         submit_kwargs.update(client_kwargs or {})
-        deps = list(dependencies) if dependencies is not None else []
-        return self.client.submit(module.run, design, *deps, **submit_kwargs)
+        if dependencies:
+            submit_kwargs["_deps"] = list(dependencies)
+        return self.client.submit(module.run, design=design, **submit_kwargs)

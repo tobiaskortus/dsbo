@@ -5,7 +5,7 @@ import pandas as pd
 from pathlib import Path
 
 from dsbo.modules import Module
-from dsbo.utils.io import Workdir, with_remote_workdir
+from dsbo.utils.io import Workdir
 
 READERS = {
     ".csv":     pd.read_csv,
@@ -49,7 +49,6 @@ class SimulationTransform(Module):
     def __init__(self) -> None:
         super().__init__()
     
-    @with_remote_workdir
     def __call__(self, design: dict, **kwargs) -> None:
         return self.transform(design, **kwargs)
 
