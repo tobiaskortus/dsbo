@@ -1,6 +1,6 @@
 from __future__ import annotations
 from copy import deepcopy
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, overload
 
 
 class ModuleDslMixin:
@@ -39,7 +39,11 @@ class ModuleDslMixin:
             case _:
                 raise TypeError(f"Unsupported operand type(s) for >>: '{type(self).__name__}' and '{type(other).__name__}'")
 
-    def __mul__(self, other):
+    @overload
+    def __mul__(self, other: int) -> DependencyDict: ...
+    @overload
+    def __mul__(self, other: Dynamic) -> Dynamic: ...
+    def __mul__(self, other: int | Dynamic) -> DependencyDict | Dynamic:
         match other:
             case int():
                 reps = [self.replicate(i) for i in range(other)]
@@ -88,7 +92,7 @@ class DependencyDict(dict):
 
         raise TypeError(f"Unsupported operand type(s) for *: 'DependencyDict' and '{type(other).__name__}'")
 
-    def __rshift__(self, other):
+    def __rshift__(self, other: ModuleDslMixin | DependencyDict | Dynamic) -> DependencyDict:
         from collections.abc import Iterable
         from collections.abc import Mapping
 
