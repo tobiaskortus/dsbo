@@ -1,7 +1,6 @@
 
 from abc import ABC, abstractmethod
 from typing import Sequence
-from dsbo.parameters import CompositeDesignParameter
 
 class ConstraintBase(ABC):
     def __init__(self, binary: bool = False):
