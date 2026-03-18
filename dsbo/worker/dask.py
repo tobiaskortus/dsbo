@@ -113,7 +113,7 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
         workdir = get_workdir().workdir_root
         suffix = get_file_suffix()
 
-        resources = module.resources.resources if module.resources is not None else {}
+        resources = getattr(module.resources, "resources", None)
     
         def _module_wrapper(module, design_arg, *deps):
             return module.run(design=design_arg, workdir=workdir, suffix=suffix)
