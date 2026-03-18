@@ -2,14 +2,14 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence, Union
 
 from dsbo.modules.compile import dry_run
-from dsbo.workflow import WorkflowTaskGraph
+from dsbo.workflow import Workflow
 
 @dataclass
 class Objective:
     name: str
     minimize: bool = True
 
-def check_workflow_validity(workflow: WorkflowTaskGraph, objectives: Union[Objective, Iterable[Objective]]):
+def check_workflow_validity(workflow: Workflow, objectives: Union[Objective, Iterable[Objective]]):
     with dry_run():
         returns = workflow.run({})
 

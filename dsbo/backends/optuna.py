@@ -11,7 +11,7 @@ from typing import Any, Iterable, Optional, Callable, Sequence, Union
 
 from dsbo.utils.io import Workdir
 from dsbo.worker.dask import  WorkerContext, DaskWorkerBase
-from dsbo.workflow import  WorkflowTaskGraph
+from dsbo.workflow import  Workflow
 from dsbo.parameters import Candidate, Continuous, Integer, Categorical, Sampler, ParameterSpace
 from dsbo.constraints import GeometryConstraintBase
 from dsbo.objectives import Objective, is_single_objective, check_workflow_validity, get_objective_vals
@@ -73,7 +73,7 @@ def get_directions(objective: Union[Objective, Sequence[Objective]]) -> Sequence
 
 
 class OptunaBackend:
-    def __init__(self, study_name: str, workflow: WorkflowTaskGraph, design: ParameterSpace, 
+    def __init__(self, study_name: str, workflow: Workflow, design: ParameterSpace, 
                  constraint: Optional[GeometryConstraintBase], objective: Union[Objective, Iterable[Objective]],
                  worker: Optional[DaskWorkerBase] = None,
                  seed: int = 42) -> None:

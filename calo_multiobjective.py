@@ -4,7 +4,7 @@ from dsbo.backends.optuna import OptunaBackend
 from dsbo.transforms import MiniframeMergeTransform
 from dsbo.worker.dask import AdaptiveHeterogeneousDaskSlurmWorker
 from dsbo.worker.config import DEFAULT_CPU_CONFIG, DEFAULT_GPU_CONFIG, SlurmWorkerConfig
-from dsbo.workflow import  WorkflowTaskGraph, optimize
+from dsbo.workflow import  Workflow, optimize
 from dsbo.parameters import ParameterSpace, Group, Continuous, Categorical
 
 from examples.calo_multiobjective.reconstruction import G4CaloReconstruction
@@ -42,7 +42,7 @@ if __name__ == "__main__":
     sim2reco         = G4CaloSimToReco().to(SINGLE_CORE_CONFIG)
     reconstruction   = G4CaloReconstruction("/home/nyl93mev/minicalosim_90baa21.sif").to(DEFAULT_GPU_CONFIG)
 
-    workflow = WorkflowTaskGraph(simulation * 30 >> simulation_merge >> sim2reco >> reconstruction)
+    workflow = Workflow(simulation * 30 >> simulation_merge >> sim2reco >> reconstruction)
     workflow = optimize(workflow)
     workflow.visualize("workflow_dsl_example.png")
     

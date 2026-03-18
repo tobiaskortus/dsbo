@@ -12,7 +12,7 @@ from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dsbo.worker.config import SlurmWorkerConfig
-    from dsbo.workflow import WorkflowTaskGraph
+    from dsbo.workflow import Workflow
     from dsbo.modules import Module
 
 dask.config.set({
@@ -124,6 +124,6 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
         return delayed_obj
 
     @classmethod
-    def from_workflow(cls, workflow: WorkflowTaskGraph, logdir: str = "logs") -> "AdaptiveHeterogeneousDaskSlurmWorker":
+    def from_workflow(cls, workflow: Workflow, logdir: str = "logs") -> "AdaptiveHeterogeneousDaskSlurmWorker":
         job_specs = workflow.get_unique_workers()
         return cls(job_specs=job_specs, logdir=logdir)

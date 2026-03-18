@@ -89,13 +89,12 @@ def get_dependent_task_groups(G: nx.DiGraph):
     ]
 
 
-class WorkflowTaskGraph:
+class Workflow:
     def __init__(self, dependencies: dict[Module, list[Module]]) -> None:
         self._repr = nx.DiGraph(dependencies)
 
         assert_no_self_loops(self._repr)
         assert_no_duplicate_nodes(self._repr)
-        #assert_no_disconnected_nodes(self._repr)
 
     def run(self, design: dict) -> dict[str, float]:
         """Evaluate a single design through the workflow task graph.
@@ -243,7 +242,7 @@ class WorkflowTaskGraph:
         return max(self.levels.values()) + 1 if self.levels else 0
     
 
-class DefaultSimRecoWorkflow(WorkflowTaskGraph):
+class DefaultSimRecoWorkflow(Workflow):
     def __init__(self, sim: Module, transform: Module, reco: Module) -> None:
         dependencies = {
             sim: [transform],
@@ -252,7 +251,7 @@ class DefaultSimRecoWorkflow(WorkflowTaskGraph):
         super().__init__(dependencies)
 
 
-def mergeable_components(task_graph: WorkflowTaskGraph, attr="resources") -> List[List[Module]]:
+def mergeable_components(task_graph: Workflow, attr="resources") -> List[List[Module]]:
     G = task_graph._repr
     in_deg = dict(G.in_degree())
     out_deg = dict(G.out_degree())
@@ -274,7 +273,7 @@ def mergeable_components(task_graph: WorkflowTaskGraph, attr="resources") -> Lis
     ]
 
 
-def update_task_graph(task_graph: WorkflowTaskGraph, groups: list[list[Module]]) -> WorkflowTaskGraph:
+def update_task_graph(task_graph: Workflow, groups: list[list[Module]]) -> Workflow:
     G = task_graph._repr.copy()
     for group in groups:
         merged = FusedModule(*group)
@@ -293,7 +292,7 @@ def update_task_graph(task_graph: WorkflowTaskGraph, groups: list[list[Module]])
     return updated_task_graph
 
 
-def optimize(workflow: WorkflowTaskGraph) -> WorkflowTaskGraph:
+def optimize(workflow: Workflow) -> Workflow:
     return update_task_graph(workflow, mergeable_components(workflow))
 
 

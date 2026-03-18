@@ -6,12 +6,12 @@ from typing import List, Any, Tuple, Dict, Optional, Iterable
 
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import Workdir
-from dsbo.workflow import WorkflowTaskGraph
+from dsbo.workflow import Workflow
 from dsbo.worker.dask import WorkerContext
 
 
 
-async def indexed_coroutine(idx, workflow: WorkflowTaskGraph, design: dict, workdir: str, 
+async def indexed_coroutine(idx, workflow: Workflow, design: dict, workdir: str, 
                             keep_workdir: bool = False) -> Tuple[int, Any, Optional[Exception]]:
     try:
         workdir = os.path.join(workdir, f"design_{idx}")
@@ -38,7 +38,7 @@ class WorkflowExecutor:
     async def execute_workflow_async(self):
         raise NotImplementedError()
 
-    async def execute_workflow_batch_async(self, workflow: WorkflowTaskGraph, designs: Iterable[dict],
+    async def execute_workflow_batch_async(self, workflow: Workflow, designs: Iterable[dict],
                                            workdir: str, keep_workdir: bool = False) -> List[Tuple[int, Any]]:
         with self.optional_worker_context():
             indexed_tasks = [asyncio.create_task(indexed_coroutine(idx, workflow, design, workdir, keep_workdir)) \
@@ -62,7 +62,7 @@ class WorkflowExecutor:
 
             return list(filter(None, results))
 
-    def execute_workflow_batch(self, workflow: WorkflowTaskGraph, designs: Iterable[dict], workdir: str, keep_workdir: bool = False) -> List[Tuple[int, Any]]:
+    def execute_workflow_batch(self, workflow: Workflow, designs: Iterable[dict], workdir: str, keep_workdir: bool = False) -> List[Tuple[int, Any]]:
         try:
             return asyncio.run(self.execute_workflow_batch_async(workflow, designs, workdir, keep_workdir))
         except RuntimeError as e:
