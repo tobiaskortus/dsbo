@@ -15,6 +15,7 @@ dependencies = [
     "dask-jobqueue",
     "grpcio",
     "grpcio-tools",
+    "graphviz",
     "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main"
 ]
 
