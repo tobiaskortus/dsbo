@@ -2,43 +2,39 @@ from dsbo.objectives import Objective
 from dsbo.constraints import MultiConstraint
 from dsbo.backends.optuna import OptunaBackend
 from dsbo.transforms import MiniframeMergeTransform
-from dsbo.modules.simulation import DaskSimulationWrapper
 from dsbo.worker.dask import AdaptiveHeterogeneousDaskSlurmWorker
 from dsbo.worker.config import DEFAULT_CPU_CONFIG, DEFAULT_GPU_CONFIG, SlurmWorkerConfig
-from dsbo.workflow import DefaultSimRecoWorkflow, WorkflowTaskGraph, optimize
-from dsbo.parameters import ContinuousDesignParameter, CategoricalDesignParameter, CompositeDesignParameter
+from dsbo.workflow import  WorkflowTaskGraph, optimize
+from dsbo.parameters import ParameterSpace, Group, Continuous, Categorical
 
 from examples.calo_multiobjective.reconstruction import G4CaloReconstruction
 from examples.calo.constraints import G4CaloCostConstraint, G4CaloLengthConstraint
 from examples.calo_multiobjective.simulation import G4CaloSimulation, G4CaloSimToReco
 
-class CaloDesignParameterization(CompositeDesignParameter):
-    def __init__(self, name: str) -> None:
-        parameters = []
-        for i in range(5):
-            absorber = CompositeDesignParameter(
-                name=f"absorber_{i}",
-                parameters=[ContinuousDesignParameter(f"thickness_absorber_{i}", 1e-3, 50.0),
-                            CategoricalDesignParameter(f"material_absorber_{i}", ["G4_Pb", "G4_Fe"])]
-            )
-            scintillator = CompositeDesignParameter(
-                name=f"scintilator_{i}",
-                parameters=[ContinuousDesignParameter(f"thickness_scintillator_{i}", 1e-3, 50.0),
-                            CategoricalDesignParameter(f"material_scintillator_{i}", ["G4_PbWO4", "G4_POLYSTYRENE"])]
-            )
-            parameters += [absorber, scintillator]
+def _g4_calo_key(parts):
+        return f"{parts[-1]}_{parts[-2]}_{parts[0].split('_')[-1]}"
 
-        super().__init__(name, parameters)
+calorimeter = ParameterSpace(
+    key_fn=_g4_calo_key,
+    **ParameterSpace.repeat('layer', 5,
+        absorber=Group(
+            thickness=Continuous(0.1, 50.0, log=True),
+            material=Categorical(['G4_Pb', 'G4_Fe']),
+        ),
+        scintillator=Group(
+            thickness=Continuous(0.1, 50.0, log=True),
+            material=Categorical(['G4_PbWO4', 'G4_POLYSTYRENE']),
+        ),
+    )
+)
 
 
 if __name__ == "__main__":
     seed = 43
-    calo_design = CaloDesignParameterization("calo")
     constraint = MultiConstraint(G4CaloCostConstraint(max_cost=100_000),
                                  G4CaloLengthConstraint(max_length=200))
-
     
-    SINGLE_CORE_CONFIG = SlurmWorkerConfig(processes=2, job_cpu=2, walltime="48:00:00", memory="16GB", partition="skylake-96")
+    SINGLE_CORE_CONFIG = SlurmWorkerConfig(processes=5, job_cpu=5, walltime="48:00:00", memory="48GB", partition="epyc-256")
     DEFAULT_GPU_CONFIG = SlurmWorkerConfig(job_cpu=4, gpu_resources="gpu:1", memory="16GB", walltime="48:00:00")
 
     simulation       = G4CaloSimulation("/home/nyl93mev/minicalosim_90baa21.sif").to(SINGLE_CORE_CONFIG)
@@ -46,7 +42,7 @@ if __name__ == "__main__":
     sim2reco         = G4CaloSimToReco().to(SINGLE_CORE_CONFIG)
     reconstruction   = G4CaloReconstruction("/home/nyl93mev/minicalosim_90baa21.sif").to(DEFAULT_GPU_CONFIG)
 
-    workflow = WorkflowTaskGraph(simulation * 10 >> simulation_merge >> sim2reco >> reconstruction)
+    workflow = WorkflowTaskGraph(simulation * 30 >> simulation_merge >> sim2reco >> reconstruction)
     workflow = optimize(workflow)
     workflow.visualize("workflow_dsl_example.png")
     
@@ -54,5 +50,5 @@ if __name__ == "__main__":
                   Objective(name="particle_id", minimize=True)]
     
     with AdaptiveHeterogeneousDaskSlurmWorker.from_workflow(workflow, logdir="logdir") as worker:
-        OptunaBackend(f"calo_constrained", workflow, calo_design, constraint, objectives, worker, seed=seed).optimize_ask_tell(n_trials=500)
+        OptunaBackend(f"calo_constrained", workflow, calorimeter, constraint, objectives, worker, seed=seed).optimize_ask_tell(n_trials=500)
 
