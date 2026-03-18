@@ -9,7 +9,9 @@ from graphviz import Digraph
 from itertools import groupby
 import matplotlib
 import matplotlib.colors as mcolors
-from dask.distributed import Future, performance_report, as_completed
+import dask
+from dask import delayed
+from dask.distributed import performance_report
 from matplotlib import pyplot as plt
 from dsbo.modules import Module
 from dsbo.worker.config import SlurmWorkerConfig
@@ -96,38 +98,56 @@ class WorkflowTaskGraph:
         #assert_no_disconnected_nodes(self._repr)
 
     def run(self, design: dict) -> dict[str, float]:
-        """ Sequential execution of the task graph without worker distribution 
-        For distributed execution, use TODO: Something?!?!?!
+        """Evaluate a single design through the workflow task graph.
         
         Args:
-            design (dict): Design parameters that should be used to evaluate the defined workflow.
+            design (dict): Design parameters to evaluate.
         """
-        results = {}
+        return self.run_batch([design])[0]
+
+    def run_batch(self, designs: Sequence[dict]) -> List[dict[str, float]]:
+        """Evaluate multiple designs through the workflow task graph.
+        
+        Without a distributed worker, designs are executed sequentially.
+        With a distributed worker, all designs are built into a single
+        delayed graph and submitted together via compute.
+        
+        Args:
+            designs (Sequence[dict]): List of design parameter dicts to evaluate.
+        """
         from dsbo.worker.dask import WorkerContext
         worker = WorkerContext.get_current_worker()
-        print(f"Using worker: {type(worker)}")
 
-        future_map: dict[Module, Future] = {}
+        if worker is None:
+            batch_results = []
+            for design in designs:
+                results = {}
+                for batch in self.iterate_dependent_task_groups():
+                    for task in batch:
+                        result = task.run(design=design)
+                        results.update(result)
+                batch_results.append(results)
+            return batch_results
+        else:
+            batch_delayed_maps = []
+            for design in designs:
+                delayed_map = {}
+                for depth, batch in enumerate(self.iterate_dependent_task_groups()):
+                    for task in batch:
+                        dependencies = [delayed_map[p] for p in self._repr.predecessors(task)]
+                        delayed_map[task] = worker.schedule(task, design, dependencies, priority=depth)
+                        
+                batch_delayed_maps.append(delayed_map)
 
-        for depth, batch in enumerate(self.iterate_dependent_task_groups()):
-            for task in batch:
-                if worker is None:
-                    result = task.run(design=design)
-                    results.update(result)
-                else:
-                    pred_futures = [future_map[p] for p in self._repr.predecessors(task)]
+            results_flatten = worker.compute([d for dm in batch_delayed_maps for d in dm.values()])
 
-                    future = worker.submit(task, design=design, priority=depth, dependencies=pred_futures)
-                    future_map[task] = future
+            it = iter(results_flatten)
+            batch_results = [
+                {k: v for f in (next(it).result() for _ in dm) for k, v in (f.items() if f else [])}
+                for dm in batch_delayed_maps
+            ]
+            return batch_results
 
-        if worker is not None:
-            futures = future_map.values()
-            for f in as_completed(futures):
-                r = f.result()
-                if r is not None:
-                    results.update(r)
-                    
-        return results
 
     def iterate_dependent_task_groups(self):
         for batch in get_dependent_task_groups(self._repr):

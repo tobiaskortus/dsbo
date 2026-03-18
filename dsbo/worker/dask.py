@@ -1,15 +1,14 @@
 from __future__ import annotations
-import os
 import dask
-import threading
 import contextvars
-from distributed import Future
+from abc import abstractmethod
+from dask.delayed import Delayed, delayed
 from dask.distributed import Client
 from contextlib import contextmanager
 from dask_jobqueue import SLURMCluster
+from dsbo.utils.io import get_workdir, get_file_suffix
 from dask_heterogeneous.slurm import HeterogeneousSlurmCluster
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
-from dsbo.utils.io import get_file_suffix, get_workdir
 
 if TYPE_CHECKING:
     from dsbo.worker.config import SlurmWorkerConfig
@@ -26,10 +25,14 @@ dask.config.set({
 class DaskWorkerBase:
     def __init__(self):
         pass
-    def submit(self, task: Module, design: dict, priority: int = 0,
-               dependencies: Optional[Iterable[Future]] = None, **client_kwargs) -> Future:
-        raise NotImplementedError("submit method must be implemented by subclasses.")
 
+    @abstractmethod
+    def compute(self, objs, **kwargs):
+        pass
+
+    @abstractmethod
+    def schedule(self, module: Module, design: dict, dependencies: Iterable = (), priority: int | None = None) -> Delayed:
+        pass
 
 class WorkerContext:
     _current_worker = contextvars.ContextVar("current_worker", default=None)
@@ -92,7 +95,7 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
         }
 
         self.cluster = HeterogeneousSlurmCluster(spec=spec_dict, log_directory=logdir)
-        self.cluster.adapt({spec_key: (0, 10) for spec_key in spec_dict.keys()})
+        self.cluster.adapt({spec_key: (0, 5) for spec_key in spec_dict.keys()})
 
         self.client = Client(self.cluster)
 
@@ -103,22 +106,24 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
         self.client.close()
         self.cluster.close()
 
+    def compute(self, objs, **kwargs):
+        return self.client.compute(objs, **kwargs)
+
+    def schedule(self, module: Module, design: dict, dependencies: Iterable = (), priority: int | None = None) -> Delayed:
+        workdir = get_workdir().workdir_root
+        suffix = get_file_suffix()
+
+        resources = module.resources.resources if module.resources is not None else {}
+    
+        def _module_wrapper(module, design_arg, *deps):
+            return module.run(design=design_arg, workdir=workdir, suffix=suffix)
+
+        with dask.annotate(resources=(resources or {}), priority=priority):
+            delayed_obj = delayed(_module_wrapper, name=module.name)(module, design, *dependencies)
+
+        return delayed_obj
+
     @classmethod
     def from_workflow(cls, workflow: WorkflowTaskGraph, logdir: str = "logs") -> "AdaptiveHeterogeneousDaskSlurmWorker":
         job_specs = workflow.get_unique_workers()
         return cls(job_specs=job_specs, logdir=logdir)
-
-    def submit(self, module: Module, design: dict, priority: int = 0,
-               dependencies: Optional[Iterable[Future]] = None, **client_kwargs) -> Future:
-        workdir = get_workdir()
-
-        submit_kwargs: dict = {
-            "workdir": workdir.workdir_root, 
-            "suffix": get_file_suffix(), 
-            "priority": priority,
-            "resources": module.resources.resources if module.resources is not None else {}}
-        
-        submit_kwargs.update(client_kwargs or {})
-        if dependencies:
-            submit_kwargs["_deps"] = list(dependencies)
-        return self.client.submit(module.run, design=design, **submit_kwargs)
