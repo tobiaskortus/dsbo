@@ -178,7 +178,7 @@ class Workdir(dict):
             shutil.rmtree(self.workdir_root)
 
     @classmethod
-    def register(cls, path: Union[str, DefaultPaths]) -> Callable[[], str]:
+    def register(cls, path: Optional[Union[str, DefaultPaths]]) -> Callable[[], str]:
         if isinstance(path, DefaultPaths):
             path = path.value
 
@@ -188,7 +188,7 @@ class Workdir(dict):
         return AbstractPath(path)
     
     @classmethod
-    def register_file(cls, path: Optional[str], filename: str, unique_filename: bool = True) -> AbstractFilePath:
+    def register_file(cls, path: Optional[Union[str, DefaultPaths]], filename: str, unique_filename: bool = True) -> AbstractFilePath:
         workdir_path = Workdir.register(path)
         return AbstractFilePath(workdir_path, filename, unique_filename)
     
