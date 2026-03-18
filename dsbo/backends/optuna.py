@@ -12,10 +12,10 @@ from typing import Any, Iterable, Optional, Callable, Sequence, Union
 from dsbo.utils.io import Workdir
 from dsbo.worker.dask import  WorkerContext, DaskWorkerBase
 from dsbo.workflow import  WorkflowTaskGraph
-from dsbo.parameters import ValueRegistry
+from dsbo.parameters import Candidate, Continuous, Integer, Categorical, Sampler, ParameterSpace
 from dsbo.constraints import GeometryConstraintBase
 from dsbo.objectives import Objective, is_single_objective, check_workflow_validity, get_objective_vals
-from dsbo.parameters import DesignParameter, CompositeDesignParameter, ContinuousDesignParameter, CategoricalDesignParameter
+from dsbo.parameters import DesignParameter
 from optuna_integration.botorch import qehvi_candidates_func
 
 def qehvi_candidates_func_wrapper(
@@ -48,18 +48,22 @@ class TrialFailedError(Exception):
     """Custom exception to indicate a trial failure in Optuna optimization."""
     pass
 
-def get_optuna_sampler_callback(trial: optuna.Trial, log: bool = False) -> Callable[[DesignParameter], Any]:
-    def callback(param: DesignParameter) -> Any:
-        match param:
-            case ContinuousDesignParameter():
-                return trial.suggest_float(param.name, param.min_value, param.max_value, log=log)
-            case CategoricalDesignParameter():
-                return trial.suggest_categorical(param.name, param.choices)
-            case _:
-                if not issubclass(type(param), CompositeDesignParameter):
-                    raise ValueError(f"Unsupported parameter type: {type(param)}")
-    
-    return callback
+class OptunaSampler(Sampler):
+    def __init__(self, trial: optuna.trial.Trial):
+        self._trial = trial
+
+    def ask(self) -> torch.Tensor:
+        values = {}
+        for name, p in self._space:
+            match p:
+                case Continuous():
+                    values[name] = self._trial.suggest_float(name, p.lower, p.upper, log=p.log)
+                case Integer():
+                    values[name] = self._trial.suggest_int(name, p.lower, p.upper)
+                case Categorical():
+                    values[name] = self._trial.suggest_categorical(name, p.choices)
+        return self._space.encode(values)
+
 
 def get_directions(objective: Union[Objective, Sequence[Objective]]) -> Sequence[str]:
     if isinstance(objective, Objective):
@@ -69,7 +73,7 @@ def get_directions(objective: Union[Objective, Sequence[Objective]]) -> Sequence
 
 
 class OptunaBackend:
-    def __init__(self, study_name: str, workflow: WorkflowTaskGraph, design: CompositeDesignParameter, 
+    def __init__(self, study_name: str, workflow: WorkflowTaskGraph, design: ParameterSpace, 
                  constraint: Optional[GeometryConstraintBase], objective: Union[Objective, Iterable[Objective]],
                  worker: Optional[DaskWorkerBase] = None,
                  seed: int = 42) -> None:
@@ -92,14 +96,11 @@ class OptunaBackend:
 
         check_workflow_validity(self.workflow, self.objective)
 
-    def sample_design(self, trial: optuna.trial.Trial) -> Any:
-        """
-        Only sample the design parameters for a trial (this triggers GP fitting in the sampler).
-        """
-        sampler_callback = get_optuna_sampler_callback(trial, log=True)
-        return ValueRegistry.sample_from(self.design, sampler_callback)
+    def sample_design(self, trial: optuna.trial.Trial) -> Candidate:
+        """Only sample the design parameters for a trial (this triggers GP fitting in the sampler)."""
+        return self.design.sample(OptunaSampler(trial))
 
-    def evaluate_design(self, trial_number: int, sampled_design: Any) -> tuple[Union[float, Sequence[float]], Optional[Sequence[float]]]:
+    def evaluate_design(self, trial_number: int, candidate: Candidate) -> tuple[Union[float, Sequence[float]], Optional[Sequence[float]]]:
         """
         Evaluate the sampled design (run workflow, check objectives, set constraints).
         Returns (objective_values, constraints)
@@ -108,22 +109,22 @@ class OptunaBackend:
             try:
                 workdir_root = os.path.join("files", f"run{self.seed}", f"trial_{trial_number}")
                 with Workdir.create(workdir_root):
-                    result = self.workflow.run(sampled_design.to_dict(flatten=True))
+                    result = self.workflow.run(candidate.values)
                     objective_val = get_objective_vals(result, self.objective)
                     
                     constraints = None
                     if self.constraint is not None:
-                        constraints = self.constraint(sampled_design.to_dict(flatten=True))
+                        constraints = self.constraint(candidate.values)
                     
                     return objective_val[0] if is_single_objective(self.objective) else objective_val, constraints
                 
             except Exception as e:
-                print(f"Trial {trial_number} failed with error: {e}")
+                print(f"Trial {trial_number} failed with error: {e}")                
                 raise TrialFailedError()
             
     def sample_and_evaluate(self, trial: optuna.trial.Trial) -> Union[float, Sequence[float]]:
-        sampled_design = self.sample_design(trial)
-        return self.evaluate_design(trial, sampled_design)
+        candidate = self.sample_design(trial)
+        return self.evaluate_design(trial, candidate)
     
     def constraint_fn(self, trial: optuna.trial.FrozenTrial) -> Sequence[float]:
         return trial.user_attrs[_CONSTRAINTS_KEY]
@@ -159,15 +160,14 @@ class OptunaBackend:
                         trial = study.ask()
                         trial_number = trial.number
                         
-                        sampler_callback = get_optuna_sampler_callback(trial, log=True)
-                        sampled_design = ValueRegistry.sample_from(design, sampler_callback)
+                        candidate = design.sample(OptunaSampler(trial))
 
                         del trial
                         gc.collect()
                         
                         result_queue.put({
                             'type': 'design',
-                            'design': sampled_design,
+                            'design': candidate,
                             'trial_number': trial_number
                         })
                     
@@ -230,12 +230,12 @@ class OptunaBackend:
                             return
                         
                         trial_number = response['trial_number']
-                        sampled_design = response['design']
+                        candidate = response['design']
                         asked_count[0] += 1
                         print(f"Asked trial {trial_number}, total asked: {asked_count[0]}")
             
                 try:
-                    value, constraints = await loop.run_in_executor(None, self.evaluate_design, trial_number, sampled_design)
+                    value, constraints = await loop.run_in_executor(None, self.evaluate_design, trial_number, candidate)
                     
                     ask_queue.put({
                         'type': 'tell',
@@ -271,7 +271,7 @@ class OptunaBackend:
                     await loop.run_in_executor(None, result_queue.get)
                     
                 finally:
-                    del sampled_design
+                    del candidate
                     gc.collect()
                     
                     async with ask_condition:

@@ -1,178 +1,248 @@
-import numpy as np
-from abc import abstractmethod
+from __future__ import annotations
+
+import torch
+from enum import Enum
+from attr import field
+from numpy.char import lower, upper
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from collections.abc import Callable
-from typing import Any, Callable, Generator, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, TypeAlias
+
+class Encoding(Enum):
+    ORDINAL = "ordinal"
+    ONE_HOT = "one_hot"
+
+#TODO: add option to declare Variable constants (e.g. fixed hyperparameters) that are not included in the encoding/tensors.
+#TODO: add support for default values? alternative to sampling?
+
+@dataclass(frozen=True)
+class Continuous:
+    lower: float
+    upper: float
+    log: bool = False
+
+@dataclass(frozen=True)
+class Integer:
+    lower: int
+    upper: int
 
 
-class DesignParameter:
-    def __init__(self, name: str) -> None:
-        self.name: str = name
+@dataclass(frozen=True)
+class Categorical:
+    choices: List[Any]
 
-    def iterate_flatten(self) -> Generator['DesignParameter', None, None]:
-        yield self
+
+@dataclass(frozen=True)
+class Vector:
+    lower: float
+    upper: float
+    size: int
+    log: bool = False
+
+
+DesignParameter: TypeAlias = Union[Continuous, Integer, Categorical, Vector]
+
+
+class Group:
+    def __init__(self, **params: Union[DesignParameter, Group]):
+        self.params = params
+
+
+class ParameterMap(ABC):
+    def __init__(self, source: ParameterSpace, target: ParameterSpace):
+        self.source = source
+        self.target = target
+
+    @abstractmethod
+    def decode_tensors(self, z: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
+        """Differentiable latent -> target decode. Must preserve the autograd graph."""
+        pass
+
+    def _assert_decoded_keys(self, decoded: Dict[str, torch.Tensor]) -> None:
+        expected_keys = set(self.target._params)
+        decoded_keys = set(decoded.keys())
+        missing = expected_keys - decoded_keys
+        extra = decoded_keys - expected_keys
+        
+        if missing:
+            raise ValueError(f"decode_tensors output missing keys: {missing}")
+        if extra:
+            raise ValueError(f"decode_tensors output has unexpected keys: {extra}")
     
-    def num_parameters(self, one_hot_categorical: bool = True) -> int:
-        return 1
+    def _decode_values(self, z: torch.Tensor) -> Dict[str, Any]:
+        raw = self.decode_tensors(z)
+        self._assert_decoded_keys(raw)
+
+        result: Dict[str, Any] = {}
+        for name, p in self.target._params.items():
+            t = raw[name]
+            match p:
+                #TODO: fix this if gradient is required (especially categorical and integer + .item())
+                case Categorical():
+                    expected_w = len(p.choices)
+                    if t.shape[-1] != expected_w:
+                        raise ValueError(
+                            f"decode_tensors output for '{name}' has width {t.shape[-1]}, "
+                            f"expected {expected_w} (Categorical with {expected_w} choices)"
+                        )
+                    result[name] = p.choices[int(t.argmax().item())]
+                case Integer():
+                    result[name] = int(t.item())
+                case Continuous():
+                    result[name] = float(t.item())
+        return result
+
+    def register_sampler(self, sampler: Sampler) -> None:
+        self.source.register_sampler(sampler)
+
+    def __call__(self, source_candidate: Candidate) -> Candidate:
+        return Candidate(self, source_candidate.tensor)
+
+    def sample(self, sampler: Sampler = None, requires_grad: bool = False) -> Candidate:
+        return Candidate(self, self.source.sample(sampler, requires_grad).tensor)
+
+    def n_dims(self, encoding: str = 'ordinal') -> int:
+        return self.target.n_dims(encoding)
 
 
-class CompositeDesignParameter(DesignParameter):
-    def __init__(self, name: str, parameters: Sequence[DesignParameter]) -> None:
-        super().__init__(name)
-        self._parameters = parameters
+@dataclass(frozen=True)
+class Candidate:
+    space: ParameterSpace
+    tensor: torch.Tensor
+    _index: Dict[str, Tuple[int, int]] = field(init=False)
 
-    def iterate_flatten(self) -> Generator['DesignParameter', None, None]:
-        for param in self._parameters:
-            if isinstance(param, CompositeDesignParameter):
-                yield from param.iterate_flatten()
-            else:
-                yield param
+    def __post_init__(self):
+        if not isinstance(self.space, ParameterMap):
+            index: Dict[str, Tuple[int, int]] = {}
+            offset = 0
+            for n, p in self.space._params.items():
+                w = len(p.choices) if hasattr(p, 'choices') else 1
+                index[n] = (offset, w)
+                offset += w
+        else:
+            index = {n: (i, 1) for i, n in enumerate(self.space.source._params)}
+        object.__setattr__(self, '_index', index)
 
-    def num_parameters(self, one_hot_categorical: bool = True) -> int:
-        return sum(p.num_parameters(one_hot_categorical) for p in self._parameters)
+    @classmethod
+    def from_values(cls, space: ParameterSpace, values: Dict[str, Any], requires_grad: bool = False) -> Candidate:
+        return cls(space, space.encode(values, requires_grad))
 
-    def __repr__(self) -> str:
-        return f"CompositeDesignParameter(name={self.name}, parameters={self._parameters})"
+    def __getitem__(self, key):
+        if not isinstance(self.space, ParameterMap):
+            offset, w = self._index[key]
+            return self.tensor[offset:offset+w] if w > 1 else self.tensor[offset].item()
+        
+        return self.space.decode_tensors(self.tensor)[key]
     
     @property
-    def parameters(self) -> Sequence[DesignParameter]:
-        return self._parameters
-
-
-class ContinuousDesignParameter(DesignParameter):
-    def __init__(self, name, min_value: float, max_value: float, value: Optional[float] = 0) -> None:
-        super().__init__(name)
-        self.min_value = min_value
-        self.max_value = max_value
-
-    def __repr__(self) -> str:
-        return f"ContinuousDesignParameter(name={self.name}, min_value={self.min_value}, max_value={self.max_value})"
-
-class CategoricalDesignParameter(DesignParameter):
-    def __init__(self, name: str, choices: Sequence[Any]) -> None:
-        super().__init__(name)
-        self.choices = choices
-
-    def num_parameters(self, one_hot_categorical: bool = True) -> int:
-        return len(self.choices) if one_hot_categorical else 1
-
-    def __repr__(self) -> str:
-        return f"ContinuousDesignParameter(name={self.name}, choices={self.choices})"
-
-
-class VectorDesignParameter(CompositeDesignParameter):
-    def __init__(self, name: str, num_elements: int, min_val: float, max_val: float) -> None:
-        super().__init__(name, [ContinuousDesignParameter(f"{name}_{i}", min_val, max_val) for i in range(num_elements)])
-
-    @property
-    def shape(self) -> Tuple[int]:
-        return (len(self._parameters),)
-
-
-class ValueRegistry:
-    def __init__(self, registry: Optional[dict] = None, design: Optional[Union[CompositeDesignParameter, DesignParameter]] = None) -> None:
-        object.__setattr__(self, '_registry', registry if registry is not None else {})
-        object.__setattr__(self, '_design', design)
+    def values(self) -> Dict[str, Any]:
+        if not isinstance(self.space, ParameterMap):
+            result: Dict[str, Any] = {}
+            for name, p in self.space._params.items():
+                offset, w = self._index[name]
+                match p:
+                    case Categorical():   # Categorical — argmax over one-hot slice
+                        result[name] = p.choices[int(self.tensor[offset:offset + w].argmax().item())]
+                    case Continuous():
+                        result[name] = float(self.tensor[offset].item())
+                    case Integer():
+                        result[name] = int(round(self.tensor[offset].item()))   
+                    case _:
+                        raise ValueError(f"Unsupported parameter type: {type(p)}")
+            return result
+        return self.space._decode_values(self.tensor)
     
-    def __setattr__(self, name: str, value: Any) -> None:
-        raise AttributeError("ValueRegistry is immutable")
-
-    @classmethod
-    def sample_from(cls, design: Union[CompositeDesignParameter, DesignParameter],
-                    sampler_callback: Callable[[DesignParameter], Any],
-                    transform: Optional[Callable[[dict], dict]] = None) -> 'ValueRegistry':
-        
-        def _sample_recursive(param: DesignParameter) -> Any:
-            if isinstance(param, CompositeDesignParameter):
-                return {p.name: _sample_recursive(p) for p in param.parameters}
-            else:
-                return sampler_callback(param)
-        
-        sampled_values = _sample_recursive(design)
-
-        if transform:
-            sampled_values = transform(sampled_values)
-        
-        return cls(sampled_values, design)
+    def __contains__(self, key: str) -> bool:
+        params = (self.space.target._params \
+                    if isinstance(self.space, ParameterMap) \
+                    else self.space._params)
+        return key in params
     
-    @classmethod
-    def sample_batch(cls, design: Union[CompositeDesignParameter, DesignParameter],
-                     sampler_callback: Callable[[DesignParameter], Any],
-                     batch_size: int) -> Sequence['ValueRegistry']:
-        return [cls.sample_from(design, sampler_callback) for _ in range(batch_size)]
-    
-    @classmethod
-    def from_design_vector(cls, design: Union[CompositeDesignParameter, DesignParameter],
-                           design_vector: Sequence[float],
-                           one_hot_categorical: bool = True) -> 'ValueRegistry':
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Candidate):
+            return NotImplemented
+        return self.values == other.values
 
-        design_vector = list(design_vector)
-        index = 0
+
+class Sampler(ABC):
+    def bind(self, space: ParameterSpace) -> None:
+        self._space = space
+
+    @abstractmethod
+    def ask(self) -> torch.Tensor: 
+        pass
+
+
+class ParameterSpace:
+    def __init__(self, *, key_fn: Callable[[Tuple[str, ...]], str] = lambda x: ".".join(x),
+                 **spec: Union[DesignParameter, Group]):
         
-        def _assign_recursive(param: DesignParameter) -> Any:
-            nonlocal index
+        self._key_fn = key_fn
+        self._spec = spec
+        self._params = _collect(spec, key_fn)
+        self._sampler: Sampler | None = None
+
+    @staticmethod
+    def repeat(prefix: str, n: int, **params: Union[DesignParameter, Group]) -> Dict[str, Union[DesignParameter, Group]]:
+        return {f"{prefix}_{i}": Group(**params) for i in range(n)}
+    
+    def register_sampler(self, sampler: Sampler) -> None:
+        sampler.bind(self)
+        self._sampler = sampler
+
+    def encode(self, values: Dict[str, Any], requires_grad: bool = False) -> torch.Tensor:
+        parts: List[float] = []
+        for name, p in self:
+            v = values[name]
+            match p:
+                case Categorical():
+                    one_hot = [0.0] * len(p.choices)
+                    one_hot[p.choices.index(v)] = 1.0
+                    parts.extend(one_hot)
+                case _:
+                    parts.append(float(v))
+        return torch.tensor(parts, dtype=torch.float32, requires_grad=requires_grad)
+
+    def sample(self, sampler: Sampler = None, requires_grad: bool = False) -> Candidate:
+        s = sampler or self._sampler
+        if s is None:
+            raise RuntimeError("No sampler provided. Pass one to sample() or call register_sampler() first.")
+        
+        #TODO: this is hacky
+        s.bind(self)
+        t = s.ask()
+        if requires_grad:
+            t.requires_grad_(True)
+        return Candidate(self, t)
+
+    def dims(self, encoding: Encoding | str = Encoding.ORDINAL) -> int:
+        match encoding:
+            case Encoding.ORDINAL | "ordinal":
+                return len(self._params)
+            case Encoding.ONE_HOT | "one_hot":
+                return sum(
+                    len(p.choices) if isinstance(p, Categorical) else 1
+                    for p in self._params.values()
+                )
+            case _:
+                raise ValueError(f"Unknown encoding {encoding!r}. Use 'ordinal' or 'one_hot'.")
             
-            if isinstance(param, CompositeDesignParameter):
-                return {p.name: _assign_recursive(p) for p in param.parameters}
-            elif isinstance(param, CategoricalDesignParameter) and one_hot_categorical:
-                num_choices = len(param.choices)
-                one_hot = design_vector[index:index + num_choices]
-                index += num_choices
-                
-                if len(one_hot) < num_choices:
-                    raise ValueError(f"Insufficient vector length for one-hot encoding of {param.name}")
-                
-                choice_idx = int(np.argmax(one_hot))
-                return param.choices[choice_idx]
-            else:
-                value = design_vector[index]
-                index += 1
-                return value
-        
-        structured_values = _assign_recursive(design)
-        
-        if index != len(design_vector):
-            raise ValueError(f"Design vector length mismatch: expected {index} elements, got {len(design_vector)}")
-        
-        return cls(structured_values, design)
-    
+    def __iter__(self)  -> Iterator[Tuple[str, DesignParameter]]:
+        return iter(self._params.items())
 
-    def to_design_vector(self, one_hot_categorical: bool = True) -> list:
-        def _flatten(param: Optional[DesignParameter], value: Any) -> list:
-            if isinstance(value, dict):
-                result = []
-                if param and isinstance(param, CompositeDesignParameter):
-                    for p in param.parameters:
-                        result.extend(_flatten(p, value[p.name]))
-                else:
-                    for v in value.values():
-                        result.extend(_flatten(None, v))
-                return result
-            
-            if one_hot_categorical and param and isinstance(param, CategoricalDesignParameter):
-                one_hot = [0.0] * len(param.choices)
-                choice_idx = param.choices.index(value)
-                one_hot[choice_idx] = 1.0
-                return one_hot
-            
-            return [value]
-        
-        return _flatten(self._design, self._registry)
-    
 
-    def to_dict(self, flatten: bool = True) -> dict:
-        if not flatten:
-            import copy
-            return copy.deepcopy(self._registry)
-        
-        def _flatten(d: dict, parent: str = '') -> dict:
-            items = []
-            for k, v in d.items():
-                key = f"{k}" if parent else k
-                if isinstance(v, dict):
-                    items.extend(_flatten(v, key).items())
-                else:
-                    items.append((key, v))
-            return dict(items)
-        
-        return _flatten(self._registry)
+def _collect(params: Dict[str, Union[DesignParameter, Group]], 
+             key_fn: Callable[[Tuple[str, ...]], str] = '.'.join,
+            _parts: Tuple[str, ...] = ()) -> Dict[str, DesignParameter]:
+    """Flatten dictionary representation of parameters {key: parameter}; groups and vectors are expanded"""
+    out: Dict[str, Union[Continuous, Integer, Categorical]] = {}
+    for name, spec in params.items():
+        parts = (*_parts, name)
+        if isinstance(spec, Group):
+            out.update(_collect(spec.params, key_fn, parts))
+        elif isinstance(spec, Vector):
+            for i in range(1, spec.size + 1):
+                out[key_fn((*_parts, f"{name}_{i}"))] = Continuous(spec.lower, spec.upper, spec.log)
+        else:
+            out[key_fn(parts)] = spec
+    return out
