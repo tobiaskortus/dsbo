@@ -3,7 +3,7 @@ import math
 import os
 import matplotlib
 import networkx as nx
-from typing import List
+from typing import Iterable, List
 from copy import deepcopy
 from graphviz import Digraph
 from itertools import groupby
@@ -90,7 +90,12 @@ def get_dependent_task_groups(G: nx.DiGraph):
 
 
 class Workflow:
-    def __init__(self, dependencies: dict[Module, list[Module]]) -> None:
+    def __init__(self, dependencies: dict[Module, Iterable[Module]] | Module) -> None:
+
+        #Convert single module into dict forma
+        if isinstance(dependencies, Module):
+            dependencies = {dependencies: []}
+
         self._repr = nx.DiGraph(dependencies)
 
         assert_no_self_loops(self._repr)
