@@ -8,7 +8,7 @@ from dsbo.workflow import  WorkflowTaskGraph, optimize
 from dsbo.parameters import ParameterSpace, Group, Continuous, Categorical
 
 from examples.calo_multiobjective.reconstruction import G4CaloReconstruction
-from examples.calo.constraints import G4CaloCostConstraint, G4CaloLengthConstraint
+from examples.calo_multiobjective.constraints import G4CaloCostConstraint, G4CaloLengthConstraint
 from examples.calo_multiobjective.simulation import G4CaloSimulation, G4CaloSimToReco
 
 def _g4_calo_key(parts):
