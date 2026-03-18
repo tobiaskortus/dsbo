@@ -1,8 +1,13 @@
 *.ipynb
 *.root
 *.db
+.vscode/
 files
 logs
+*.out
+*.err
+
+__BACKUP
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
