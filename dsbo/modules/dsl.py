@@ -68,6 +68,10 @@ class DependencyDict(dict):
 
     def __or__(self, other):
         match other:
+            case ModuleDslMixin() as m:
+                out = DependencyDict({k: list(v) for k, v in self.items()})
+                out.setdefault(m, [])
+                return out
             case dict() as d:
                 out = DependencyDict({k: list(v) for k, v in self.items()})
                 for k, vs in d.items():
