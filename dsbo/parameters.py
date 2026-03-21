@@ -40,7 +40,12 @@ class Vector:
     log: bool = False
 
 
-DesignParameter: TypeAlias = Union[Continuous, Integer, Categorical, Vector]
+@dataclass(frozen=True)
+class Constant:
+    value: Union[float, int, str]
+
+
+DesignParameter: TypeAlias = Union[Continuous, Integer, Categorical, Vector, Constant]
 
 
 class Group:
@@ -59,7 +64,7 @@ class ParameterMap(ABC):
         pass
 
     def _assert_decoded_keys(self, decoded: Dict[str, torch.Tensor]) -> None:
-        expected_keys = set(self.target._params)
+        expected_keys = {k for k, p in self.target._params.items() if not isinstance(p, Constant)}
         decoded_keys = set(decoded.keys())
         missing = expected_keys - decoded_keys
         extra = decoded_keys - expected_keys
@@ -75,10 +80,13 @@ class ParameterMap(ABC):
 
         result: Dict[str, Any] = {}
         for name, p in self.target._params.items():
-            t = raw[name]
             match p:
+                case Constant():
+                    result[name] = p.value
+                    continue
                 #TODO: fix this if gradient is required (especially categorical and integer + .item())
                 case Categorical():
+                    t = raw[name]
                     expected_w = len(p.choices)
                     if t.shape[-1] != expected_w:
                         raise ValueError(
@@ -87,9 +95,9 @@ class ParameterMap(ABC):
                         )
                     result[name] = p.choices[int(t.argmax().item())]
                 case Integer():
-                    result[name] = int(t.item())
+                    result[name] = int(raw[name].item())
                 case Continuous():
-                    result[name] = float(t.item())
+                    result[name] = float(raw[name].item())
         return result
 
     def register_sampler(self, sampler: Sampler) -> None:
@@ -116,6 +124,8 @@ class Candidate:
             index: Dict[str, Tuple[int, int]] = {}
             offset = 0
             for n, p in self.space._params.items():
+                if isinstance(p, Constant):
+                    continue
                 w = len(p.choices) if hasattr(p, 'choices') else 1
                 index[n] = (offset, w)
                 offset += w
@@ -129,6 +139,9 @@ class Candidate:
 
     def __getitem__(self, key):
         if not isinstance(self.space, ParameterMap):
+            p = self.space._params[key]
+            if isinstance(p, Constant):
+                return p.value
             offset, w = self._index[key]
             return self.tensor[offset:offset+w] if w > 1 else self.tensor[offset].item()
         
@@ -139,14 +152,18 @@ class Candidate:
         if not isinstance(self.space, ParameterMap):
             result: Dict[str, Any] = {}
             for name, p in self.space._params.items():
-                offset, w = self._index[name]
                 match p:
+                    case Constant():
+                        result[name] = p.value
                     case Categorical():   # Categorical — argmax over one-hot slice
+                        offset, w = self._index[name]
                         result[name] = p.choices[int(self.tensor[offset:offset + w].argmax().item())]
                     case Continuous():
+                        offset, _ = self._index[name]
                         result[name] = float(self.tensor[offset].item())
                     case Integer():
-                        result[name] = int(round(self.tensor[offset].item()))   
+                        offset, _ = self._index[name]
+                        result[name] = int(round(self.tensor[offset].item()))
                     case _:
                         raise ValueError(f"Unsupported parameter type: {type(p)}")
             return result
@@ -193,14 +210,16 @@ class ParameterSpace:
     def encode(self, values: Dict[str, Any], requires_grad: bool = False) -> torch.Tensor:
         parts: List[float] = []
         for name, p in self:
-            v = values[name]
             match p:
+                case Constant():
+                    continue
                 case Categorical():
+                    v = values[name]
                     one_hot = [0.0] * len(p.choices)
                     one_hot[p.choices.index(v)] = 1.0
                     parts.extend(one_hot)
                 case _:
-                    parts.append(float(v))
+                    parts.append(float(values[name]))
         return torch.tensor(parts, dtype=torch.float32, requires_grad=requires_grad)
 
     def sample(self, sampler: Sampler = None, requires_grad: bool = False) -> Candidate:
@@ -215,12 +234,13 @@ class ParameterSpace:
             t.requires_grad_(True)
         return Candidate(self, t)
 
-    def dims(self, encoding: Encoding | str = Encoding.ORDINAL) -> int:
+    def dims(self, encoding: Encoding | str = Encoding.ORDINAL, include_constants: bool = False) -> int:
         match encoding:
             case Encoding.ORDINAL | "ordinal":
-                return len(self._params)
+                return sum(0 if isinstance(p, Constant) and not include_constants else 1 for p in self._params.values())
             case Encoding.ONE_HOT | "one_hot":
                 return sum(
+                    0 if isinstance(p, Constant) and not include_constants else
                     len(p.choices) if isinstance(p, Categorical) else 1
                     for p in self._params.values()
                 )
