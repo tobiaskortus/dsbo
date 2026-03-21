@@ -25,9 +25,15 @@ optuna = [
     "optuna-integration[botorch]"
 ]
 
+[project.optional-dependencies]
+aido = [
+    "diffusers"
+]
+
 all = [
     "optuna",
     "optuna-integration[botorch]"
+    "diffusers"
 ]
 
 [tool.setuptools.packages.find]
