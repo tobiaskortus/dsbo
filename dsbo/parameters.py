@@ -234,6 +234,9 @@ class ParameterSpace:
             t.requires_grad_(True)
         return Candidate(self, t)
 
+    def sample_batch(self, sampler: Sampler = None, batch_size: int = 16, requires_grad: bool = False) -> list[Candidate]:
+        return [self.sample(sampler, requires_grad) for _ in range(batch_size)]
+
     def dims(self, encoding: Encoding | str = Encoding.ORDINAL, include_constants: bool = False) -> int:
         match encoding:
             case Encoding.ORDINAL | "ordinal":
