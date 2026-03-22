@@ -97,7 +97,7 @@ class ParameterMap(ABC):
                 case Integer():
                     result[name] = int(raw[name].item())
                 case Continuous():
-                    result[name] = float(raw[name].item())
+                    result[name] = raw[name]
         return result
 
     def register_sampler(self, sampler: Sampler) -> None:
@@ -160,7 +160,7 @@ class Candidate:
                         result[name] = p.choices[int(self.tensor[offset:offset + w].argmax().item())]
                     case Continuous():
                         offset, _ = self._index[name]
-                        result[name] = float(self.tensor[offset].item())
+                        result[name] = self.tensor[offset]
                     case Integer():
                         offset, _ = self._index[name]
                         result[name] = int(round(self.tensor[offset].item()))
@@ -219,7 +219,7 @@ class ParameterSpace:
                     one_hot[p.choices.index(v)] = 1.0
                     parts.extend(one_hot)
                 case _:
-                    parts.append(float(values[name]))
+                    parts.append(values[name])
         return torch.tensor(parts, dtype=torch.float32, requires_grad=requires_grad)
 
     def sample(self, sampler: Sampler = None, requires_grad: bool = False) -> Candidate:
