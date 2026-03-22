@@ -1,23 +1,17 @@
-from contextlib import nullcontext
-import math
 import os
 import matplotlib
 import networkx as nx
-from typing import Iterable, List
 from copy import deepcopy
+from typing import Sequence
+from itertools import chain
 from graphviz import Digraph
 from itertools import groupby
-import matplotlib
+from typing import Iterable, List
 import matplotlib.colors as mcolors
-import dask
-from dask import delayed
-from dask.distributed import performance_report
-from matplotlib import pyplot as plt
-from dsbo.modules import Module
-from dsbo.worker.config import SlurmWorkerConfig
-from typing import Callable, Optional, Sequence
 from IPython.display import Image, display
 
+from dsbo.modules import Module
+from dsbo.worker.config import SlurmWorkerConfig
 
 class FusedModule(Module):
     """A group of modules with identical resources, fused into a single graph node."""
@@ -101,56 +95,54 @@ class Workflow:
         assert_no_self_loops(self._repr)
         assert_no_duplicate_nodes(self._repr)
 
-    def run(self, design: dict) -> dict[str, float]:
-        """Evaluate a single design through the workflow task graph.
-        
-        Args:
-            design (dict): Design parameters to evaluate.
-        """
-        return self.run_batch([design])[0]
+    def run(self, design: dict, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
+        return self.run_batch([design], catch=catch)[0]
 
-    def run_batch(self, designs: Sequence[dict]) -> List[dict[str, float]]:
-        """Evaluate multiple designs through the workflow task graph.
-        
-        Without a distributed worker, designs are executed sequentially.
-        With a distributed worker, all designs are built into a single
-        delayed graph and submitted together via compute.
-        
-        Args:
-            designs (Sequence[dict]): List of design parameter dicts to evaluate.
-        """
+    def run_batch(self, designs: Sequence[dict], catch: tuple[Exception, ...] = ()) -> List[dict[str, float]]:
         from dsbo.worker.dask import WorkerContext
         worker = WorkerContext.get_current_worker()
 
         if worker is None:
             batch_results = []
             for design in designs:
-                results = {}
-                for batch in self.iterate_dependent_task_groups():
-                    for task in batch:
-                        result = task.run(design=design)
-                        results.update(result)
-                batch_results.append(results)
+                try:
+                    results = {}
+                    for batch in self.iterate_dependent_task_groups():
+                        for task in batch:
+                            result = task.run(design=design)
+                            results.update(result)
+                    batch_results.append(results)
+                except Exception as e:
+                    batch_results.append({})
+                    if not isinstance(e, catch):
+                        raise
+                    
             return batch_results
         else:
-            batch_delayed_maps = []
+            batch_delays = []
+            batch_task_ids = []
             for design in designs:
                 delayed_map = {}
+                task_ids = []
                 for depth, batch in enumerate(self.iterate_dependent_task_groups()):
                     for task in batch:
                         dependencies = [delayed_map[p] for p in self._repr.predecessors(task)]
-                        delayed_map[task] = worker.schedule(task, design, dependencies, priority=depth)
+                        task_id, delayed_obj = worker.schedule(task, design, dependencies, priority=depth)
+                        delayed_map[task] = delayed_obj
                         
-                batch_delayed_maps.append(delayed_map)
+                        task_ids.append(task_id)
+                        batch_delays.append(delayed_obj)
 
-            results_flatten = worker.compute([d for dm in batch_delayed_maps for d in dm.values()])
+                batch_task_ids.append(task_ids)
 
-            it = iter(results_flatten)
-            batch_results = [
-                {k: v for f in (next(it).result() for _ in dm) for k, v in (f.items() if f else [])}
-                for dm in batch_delayed_maps
-            ]
-            return batch_results
+            futures_computed = worker.compute(batch_delays)
+            results_flat = worker.gather(futures_computed, catch=catch)
+
+            lookup = {task_id: result for task_id, result in results_flat}
+
+            return [dict(chain.from_iterable(lookup.get(tid, {}).items() \
+                        for tid in tids)) \
+                        for tids in batch_task_ids]
 
 
     def iterate_dependent_task_groups(self):

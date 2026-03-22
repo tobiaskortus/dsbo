@@ -1,11 +1,11 @@
 from __future__ import annotations
 import dask
 import contextvars
-from abc import abstractmethod
-from dask.delayed import Delayed, delayed
-from dask.distributed import Client
+import uuid
+from dask.distributed import Client, Future
 from contextlib import contextmanager
-from dask_jobqueue import SLURMCluster
+from dask.delayed import Delayed, delayed
+from dask_jobqueue.local import LocalCluster
 from dsbo.utils.io import get_workdir, get_file_suffix
 from dask_heterogeneous.slurm import HeterogeneousSlurmCluster
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
@@ -23,16 +23,58 @@ dask.config.set({
 })
 
 class DaskWorkerBase:
-    def __init__(self):
-        pass
+    def __init__(self, cluster):
+        self.client = Client(cluster)
 
-    @abstractmethod
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.client.close()
+        self.cluster.close()
+
     def compute(self, objs, **kwargs):
-        pass
+        return self.client.compute(objs, **kwargs)
 
-    @abstractmethod
-    def schedule(self, module: Module, design: dict, dependencies: Iterable = (), priority: int | None = None) -> Delayed:
-        pass
+    def gather(self, futures: Iterable[Future], catch: tuple = ()) -> list:
+        """Should be okay since client.gather implements
+
+        ```
+        if isinstance(futures, Iterator):
+            return (self.gather(f, errors=errors, direct=direct) for f in futures)
+        ```
+        
+        internally
+        """
+        if not catch:
+            return self.client.gather(futures)
+
+        results = []
+        for f in futures:
+            try:
+                r = self.client.gather(f)
+            except Exception as e:
+                if isinstance(e, catch):
+                    continue
+                raise
+            results.append(r)
+        return results
+
+    def schedule(self, module: Module, design: dict, dependencies: Iterable = (), priority: int | None = None) -> tuple[uuid.UUID, Delayed]:
+        suffix = get_file_suffix()
+        workdir = getattr(get_workdir(), "workdir_root", None)
+        resources = getattr(module.resources, "resources", None)
+
+        task_id = uuid.uuid4()
+
+        def _module_wrapper(module, design_arg, *deps):
+            result = module.run(design=design_arg, workdir=workdir, suffix=suffix)
+            return task_id, result
+
+        with dask.annotate(resources=(resources or {}), priority=priority):
+            delayed_obj = delayed(_module_wrapper, name=module.name)(module, design, *dependencies)
+
+        return task_id, delayed_obj
 
 class WorkerContext:
     _current_worker = contextvars.ContextVar("current_worker", default=None)
@@ -77,7 +119,6 @@ def get_extra_args(worker_config: SlurmWorkerConfig) -> tuple[list[str], list[st
 
 class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
     def __init__(self, job_specs: Iterable[SlurmWorkerConfig], logdir: str = "logs"):
-        super().__init__()
         self.logdir = logdir
 
         spec_dict = {
@@ -96,34 +137,16 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
 
         self.cluster = HeterogeneousSlurmCluster(spec=spec_dict, log_directory=logdir)
         self.cluster.adapt({spec_key: (0, 5) for spec_key in spec_dict.keys()})
-
-        self.client = Client(self.cluster)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.client.close()
-        self.cluster.close()
-
-    def compute(self, objs, **kwargs):
-        return self.client.compute(objs, **kwargs)
-
-    def schedule(self, module: Module, design: dict, dependencies: Iterable = (), priority: int | None = None) -> Delayed:
-        workdir = get_workdir().workdir_root
-        suffix = get_file_suffix()
-
-        resources = getattr(module.resources, "resources", None)
-    
-        def _module_wrapper(module, design_arg, *deps):
-            return module.run(design=design_arg, workdir=workdir, suffix=suffix)
-
-        with dask.annotate(resources=(resources or {}), priority=priority):
-            delayed_obj = delayed(_module_wrapper, name=module.name)(module, design, *dependencies)
-
-        return delayed_obj
+        super().__init__(self.cluster)
 
     @classmethod
     def from_workflow(cls, workflow: Workflow, logdir: str = "logs") -> "AdaptiveHeterogeneousDaskSlurmWorker":
         job_specs = workflow.get_unique_workers()
         return cls(job_specs=job_specs, logdir=logdir)
+
+
+class LocalDaskWorker(DaskWorkerBase):
+    def __init__(self):
+        self.cluster = LocalCluster(cores=1, memory="1GB")
+        self.cluster.adapt(minimum=1, maximum=5)
+        super().__init__(self.cluster)
