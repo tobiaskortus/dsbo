@@ -1,5 +1,6 @@
 from abc import abstractmethod
 import os
+from typing import Callable
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -78,6 +79,29 @@ class DataFrameMergeTransform(SimulationTransform):
         output_path = self.output_file()
         save_df_by_extension(df, output_path)
 
+
+class NumpyRecordMergeTransform(SimulationTransform):
+    def __init__(self, pattern: str, output_name: str, transform: Callable[[np.recarray], np.recarray] | None = None) -> None:
+        super().__init__()
+        self.pattern = pattern
+        self.simulation_dir = Workdir.register("simulation")
+        self.output_file = Workdir.register_file("simulation", f"{output_name}.npy", unique_filename=False)
+        self.transform_fn = transform
+
+    def transform(self, design, **kwargs):
+        simulation_files = Path(self.simulation_dir()).glob(self.pattern)
+        arrays = []
+        for simulation_file in simulation_files:
+            arr = np.load(simulation_file, allow_pickle=True)
+            if self.transform_fn is not None:
+                arr = self.transform_fn(arr)
+            arrays.append(arr)
+            os.remove(simulation_file)
+
+        assert len(arrays) > 0, "No simulation files found to merge."
+            
+        merged_array = np.concatenate(arrays)
+        np.save(self.output_file(), merged_array)
         
 class MiniframeMergeTransform(SimulationTransform):
     def __init__(self, pattern: str) -> None:
