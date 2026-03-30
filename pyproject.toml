@@ -9,6 +9,9 @@ description = "Detector Suroogate-Based Optimization"
 requires-python = ">=3.10"
 
 dependencies = [
+    "tqdm",
+    "attrs",
+    "torch",
     "numpy",
     "pandas",
     "dask[distributed]",
@@ -16,24 +19,24 @@ dependencies = [
     "grpcio",
     "grpcio-tools",
     "graphviz",
+    "matplotlib",
     "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main"
 ]
 
 [project.optional-dependencies]
 optuna = [
     "optuna",
-    "optuna-integration[botorch]"
+    "optuna-integration[botorch]",
 ]
 
-[project.optional-dependencies]
 aido = [
-    "diffusers"
+    "diffusers",
 ]
 
 all = [
     "optuna",
-    "optuna-integration[botorch]"
-    "diffusers"
+    "optuna-integration[botorch]",
+    "diffusers",
 ]
 
 [tool.setuptools.packages.find]
