@@ -80,12 +80,10 @@ class LocalSurrogateDiffuser(ModelMixin, ConfigMixin):
         dropout: float = 0.1,
     ):
         super().__init__()
-        time_dim = emb_dim
         self.cond_dim = parameter_dim
 
-        #TODO: compare time embedding in cond vs x.
-        self.time_emb = PositionalEncoding(time_dim)
-        film_cond_dim = parameter_dim + time_dim
+        self.time_emb = PositionalEncoding(emb_dim)
+        film_cond_dim = parameter_dim
 
         self.in_fc = nn.Linear(objective_dim, emb_dim)
         self.blocks = nn.ModuleList([MLPBlock(emb_dim, hidden_dim, film_cond_dim, dropout) \
@@ -99,19 +97,14 @@ class LocalSurrogateDiffuser(ModelMixin, ConfigMixin):
         parameters: torch.Tensor | None = None,
         return_dict: bool = True,
     )  -> LocalSurrogateDiffuserOutput | torch.Tensor:
-        B = x.shape[0]
-        te = self.time_emb(t)
-
-        if parameters is None:
-            parameters = torch.zeros((B, self.cond_dim), device=x.device)
-
-        cond_in = torch.cat([parameters, te], dim=-1)
-
+        
+        #TODO: Is this really necessary to stay compatible with diffusers or is (B, n) also fine?
         x = x.squeeze(1)
         x = self.in_fc(x)
+        x = x + self.time_emb(t)
 
         for blk in self.blocks:
-            x = blk(x, cond_in)
+            x = blk(x, parameters)
 
         x = self.out_fc(x)
         x = x.unsqueeze(1)
