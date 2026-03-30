@@ -133,12 +133,10 @@ class Workdir(dict):
                     raise FileExistsError(f"Directory {path} already exists.")
                 os.makedirs(path, exist_ok=True)
 
-            yield
+            yield registry
         finally:
             if not keep: registry.cleanup()
             cls._current_workdir.reset(token)
-        
-        return registry
     
     @classmethod
     @contextmanager
@@ -213,8 +211,8 @@ class Workdir(dict):
 
 def get_workdir() -> Workdir:
     workdir = Workdir._current_workdir.get()
-    if workdir is None:
-        raise RuntimeError("No current workdir set.")
+    #if workdir is None:
+    #    raise RuntimeError("No current workdir set.")
     return workdir
     
 def get_file_suffix() -> Optional[str]:
