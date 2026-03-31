@@ -1,9 +1,11 @@
 import os
+import torch
 import matplotlib
 import networkx as nx
 from copy import deepcopy
 from typing import Sequence
 from itertools import chain
+from dsbo.parameters import Candidate
 from graphviz import Digraph
 from itertools import groupby
 from typing import Iterable, List
@@ -11,7 +13,10 @@ import matplotlib.colors as mcolors
 from IPython.display import Image, display
 
 from dsbo.modules import Module
+from dsbo.modules.compile import dry_run
 from dsbo.worker.config import SlurmWorkerConfig
+from dsbo.backends.aido.surrogate import LocalSurrogate
+
 
 class FusedModule(Module):
     """A group of modules with identical resources, fused into a single graph node."""
@@ -90,68 +95,71 @@ class Workflow:
         if isinstance(dependencies, Module):
             dependencies = {dependencies: []}
 
-        self._repr = nx.DiGraph(dependencies)
+        self._representation = nx.DiGraph(dependencies)
 
-        assert_no_self_loops(self._repr)
-        assert_no_duplicate_nodes(self._repr)
+        assert_no_self_loops(self._representation)
+        assert_no_duplicate_nodes(self._representation)
+
 
     def run(self, design: dict, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
         return self.run_batch([design], catch=catch)[0]
 
-    def run_batch(self, designs: Sequence[dict], catch: tuple[Exception, ...] = ()) -> List[dict[str, float]]:
-        from dsbo.worker.dask import WorkerContext
-        worker = WorkerContext.get_current_worker()
+    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()) -> List[dict[str, float]]:
+        
+        with torch.no_grad():
+            from dsbo.worker.dask import WorkerContext
+            worker = WorkerContext.get_current_worker()
 
-        if worker is None:
-            batch_results = []
-            for design in designs:
-                try:
-                    results = {}
-                    for batch in self.iterate_dependent_task_groups():
-                        for task in batch:
-                            result = task.run(design=design)
-                            results.update(result)
-                    batch_results.append(results)
-                except Exception as e:
-                    batch_results.append({})
-                    if not isinstance(e, catch):
-                        raise
-                    
-            return batch_results
-        else:
-            batch_delays = []
-            batch_task_ids = []
-            for design in designs:
-                delayed_map = {}
-                task_ids = []
-                for depth, batch in enumerate(self.iterate_dependent_task_groups()):
-                    for task in batch:
-                        dependencies = [delayed_map[p] for p in self._repr.predecessors(task)]
-                        task_id, delayed_obj = worker.schedule(task, design, dependencies, priority=depth)
-                        delayed_map[task] = delayed_obj
+            if worker is None:
+                batch_results = []
+                for candidate in candidates:
+                    try:
+                        results = {}
+                        for batch in self.iterate_dependent_task_groups():
+                            for task in batch:
+                                result = task.run(design=candidate.values)
+                                results.update(result)
+                        batch_results.append(results)
+                    except Exception as e:
+                        batch_results.append({})
+                        if not isinstance(e, catch):
+                            raise
                         
-                        task_ids.append(task_id)
-                        batch_delays.append(delayed_obj)
+                return batch_results
+            else:
+                batch_delays = []
+                batch_task_ids = []
+                for candidate in candidates:
+                    delayed_map = {}
+                    task_ids = []
+                    for depth, batch in enumerate(self.iterate_dependent_task_groups()):
+                        for task in batch:
+                            dependencies = [delayed_map[p] for p in self._representation.predecessors(task)]
+                            task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
+                            delayed_map[task] = delayed_obj
+                            
+                            task_ids.append(task_id)
+                            batch_delays.append(delayed_obj)
 
-                batch_task_ids.append(task_ids)
+                    batch_task_ids.append(task_ids)
 
-            futures_computed = worker.compute(batch_delays)
-            results_flat = worker.gather(futures_computed, catch=catch)
+                futures_computed = worker.compute(batch_delays)
+                results_flat = worker.gather(futures_computed, catch=catch)
 
-            lookup = {task_id: result for task_id, result in results_flat}
+                lookup = {task_id: result for task_id, result in results_flat}
 
-            return [dict(chain.from_iterable(lookup.get(tid, {}).items() \
-                        for tid in tids)) \
-                        for tids in batch_task_ids]
+                return [dict(chain.from_iterable(lookup.get(tid, {}).items() \
+                            for tid in tids)) \
+                            for tids in batch_task_ids]
 
 
     def iterate_dependent_task_groups(self):
-        for batch in get_dependent_task_groups(self._repr):
+        for batch in get_dependent_task_groups(self._representation):
             yield batch
 
     def get_unique_workers(self) -> set[SlurmWorkerConfig]:
         workers = set()
-        for node in self._repr.nodes():
+        for node in self._representation.nodes():
             if node.resources is not None:
                 workers.add(node.resources)
         return workers
@@ -177,7 +185,7 @@ class Workflow:
             res = getattr(n, 'resources', None)
             return 'default' if res is None else f"mem={res.memory}, cpu={res.job_cpu}, gpu={res.gpu_resources}"
 
-        nodes = list(self._repr.nodes())
+        nodes = list(self._representation.nodes())
         keys = []
         groups = {}
         for n in nodes:
@@ -214,7 +222,7 @@ class Workflow:
                 dot.node(nid, label=_node_label(n), style='filled', fillcolor=color, shape='box', fontcolor='black')
                 rep_entry[n] = rep_exit[n] = nid
 
-        for u, v in self._repr.edges():
+        for u, v in self._representation.edges():
             src = rep_exit.get(u, str(id(u)))
             dst = rep_entry.get(v, str(id(v)))
             dot.edge(src, dst)
@@ -232,24 +240,43 @@ class Workflow:
 
     @property
     def levels(self):
-        return task_levels(self._repr)
+        return task_levels(self._representation)
     
     @property
     def max_depth(self):
         return max(self.levels.values()) + 1 if self.levels else 0
+
+
+class PatchableWorkflow(Workflow):
+    """TODO: Integrate PatchableWorkflow into the main Workflow class, allowing for optional surrogate support without requiring a separate class."""
+    def __init__(self, dependencies: dict[Module, Iterable[Module]] | Module) -> None:
+        super().__init__(dependencies)
+        self.surrogate = None
+
+    def patch(self, surrogate: LocalSurrogate):
+        self.surrogate = surrogate
+
+    def run(self, candidate: Candidate, use_surrogate: bool = True) -> dict[str, float]:
+        if self.surrogate and use_surrogate:
+            if not self.surrogate.trust_region(candidate) or self.surrogate.model is None:
+                #TODO: Accessing the _strategy attribute directly is a bit hacky!
+                self.surrogate._strategy.update(candidate)
+                self.surrogate.fit(candidate, workflow_callback=super().run_batch)
+            
+            print("Using surrogate predictions")
+            with dry_run():
+                self.surrogate.eval()
+                scheme = super().run(candidate)
+                x = candidate.tensor.unsqueeze(0).repeat(64, 1)
+                y = self.surrogate(x).mean(dim=0)
+                if y.numel() == 1: y = [y]
+                return {k: v for k, v in  zip(scheme.keys(), y)}
+
+        return super().run(candidate)
     
 
-class DefaultSimRecoWorkflow(Workflow):
-    def __init__(self, sim: Module, transform: Module, reco: Module) -> None:
-        dependencies = {
-            sim: [transform],
-            transform: [reco]
-        }
-        super().__init__(dependencies)
-
-
 def mergeable_components(task_graph: Workflow, attr="resources") -> List[List[Module]]:
-    G = task_graph._repr
+    G = task_graph._representation
     in_deg = dict(G.in_degree())
     out_deg = dict(G.out_degree())
 
@@ -271,7 +298,7 @@ def mergeable_components(task_graph: Workflow, attr="resources") -> List[List[Mo
 
 
 def update_task_graph(task_graph: Workflow, groups: list[list[Module]]) -> Workflow:
-    G = task_graph._repr.copy()
+    G = task_graph._representation.copy()
     for group in groups:
         merged = FusedModule(*group)
         preds = set().union(*(G.predecessors(t) for t in group)) - set(group)
@@ -284,7 +311,7 @@ def update_task_graph(task_graph: Workflow, groups: list[list[Module]]) -> Workf
         for s in succs: G.add_edge(merged, s)
 
     updated_task_graph= deepcopy(task_graph)
-    updated_task_graph._repr = G
+    updated_task_graph._representation = G
 
     return updated_task_graph
 
