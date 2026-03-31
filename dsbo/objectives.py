@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Iterable, Sequence, Union
+from typing import Iterable, Sequence, Union, TYPE_CHECKING
 
 from dsbo.modules.compile import dry_run
-from dsbo.workflow import Workflow
+
+if TYPE_CHECKING:
+    from dsbo.workflow import Workflow
 
 @dataclass
 class Objective:
