@@ -1,4 +1,6 @@
 from __future__ import annotations
+import os
+from shlex import join
 
 import torch
 from typing import Optional, Union, Iterable, TYPE_CHECKING
@@ -75,7 +77,8 @@ class AidoBackend:
         coordinates = []
 
         for iteration in range(n_iterations):
-            with Workdir.create(f"files/iteration={iteration}"):
+            workdir_root = os.path.join("files", f"aido_run{self.seed}")
+            with Workdir.create(os.path.join(workdir_root, f"iteration={iteration}"), keep=True):
                 out = self.workflow.run(candidate)
 
                 loss = sum([out[obj.name] * (1 if obj.minimize else -1) for obj in self.objective])
