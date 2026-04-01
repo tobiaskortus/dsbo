@@ -6,7 +6,7 @@ from dask.distributed import Client, Future
 from contextlib import contextmanager
 from dask.delayed import Delayed, delayed
 from dask_jobqueue.local import LocalCluster
-from dsbo.utils.io import get_workdir, get_file_suffix
+from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
 from dask_heterogeneous.slurm import HeterogeneousSlurmCluster
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 
@@ -62,13 +62,14 @@ class DaskWorkerBase:
 
     def schedule(self, module: Module, design: dict, dependencies: Iterable = (), priority: int | None = None) -> tuple[uuid.UUID, Delayed]:
         suffix = get_file_suffix()
+        subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
         resources = getattr(module.resources, "resources", None)
 
         task_id = uuid.uuid4()
 
         def _module_wrapper(module, design_arg, *deps):
-            result = module.run(design=design_arg, workdir=workdir, suffix=suffix)
+            result = module.run(design=design_arg, workdir=workdir, suffix=suffix, subdir=subdir)
             return task_id, result
 
         with dask.annotate(resources=(resources or {}), priority=priority):
