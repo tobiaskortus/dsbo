@@ -77,8 +77,11 @@ class AidoBackend:
         for iteration in range(n_iterations):
             with Workdir.create(f"files/iteration={iteration}"):
                 out = self.workflow.run(candidate)
+
                 loss = sum([out[obj.name] * (1 if obj.minimize else -1) for obj in self.objective])
                 loss += box_constraint_loss(candidate) * 100.0
+                loss += constraint_loss(candidate, self.constraint) * 100 if self.constraint is not None else 0.0
+
                 loss.backward()
 
                 optimizer.step()
