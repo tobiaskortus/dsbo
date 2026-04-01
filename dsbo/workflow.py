@@ -1,4 +1,6 @@
+from contextlib import nullcontext
 import os
+from dsbo.utils.io import Workdir, get_subdir
 import torch
 import matplotlib
 import networkx as nx
@@ -112,36 +114,38 @@ class Workflow:
 
             if worker is None:
                 batch_results = []
-                for candidate in candidates:
-                    try:
-                        results = {}
-                        for batch in self.iterate_dependent_task_groups():
-                            for task in batch:
-                                result = task.run(design=candidate.values)
-                                results.update(result)
-                        batch_results.append(results)
-                    except Exception as e:
-                        batch_results.append({})
-                        if not isinstance(e, catch):
-                            raise
+                for i, candidate in enumerate(candidates):
+                    with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
+                        try:
+                            results = {}
+                            for batch in self.iterate_dependent_task_groups():
+                                for task in batch:
+                                    result = task.run(design=candidate.values)
+                                    results.update(result)
+                            batch_results.append(results)
+                        except Exception as e:
+                            batch_results.append({})
+                            if not isinstance(e, catch):
+                                raise
                         
                 return batch_results
             else:
                 batch_delays = []
                 batch_task_ids = []
-                for candidate in candidates:
-                    delayed_map = {}
-                    task_ids = []
-                    for depth, batch in enumerate(self.iterate_dependent_task_groups()):
-                        for task in batch:
-                            dependencies = [delayed_map[p] for p in self._representation.predecessors(task)]
-                            task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
-                            delayed_map[task] = delayed_obj
-                            
-                            task_ids.append(task_id)
-                            batch_delays.append(delayed_obj)
+                for i, candidate in enumerate(candidates):
+                    with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
+                        delayed_map = {}
+                        task_ids = []
+                        for depth, batch in enumerate(self.iterate_dependent_task_groups()):
+                            for task in batch:
+                                dependencies = [delayed_map[p] for p in self._representation.predecessors(task)]
+                                task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
+                                delayed_map[task] = delayed_obj
+                                
+                                task_ids.append(task_id)
+                                batch_delays.append(delayed_obj)
 
-                    batch_task_ids.append(task_ids)
+                        batch_task_ids.append(task_ids)
 
                 futures_computed = worker.compute(batch_delays)
                 results_flat = worker.gather(futures_computed, catch=catch)
