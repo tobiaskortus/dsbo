@@ -27,13 +27,16 @@ class AbstractPath:
             return None
         
         root = Workdir._current_workdir.get()
+        subdir_parts = Workdir._current_subdir.get()
+
         if root is None:
             print("Warning: No workdir root is set. Using cwd instead.")
-            return os.path.join(os.getcwd(), self._path) if self._path else os.getcwd()
-        
-        workdir_path =  os.path.join(root.root, self._path) if self._path else root.root
+            base = os.path.join(os.getcwd(), *subdir_parts) if subdir_parts else os.getcwd()
+        else:
+            base = os.path.join(root.root, *subdir_parts) if subdir_parts else root.root
+
+        workdir_path = os.path.join(base, self._path) if self._path else base
         if not os.path.exists(workdir_path):
-            print(f"Path {workdir_path} has not been registered. Creating it once.")
             os.makedirs(workdir_path, exist_ok=True)
         
         return workdir_path
@@ -50,10 +53,10 @@ class AbstractFilePath:
         self._path = path
 
     def __call__(self):
-        suffix = Workdir._current_file_context.get()
-        if suffix and self._unique:
+        parts = Workdir._current_file_context.get()
+        if parts and self._unique:
             name, ext = os.path.splitext(self._filename)
-            filename = f"{name}_{suffix}{ext}"
+            filename = f"{name}_{'_'.join(parts)}{ext}"
         else:
             filename = self._filename
         return os.path.join(self._path(), filename)
@@ -85,7 +88,8 @@ class AbstractFilePatternPath:
 
 class Workdir(dict):
     _current_workdir = contextvars.ContextVar("current_workdir", default=None)
-    _current_file_context = contextvars.ContextVar("current_file_context", default=None)
+    _current_file_context = contextvars.ContextVar("current_file_context", default=())
+    _current_subdir = contextvars.ContextVar("current_subdir", default=())
     _registered_paths: Set[str] = set()
 
     def __init__(self, workdir_root: str, paths: Optional[List[str]] = None,
@@ -140,9 +144,20 @@ class Workdir(dict):
     
     @classmethod
     @contextmanager
-    def use_file_suffix(cls, suffix: str) -> Generator[None, None, None]:
+    def create_subdir(cls, subdir: str) -> Generator[None, None, None]:
+        current = cls._current_subdir.get()
+        token = cls._current_subdir.set(current + (subdir,))
         try:
-            token = cls._current_file_context.set(suffix)
+            yield
+        finally:
+            cls._current_subdir.reset(token)
+
+    @classmethod
+    @contextmanager
+    def use_file_suffix(cls, suffix: str) -> Generator[None, None, None]:
+        current = cls._current_file_context.get()
+        token = cls._current_file_context.set(current + (suffix,))
+        try:
             yield
         finally:
             cls._current_file_context.reset(token)
@@ -215,8 +230,13 @@ def get_workdir() -> Workdir:
     #    raise RuntimeError("No current workdir set.")
     return workdir
     
+def get_subdir() -> Optional[str]:
+    parts = Workdir._current_subdir.get()
+    return os.path.join(*parts) if parts else None
+
 def get_file_suffix() -> Optional[str]:
-    return Workdir._current_file_context.get()
+    parts = Workdir._current_file_context.get()
+    return "_".join(parts) if parts else None
 
 def get_workdir_path(stage: str) -> str:
     workdir = get_workdir()       
@@ -233,7 +253,9 @@ def with_remote_workdir(func: Callable) -> Callable:
         
         workdir = kwargs.pop("workdir", None)
         suffix = kwargs.pop("suffix", None)
+        subdir = kwargs.pop("subdir", None)
         with Workdir.load(workdir) if workdir else nullcontext():
-            with Workdir.use_file_suffix(suffix) if suffix else nullcontext():
-                return func(self, *args, **kwargs)
+            with Workdir.create_subdir(subdir) if subdir else nullcontext():
+                with Workdir.use_file_suffix(suffix) if suffix else nullcontext():
+                    return func(self, *args, **kwargs)
     return wrapper
