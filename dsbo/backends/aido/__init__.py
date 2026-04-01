@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from dsbo.workflow import Workflow
     from dsbo.worker.dask import DaskWorkerBase
     from dsbo.constraints import GeometryConstraintBase
-
+    from dsbo.constraints import ConstraintBase, MultiConstraint
 
 from dsbo.objectives import Objective
 from dsbo.backends.aido.strategy import CovarianceStrategy
@@ -18,8 +18,21 @@ from dsbo.parameters import Candidate, ParameterSpace, Continuous
 
 
 def box_constraint_loss(candidate: Candidate) -> torch.Tensor:
-    #TODO implement soft box constraint loss
-    return 0
+    penalties = []
+    for name, p in candidate.space:
+        if not isinstance(p, Continuous):
+            continue
+        offset, _ = candidate._index[name]
+        x = candidate.tensor[offset]
+        lower = torch.tensor(p.lower, dtype=x.dtype, device=x.device)
+        upper = torch.tensor(p.upper, dtype=x.dtype, device=x.device)
+        penalties.append(torch.relu(lower - x) ** 2 + torch.relu(x - upper) ** 2)
+    return torch.stack(penalties).sum() if penalties else candidate.tensor.new_zeros(1).squeeze()
+
+
+def constraint_loss(candidate: Candidate, constraint: MultiConstraint | GeometryConstraintBase) -> torch.Tensor:
+    constraint_values = constraint(candidate)
+    return sum([torch.clip(c, min=0.0) for c in constraint_values])
 
 
 class AidoBackend:
