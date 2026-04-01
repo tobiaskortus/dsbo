@@ -43,6 +43,7 @@ class ModuleDslMixin:
     def __mul__(self, other: int) -> DependencyDict: ...
     @overload
     def __mul__(self, other: Dynamic) -> Dynamic: ...
+
     def __mul__(self, other: int | Dynamic) -> DependencyDict | Dynamic:
         match other:
             case int():
