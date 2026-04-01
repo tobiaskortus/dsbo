@@ -109,12 +109,12 @@ class OptunaBackend:
             try:
                 workdir_root = os.path.join("files", f"run{self.seed}", f"trial_{trial_number}")
                 with Workdir.create(workdir_root):
-                    result = self.workflow.run(candidate.values)
+                    result = self.workflow.run(candidate)
                     objective_val = get_objective_vals(result, self.objective)
                     
                     constraints = None
                     if self.constraint is not None:
-                        constraints = self.constraint(candidate.values)
+                        constraints = self.constraint(candidate)
                     
                     return objective_val[0] if is_single_objective(self.objective) else objective_val, constraints
                 
