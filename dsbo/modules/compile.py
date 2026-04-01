@@ -6,7 +6,6 @@ import contextlib
 import contextvars
 from typing import Callable, Any, Iterator
 import warnings
-import time
 
 _DRY_RUN = contextvars.ContextVar("dry_run", default=False)
 
