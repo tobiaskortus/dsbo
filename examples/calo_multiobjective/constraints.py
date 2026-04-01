@@ -8,7 +8,7 @@ class G4CaloCostConstraint(GeometryConstraintBase):
         self.material_costs = {"G4_Pb": 25, "G4_Fe": 4.166,              #Absorber materials
                                "G4_PbWO4": 2500.0, "G4_POLYSTYRENE": 0.01}  #Scintillator materials
 
-    def evaluate(self, design: dict): #-> Tuple[float]:
+    def evaluate(self, design: dict) -> tuple[float]:
         total_cost = 0.0
         for parameter, value in design.items():
             if "material" in parameter:
@@ -25,7 +25,7 @@ class G4CaloLengthConstraint(GeometryConstraintBase):
         super().__init__(binary=False)
         self.max_length = max_length
 
-    def evaluate(self, design: dict) -> tuple[float]:  #-> Tuple[float]:
+    def evaluate(self, design: dict) -> tuple[float]:
         total_length = 0.0
         for parameter, value in design.items():
             if "thickness" in parameter:

@@ -2,6 +2,8 @@
 from abc import ABC, abstractmethod
 from typing import Sequence
 
+from dsbo.parameters import Candidate
+
 class ConstraintBase(ABC):
     def __init__(self, binary: bool = False):
         super().__init__()
@@ -18,12 +20,12 @@ class GeometryConstraintBase(ConstraintBase):
     def __init__(self, binary: bool = False) -> None:
         super().__init__(binary)
 
-    def __call__(self, design: dict) -> Sequence[float]:
-        c = self.evaluate(design)
+    def __call__(self, candidate: Candidate) -> Sequence[float]:
+        c = self.evaluate(candidate.values if isinstance(candidate, Candidate) else candidate)
         return self.binary(c) if self.binary_flag else c
 
     @abstractmethod
-    def evaluate(self, design: dict) -> Sequence[float]:
+    def evaluate(self, candidate: dict) -> Sequence[float]:
         pass
 
 
@@ -34,8 +36,8 @@ class MultiConstraint(GeometryConstraintBase):
         self.constraints = constraints
         self.lookup = {str(c): c for c in constraints}
 
-    def evaluate(self, design: dict) -> Sequence[float]:
-        return tuple(v for c in self.constraints for v in c(design))
+    def evaluate(self, candidate: dict) -> Sequence[float]:
+        return tuple(v for c in self.constraints for v in c(candidate))
     
     def get_by_name(self, name: str) -> GeometryConstraintBase:
         return self.lookup[name]
