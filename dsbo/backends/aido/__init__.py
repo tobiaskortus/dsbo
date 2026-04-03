@@ -78,7 +78,7 @@ class AidoBackend:
 
         for iteration in range(n_iterations):
             workdir_root = os.path.join("files", f"aido_run{self.seed}")
-            with Workdir.create(os.path.join(workdir_root, f"iteration={iteration}"), keep=True):
+            with Workdir.create(os.path.join(workdir_root, f"iteration={iteration}")):
                 out = self.workflow.run(candidate)
 
                 loss = sum([out[obj.name] * (1 if obj.minimize else -1) for obj in self.objective])
