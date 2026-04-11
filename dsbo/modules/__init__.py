@@ -4,7 +4,7 @@ from abc import ABC
 from contextlib import nullcontext
 from typing import Optional
 from functools import wraps
-from dsbo.utils.io import Workdir
+from dsbo.utils.io import Workdir, get_workdir
 from dsbo.modules.compile import dryrunnable, is_dry_run
 from dsbo.modules.dsl import ModuleDslMixin  # noqa: F401
 from dsbo.logger import WorkflowTaskLogger
@@ -57,7 +57,7 @@ class Module(ModuleDslMixin, ABC):
 
     @with_remote_workdir
     def run(self, design: dict, **kwargs):
-        with WorkflowTaskLogger(self) if not is_dry_run() else nullcontext():
+        with nullcontext() if (is_dry_run() or get_workdir() is None) else WorkflowTaskLogger(self):
             with Workdir.use_file_suffix(str(self.i)) if self.i is not None else nullcontext():
                 return self(design=design)
 
