@@ -1,23 +1,24 @@
-from contextlib import nullcontext
 import os
-from dsbo.utils.io import Workdir, get_subdir
 import torch
 import matplotlib
 import networkx as nx
 from copy import deepcopy
 from typing import Sequence
 from itertools import chain
-from dsbo.parameters import Candidate
 from graphviz import Digraph
 from itertools import groupby
 from typing import Iterable, List
+from contextlib import nullcontext
 import matplotlib.colors as mcolors
 from IPython.display import Image, display
 
 from dsbo.modules import Module
+from dsbo.parameters import Candidate
 from dsbo.modules.compile import dry_run
+from dsbo.storage import get_current_storage
 from dsbo.worker.config import SlurmWorkerConfig
 from dsbo.backends.aido.surrogate import LocalSurrogate
+from dsbo.utils.io import Workdir, get_subdir, get_workdir
 
 
 class FusedModule(Module):
@@ -132,20 +133,30 @@ class Workflow:
             else:
                 batch_delays = []
                 batch_task_ids = []
+                task_map: dict[str, str] = {}
                 for i, candidate in enumerate(candidates):
                     with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
                         delayed_map = {}
                         task_ids = []
+                        wdir = getattr(get_workdir(), "root", None)
+                        subdir = get_subdir()
+                        exec_id = os.path.join(wdir, subdir) if (wdir and subdir) else wdir
                         for depth, batch in enumerate(self.iterate_dependent_task_groups()):
                             for task in batch:
                                 dependencies = [delayed_map[p] for p in self._representation.predecessors(task)]
                                 task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
                                 delayed_map[task] = delayed_obj
-                                
                                 task_ids.append(task_id)
                                 batch_delays.append(delayed_obj)
+                                if exec_id is not None:
+                                    task_map[delayed_obj.key] = exec_id
 
                         batch_task_ids.append(task_ids)
+
+                storage = get_current_storage()
+                if storage is not None:
+                    plugin = storage.create_task_stream_plugin(task_map)
+                    worker.client.register_scheduler_plugin(plugin, name="dsbo_task_stream", idempotent=False)
 
                 futures_computed = worker.compute(batch_delays)
                 results_flat = worker.gather(futures_computed, catch=catch)
