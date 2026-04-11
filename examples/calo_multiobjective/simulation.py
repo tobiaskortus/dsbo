@@ -13,11 +13,21 @@ import os
 
 from dsbo.utils.io import DefaultPaths, Workdir
 
+#TODO: move this into dsbo to make it reusable
+def to_serializable(obj):
+    import torch
+    if isinstance(obj, torch.Tensor):
+        return obj.item() if obj.numel() == 1 else obj.tolist()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
 def write_design_threadsafe(design: dict, design_path: str) -> None:
     lock_path = design_path + ".lock"
+    s_design = {k: to_serializable(v) for k, v in design.items()}
     with FileLock(lock_path):
         with open(design_path, "w") as f:
-            json.dump(design, f)
+            json.dump(s_design, f)
 
 
 class G4CaloSimulation(SimulationContainerWrapperBase):

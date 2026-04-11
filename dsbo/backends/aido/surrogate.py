@@ -5,7 +5,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from diffusers.schedulers import DDPMScheduler, DDIMScheduler
 
 from typing import Callable
-from abc import ABC, abstractmethod
 
 from dsbo.parameters import Candidate, Sampler
 from dsbo.backends.aido.strategy import SurrogateStrategy
@@ -26,6 +25,7 @@ class LocalSurrogate(nn.Module):
 def dict_to_tensor(d: dict[str, float]) -> torch.Tensor:
     return torch.tensor(list(d.values()), dtype=torch.float32)
 
+
 class LocalDiffusionSurrogate(LocalSurrogate):
     def __init__(self, strategy: SurrogateStrategy, hidden_size: int = 256, num_layers: int = 3):
         super().__init__(strategy)
@@ -42,11 +42,15 @@ class LocalDiffusionSurrogate(LocalSurrogate):
     def fit(self, design: Candidate, workflow_callback: Callable[[list[dict]], list[dict[str, float]]]):
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        designs = design.space.sample_batch(self._strategy.sampler, 64, requires_grad=False)
+        designs = design.space.sample_batch(self._strategy.sampler, 16, requires_grad=False)
 
+        #TODO: Define a strategy for handling failed simulations.
         C = torch.stack([d.tensor for d in designs]).to(device)
-        X = torch.stack([dict_to_tensor(x) for x in workflow_callback(designs)]).to(device)
+        X = [dict_to_tensor(x) for x in workflow_callback(designs, catch=(FileNotFoundError, AssertionError))]
+        X = torch.nested.as_nested_tensor(X).to_padded_tensor(100).to(device)
         C = C.float(); X = X.unsqueeze(1).float()
+
+        objective_dim = X.shape[-1]
 
         dataset    = TensorDataset(X, C)
         dataloader = DataLoader(dataset, batch_size=8, shuffle=True, drop_last=True, num_workers=0)
@@ -58,7 +62,7 @@ class LocalDiffusionSurrogate(LocalSurrogate):
             clip_sample=False,
         )
 
-        self.model = LocalSurrogateDiffuser(objective_dim=1, parameter_dim=C.shape[1], n_layers=self.num_layers)
+        self.model = LocalSurrogateDiffuser(objective_dim=objective_dim, parameter_dim=C.shape[1], n_layers=self.num_layers)
         optimizer = AdamW(self.model.parameters(), lr=1e-4)
         trainer = Trainer(self.model, optimizer=optimizer, noise_scheduler=self.noise_scheduler, device=device)
 
