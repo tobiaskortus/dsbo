@@ -7,7 +7,6 @@ from contextlib import contextmanager
 from typing import Dict, Generator, List, Optional
 from peewee import SqliteDatabase
 
-from dsbo.storage.taskstream import TaskStreamPlugin
 from dsbo.storage.models import WorkflowRecord, ExecutionRecord, JobTraceRecord
 
 
@@ -88,7 +87,8 @@ class StudyStorage:
             for exec_id in exec_ids:
                 ExecutionRecord.create(workflow=wf_record, exec_id=exec_id)
 
-    def create_task_stream_plugin(self, task_map: Dict[str, str] | None = None, name_map: Dict[str, str] | None = None) -> TaskStreamPlugin:
+    def create_task_stream_plugin(self, task_map: Dict[str, str] | None = None, name_map: Dict[str, str] | None = None) -> "TaskStreamPlugin":
+        from dsbo.storage.taskstream import TaskStreamPlugin
         if self._readonly:
             raise RuntimeError("Cannot create TaskStreamPlugin from readonly StudyStorage.")
 
