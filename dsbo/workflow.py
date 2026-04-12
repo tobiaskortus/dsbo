@@ -134,6 +134,8 @@ class Workflow:
                 batch_delays = []
                 batch_task_ids = []
                 task_map: dict[str, str] = {}
+                name_map: dict[str, str] = {}
+                exec_ids = []
                 for i, candidate in enumerate(candidates):
                     with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
                         delayed_map = {}
@@ -141,6 +143,7 @@ class Workflow:
                         wdir = getattr(get_workdir(), "root", None)
                         subdir = get_subdir()
                         exec_id = os.path.join(wdir, subdir) if (wdir and subdir) else wdir
+                        exec_ids.append(exec_id)
                         for depth, batch in enumerate(self.iterate_dependent_task_groups()):
                             for task in batch:
                                 dependencies = [delayed_map[p] for p in self._representation.predecessors(task)]
@@ -148,14 +151,16 @@ class Workflow:
                                 delayed_map[task] = delayed_obj
                                 task_ids.append(task_id)
                                 batch_delays.append(delayed_obj)
-                                if exec_id is not None:
-                                    task_map[delayed_obj.key] = exec_id
+                                task_map[delayed_obj.key] = exec_id
+                                name_map[delayed_obj.key] = task.name
 
                         batch_task_ids.append(task_ids)
 
                 storage = get_current_storage()
                 if storage is not None:
-                    plugin = storage.create_task_stream_plugin(task_map)
+                    wf_record = storage.save_workflow(self._representation)
+                    storage.register_runs(wf_record, exec_ids)
+                    plugin = storage.create_task_stream_plugin(task_map, name_map=name_map)
                     worker.client.register_scheduler_plugin(plugin, name="dsbo_task_stream", idempotent=False)
 
                 futures_computed = worker.compute(batch_delays)
