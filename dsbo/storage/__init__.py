@@ -127,14 +127,10 @@ class StudyStorage:
 
     def get_workflow_graph(self, exec_id: str, as_nx: bool = True) -> Optional[nx.DiGraph]:
         with self._db.bind_ctx([WorkflowRecord, ExecutionRecord]):
-            record = (WorkflowRecord
-                .select()
-                .join(ExecutionRecord)
-                .where(ExecutionRecord.exec_id == exec_id)
-                .first()
-            )
-            if record is None:
+            execution = ExecutionRecord.get_or_none(ExecutionRecord.exec_id == exec_id)
+            if execution is None:
                 raise ValueError(f"No workflow found for exec_id {exec_id}")
+            record = WorkflowRecord.get_by_id(execution.workflow_id)
             
             graph_data = json.loads(record.graph)
             graph = nx.node_link_graph(graph_data) if as_nx else graph_data
