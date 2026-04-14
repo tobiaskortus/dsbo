@@ -1,4 +1,4 @@
-from peewee import Model, AutoField, CharField, FloatField, ForeignKeyField
+from peewee import Model, AutoField, CharField, FloatField, ForeignKeyField, TextField
 
 class WorkflowRecord(Model):
     id    = AutoField(index=True)
@@ -17,3 +17,4 @@ class JobTraceRecord(Model):
     worker    = CharField()
     start     = FloatField()
     stop      = FloatField()
+    log       = TextField()
