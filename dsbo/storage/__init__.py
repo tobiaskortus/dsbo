@@ -55,13 +55,16 @@ class StudyStorage:
         with self._db.bind_ctx([WorkflowRecord, ExecutionRecord, JobTraceRecord]):
             self._db.create_tables([WorkflowRecord, ExecutionRecord, JobTraceRecord], safe=True)
 
+
     def __enter__(self):
         self._storage_token = _current_storage.set(self)
         return self
 
+
     def __exit__(self, exc_type, exc, tb):
         _current_storage.reset(self._storage_token)
         self._db.close()
+
 
     def save_workflow(self, repr: nx.DiGraph) -> WorkflowRecord:
         if self._readonly:
@@ -79,6 +82,7 @@ class StudyStorage:
         with self._db.bind_ctx([WorkflowRecord]):
             return WorkflowRecord.create(graph=graph_json)
 
+
     def register_runs(self, wf_record: WorkflowRecord, exec_ids: list[str]) -> None:
         if self._readonly:
             raise RuntimeError("Cannot register runs to readonly StudyStorage.")
@@ -94,22 +98,22 @@ class StudyStorage:
 
         db_path = self._db_path
 
-        def on_transition(key: str, name: str, worker: str, start: float, stop: float, exec_id: str) -> None:
+        def on_transition(key: str, name: str, worker: str, start: float, stop: float, exec_id: str, log: str) -> None:
             db = SqliteDatabase(db_path, pragmas={"journal_mode": "wal"})
             db.connect()
             with db.bind_ctx([ExecutionRecord, JobTraceRecord]):
                 execution = ExecutionRecord.get(ExecutionRecord.exec_id == exec_id)
                 JobTraceRecord.create(
-                    execution=execution, task_key=key, name=name, worker=worker, start=start, stop=stop,
+                    execution=execution, task_key=key, name=name, worker=worker, start=start, stop=stop, log=log,
                 )
             db.close()
-
         return TaskStreamPlugin(on_transition=on_transition, task_map=task_map, name_map=name_map)
+
 
     def get_workflows(self) -> List[ExecutionRecord]:
         with self._db.bind_ctx([WorkflowRecord, ExecutionRecord]):
             return list(ExecutionRecord.select().order_by(ExecutionRecord.id))
-        
+
 
     def get_workflow_graphs(self, as_nx: bool = True) -> List[nx.DiGraph]:
         with self._db.bind_ctx([WorkflowRecord]):
@@ -119,7 +123,8 @@ class StudyStorage:
             else:
                 graphs = [json.loads(record.graph) for record in records]
             return graphs
-        
+    
+
     def get_workflow_graph(self, exec_id: str, as_nx: bool = True) -> Optional[nx.DiGraph]:
         with self._db.bind_ctx([WorkflowRecord, ExecutionRecord]):
             record = (WorkflowRecord
@@ -134,6 +139,7 @@ class StudyStorage:
             graph_data = json.loads(record.graph)
             graph = nx.node_link_graph(graph_data) if as_nx else graph_data
             return graph
+
 
     def get_job_traces(self, exec_id: str) -> List[JobTraceRecord]:
         with self._db.bind_ctx([ExecutionRecord, JobTraceRecord]):

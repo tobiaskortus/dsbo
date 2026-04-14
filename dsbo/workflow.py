@@ -161,7 +161,7 @@ class Workflow:
                     wf_record = storage.save_workflow(self._representation)
                     storage.register_runs(wf_record, exec_ids)
                     plugin = storage.create_task_stream_plugin(task_map, name_map=name_map)
-                    worker.client.register_scheduler_plugin(plugin, name="dsbo_task_stream", idempotent=False)
+                    worker.client.register_plugin(plugin, name="dsbo_task_stream")
 
                 futures_computed = worker.compute(batch_delays)
                 results_flat = worker.gather(futures_computed, catch=catch)
