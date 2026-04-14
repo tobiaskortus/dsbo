@@ -68,3 +68,33 @@ class Module(ModuleDslMixin, ABC):
     @property
     def registered_files(self) -> dict[str, AbstractFilePath]:
         return self._registered_files
+
+
+class dynamic_submodule:
+    def __init__(self, wrapped_fn):
+        self.wrapped_fn = wrapped_fn
+
+    def __get__(self, obj, *args, **kwargs):
+        if obj is None:
+            try:
+                return self.wrapped_fn
+            except Exception as e:
+                # Skip the frame of the wrapper function in the traceback
+                # Avoid mislearding stacktrace when the wrapper function is called directly
+                tb = e.__traceback__
+                if tb is not None:
+                    tb = tb.tb_next
+                raise e.with_traceback(tb)
+
+        class Submodule(Module):
+            def __init__(self, fn):
+                super().__init__()
+                self.fn = fn
+
+                def __call__(self, design, **kwargs):
+                    return self.fn(obj, design, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(obj, name)
+
+        return Submodule(self.wrapped_fn)
