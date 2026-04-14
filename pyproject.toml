@@ -14,6 +14,7 @@ dependencies = [
     "torch",
     "numpy",
     "pandas",
+    "cookiecutter",
     "dask[distributed]",
     "dask-jobqueue",
     "grpcio",
