@@ -13,6 +13,7 @@ dependencies = [
     "attrs",
     "torch",
     "numpy",
+    "typer",
     "pandas",
     "cookiecutter",
     "dask[distributed]",
@@ -43,3 +44,7 @@ all = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dsbo*"]
+
+
+[project.entry-points."console_scripts"]
+dsbo-create = "dsbo.cli.main:app"
