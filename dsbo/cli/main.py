@@ -6,11 +6,10 @@ app = typer.Typer()
 template_root = Path(__file__).parent / "templates"
 
 templates = ["module", "workflow", "optimizer"]
-def template_autocomplete(incomplete: str):
-    return [t for t in templates if t.startswith(incomplete.lower())]
+autocomplete = lambda incomplete: [t for t in templates if t.startswith(incomplete.lower())]
 
 @app.command()
-def dsbo_create(template: str = typer.Argument(..., help="Name of the template to use", autocompletion=template_autocomplete),
+def dsbo_create(template: str = typer.Argument(..., help="Name of the template to use", autocompletion=autocomplete),
                 name: str = typer.Argument(..., help="Name of the project to create")):
     
     template_path = template_root / template
