@@ -1,5 +1,6 @@
 import dask
 import logging
+import traceback
 from time import time
 from typing import Optional
 from dask.distributed import get_worker
@@ -93,7 +94,11 @@ class WorkflowTaskLogger:
         self._token = WorkflowTaskLogger._current_logger.set(self)
         return self
     
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, exc_type, exc_value, tb):
+        if exc_type is not None:
+            tb_str = "".join(traceback.format_exception(exc_type, exc_value, tb))
+            self.log(tb_str, logging.ERROR)
+
         self.end_time = time()
         self.log(f"Task {self.task_name} finished after {self.end_time-self.start_time} seconds.")
         if self.file_handler:
