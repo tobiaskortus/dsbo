@@ -4,7 +4,7 @@ from peewee import (IntegerField, Model, AutoField, CharField,
 
 from dsbo.storage.fields import EnumField
 
-class JobStatus(Enum):
+class JobStatus(str, Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     SUCCESS = "SUCCESS"
