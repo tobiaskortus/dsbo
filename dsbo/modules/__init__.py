@@ -96,5 +96,10 @@ class dynamic_submodule:
 
             def __getattr__(self, name):
                 return getattr(obj, name)
+            
+            @property
+            def name(self) -> str:
+                suffix = f"[{self.i}]" if self.i is not None else ""
+                return f"{type(obj).__name__}.{self.fn.__name__}{suffix}"
 
         return Submodule(self.wrapped_fn)
