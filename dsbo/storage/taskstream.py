@@ -1,6 +1,9 @@
+from re import match
 from typing import Callable, Dict, Optional
+from unittest import case
 from distributed.diagnostics.plugin import SchedulerPlugin
 
+from dsbo.storage.models import JobStatus
 
 class TaskStreamPlugin(SchedulerPlugin):
     def __init__(
@@ -23,15 +26,22 @@ class TaskStreamPlugin(SchedulerPlugin):
             self.log_buffer.setdefault(msg.get("task"), []).append(msg["task_log"])
 
     def transition(self, key, start, finish, *args, **kwargs):
-        if finish != "memory":
-            return
-        try:
-            worker = self.scheduler.workers[kwargs["worker"]]
-            startstop = kwargs["startstops"][0]
-            exec_id = self.task_map[key]
-            name    = self.name_map[key]
-            messages = self.log_buffer.pop(key, [])
-            log = "\n".join(messages)
-            self.on_transition(key, name, worker.name, startstop["start"], startstop["stop"], exec_id, log)
-        except Exception as e:
-            print(f"[TaskStreamPlugin] transition error: {e}")
+
+        def trigger_on_transition(status: JobStatus) -> None:
+            try:
+                worker = self.scheduler.workers[kwargs["worker"]]
+                startstop = kwargs["startstops"][0]
+                exec_id = self.task_map[key]
+                name    = self.name_map[key]
+                messages = self.log_buffer.pop(key, [])
+                log = "\n".join(messages)
+                self.on_transition(key, name, worker.name, startstop["start"], startstop["stop"], exec_id, log, status)
+            except Exception as e:
+                print(f"[TaskStreamPlugin] transition error: {e}")
+
+
+        match (start, finish):
+            case (_, "memory"):
+                trigger_on_transition(status=JobStatus.SUCCESS)
+            case (_, "erred"): 
+                trigger_on_transition(status=JobStatus.FAILED)

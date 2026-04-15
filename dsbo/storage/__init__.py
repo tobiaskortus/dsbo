@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Dict, Generator, List, Optional
 from peewee import SqliteDatabase
 
-from dsbo.storage.models import WorkflowRecord, ExecutionRecord, JobTraceRecord
+from dsbo.storage.models import JobStatus, WorkflowRecord, ExecutionRecord, JobTraceRecord
 
 
 _current_storage: contextvars.ContextVar["StudyStorage | None"] = contextvars.ContextVar(
@@ -80,7 +80,7 @@ class StudyStorage:
 
         graph_json = json.dumps(nx.node_link_data(G_serializable))
         with self._db.bind_ctx([WorkflowRecord]):
-            return WorkflowRecord.create(graph=graph_json)
+            return WorkflowRecord.create(graph=graph_json, num_tasks=repr.number_of_nodes())
 
 
     def register_runs(self, wf_record: WorkflowRecord, exec_ids: list[str]) -> None:
@@ -98,14 +98,37 @@ class StudyStorage:
 
         db_path = self._db_path
 
-        def on_transition(key: str, name: str, worker: str, start: float, stop: float, exec_id: str, log: str) -> None:
+        def on_transition(key: str, name: str, worker: str, start: float, stop: float, exec_id: str, log: str, status: JobStatus) -> None:
             db = SqliteDatabase(db_path, pragmas={"journal_mode": "wal"})
             db.connect()
             with db.bind_ctx([ExecutionRecord, JobTraceRecord]):
                 execution = ExecutionRecord.get(ExecutionRecord.exec_id == exec_id)
                 JobTraceRecord.create(
-                    execution=execution, task_key=key, name=name, worker=worker, start=start, stop=stop, log=log,
+                    execution=execution, task_key=key, name=name, worker=worker, start=start, stop=stop, log=log, status=status
                 )
+
+                counts = {ExecutionRecord.num_jobs: ExecutionRecord.num_jobs + 1}
+                if status == JobStatus.SUCCESS:
+                    counts[ExecutionRecord.num_successful_jobs] = ExecutionRecord.num_successful_jobs + 1
+
+                ExecutionRecord.update(counts).where(ExecutionRecord.exec_id == exec_id).execute()
+
+                # TODO: This is currently not realtime but based on the current job completion status!
+                if status == JobStatus.FAILED:
+                    ExecutionRecord.update(status=JobStatus.FAILED).where(
+                        ExecutionRecord.exec_id == exec_id
+                    ).execute()
+                else:
+                    ExecutionRecord.update(status=JobStatus.RUNNING).where(
+                        ExecutionRecord.exec_id == exec_id,
+                        ExecutionRecord.status == JobStatus.PENDING
+                    ).execute()
+                    execution = ExecutionRecord.get(ExecutionRecord.exec_id == exec_id)
+                    if execution.num_jobs >= execution.workflow.num_tasks:
+                        ExecutionRecord.update(status=JobStatus.SUCCESS).where(
+                            ExecutionRecord.exec_id == exec_id,
+                            ExecutionRecord.status != JobStatus.FAILED
+                        ).execute()
             db.close()
         return TaskStreamPlugin(on_transition=on_transition, task_map=task_map, name_map=name_map)
 
