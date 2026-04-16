@@ -1,13 +1,11 @@
 from contextlib import nullcontext
 import os
-from dsbo.utils.io import Workdir, get_subdir
 import torch
 import matplotlib
 import networkx as nx
 from copy import deepcopy
 from typing import Sequence
 from itertools import chain
-from dsbo.parameters import Candidate
 from graphviz import Digraph
 from itertools import groupby
 from typing import Iterable, List
@@ -15,7 +13,10 @@ import matplotlib.colors as mcolors
 from IPython.display import Image, display
 
 from dsbo.modules import Module
+from dsbo.parameters import Candidate
 from dsbo.modules.compile import dry_run
+from dsbo.modules.dsl import DependencyDict
+from dsbo.utils.io import Workdir, get_subdir
 from dsbo.worker.config import SlurmWorkerConfig
 from dsbo.backends.aido.surrogate import LocalSurrogate
 
@@ -93,9 +94,9 @@ def get_dependent_task_groups(G: nx.DiGraph):
 class Workflow:
     def __init__(self, dependencies: dict[Module, Iterable[Module]] | Module) -> None:
 
-        #Convert single module into dict forma
+        #Convert single module into DependencyDict format
         if isinstance(dependencies, Module):
-            dependencies = {dependencies: []}
+            dependencies = DependencyDict({dependencies: []})
 
         self._representation = nx.DiGraph(dependencies)
 
@@ -107,7 +108,7 @@ class Workflow:
         return self.run_batch([design], catch=catch)[0]
 
     def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()) -> List[dict[str, float]]:
-        
+
         with torch.no_grad():
             from dsbo.worker.dask import WorkerContext
             worker = WorkerContext.get_current_worker()
