@@ -12,7 +12,7 @@ def _is_dry_run():
     return is_dry_run()
 
 
-class DefaultPaths(Enum):
+class DefaultPaths(str, Enum):
     SIMULATION = "simulation"
     RECONSTRUCTION = "reconstruction"
     LOGS = "logs"
@@ -110,11 +110,11 @@ class Workdir(dict):
         except KeyError:
             raise AttributeError(item)
         
-    def __enter__(self):
-        return self
+    #def __enter__(self):
+    #    return self
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cleanup()
+    #def __exit__(self, exc_type, exc_val, exc_tb):
+    #    self.cleanup()
     
     @classmethod
     @contextmanager
@@ -124,13 +124,13 @@ class Workdir(dict):
         if paths is None:
             paths = cls.get_registered_paths()
 
+        if error_if_exists and os.path.exists(workdir_root):
+            raise FileExistsError(f"Directory {workdir_root} already exists.")
+
         registry = cls(workdir_root, paths, error_if_exists)
         token = cls._current_workdir.set(registry)
-        
+
         try:
-            if error_if_exists and os.path.exists(workdir_root):
-                raise FileExistsError(f"Directory {workdir_root} already exists.")
-            
             os.makedirs(workdir_root, exist_ok=True)
             for path in registry.values():
                 if error_if_exists and os.path.exists(path):
@@ -139,8 +139,9 @@ class Workdir(dict):
 
             yield registry
         finally:
-            if not keep: registry.cleanup()
             cls._current_workdir.reset(token)
+            if not keep:
+                registry.cleanup()
     
     @classmethod
     @contextmanager
@@ -229,21 +230,17 @@ def get_workdir() -> Workdir:
     #if workdir is None:
     #    raise RuntimeError("No current workdir set.")
     return workdir
-    
+
+
 def get_subdir() -> Optional[str]:
     parts = Workdir._current_subdir.get()
     return os.path.join(*parts) if parts else None
+
 
 def get_file_suffix() -> Optional[str]:
     parts = Workdir._current_file_context.get()
     return "_".join(parts) if parts else None
 
-def get_workdir_path(stage: str) -> str:
-    workdir = get_workdir()       
-    path =  workdir.get(stage, workdir.root)
-    if path is workdir.root:
-        print(f"Warning: Stage '{stage}' not found in workdir registry. Using root path instead.")
-    return path
 
 def with_remote_workdir(func: Callable) -> Callable:
     @functools.wraps(func)
