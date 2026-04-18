@@ -4,6 +4,7 @@ from abc import ABC
 from contextlib import nullcontext
 from typing import Optional
 from functools import wraps
+import weakref
 from dsbo.utils.io import Workdir, get_workdir
 from dsbo.modules.compile import dryrunnable, is_dry_run
 from dsbo.modules.dsl import ModuleDslMixin  # noqa: F401
@@ -42,6 +43,11 @@ class Module(ModuleDslMixin, ABC):
         pass
 
     def __setattr__(self, name, value):
+        if not hasattr(self, "_registered_files") and name != "_registered_files":
+            raise RuntimeError(
+                "Subclasses of Module must call super().__init__() in their __init__ before setting attributes."
+            )
+
         super().__setattr__(name, value)
 
         if isinstance(value, AbstractFilePath):
@@ -72,34 +78,51 @@ class Module(ModuleDslMixin, ABC):
 
 class dynamic_submodule:
     def __init__(self, wrapped_fn):
-        self.wrapped_fn = wrapped_fn
+        self._wrapped_fn = wrapped_fn
+        self._submodule_cache = weakref.WeakKeyDictionary()
 
     def __get__(self, obj, *args, **kwargs):
         if obj is None:
-            try:
-                return self.wrapped_fn
-            except Exception as e:
-                # Skip the frame of the wrapper function in the traceback
-                # Avoid mislearding stacktrace when the wrapper function is called directly
-                tb = e.__traceback__
-                if tb is not None:
-                    tb = tb.tb_next
-                raise e.with_traceback(tb)
+            return self._wrapped_fn
+        
+        if not isinstance(obj, Module):
+            raise TypeError(
+                f"@dynamic_submodule must be accessed on a `Module` instance; got {type(obj).__name__}."
+            )
 
         class Submodule(Module):
-            def __init__(self, fn):
-                super().__init__()
-                self.fn = fn
+            def __init__(self, parent, fn):
+                object.__setattr__(self, "_parent", parent)
+                object.__setattr__(self, "fn", fn)
 
-                def __call__(self, design, **kwargs):
-                    return self.fn(obj, design, **kwargs)
+            def __setattr__(self, name, value):
+                if name in ("_parent", "fn") or name.startswith("_"):
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(self._parent, name, value)
+
+            def __call__(self, design, **kwargs):
+                try:
+                    return self.fn(self._parent, design, **kwargs)
+                except Exception as e:
+                    tb = e.__traceback__
+                    if tb is not None:
+                        tb = tb.tb_next
+                    raise e.with_traceback(tb)
 
             def __getattr__(self, name):
-                return getattr(obj, name)
+                return getattr(self._parent, name)
             
             @property
             def name(self) -> str:
                 suffix = f"[{self.i}]" if self.i is not None else ""
-                return f"{type(obj).__name__}.{self.fn.__name__}{suffix}"
+                return f"{type(self._parent).__name__}.{self.fn.__name__}{suffix}"
 
-        return Submodule(self.wrapped_fn)
+        submodule = self._submodule_cache.get(obj)
+        if submodule is not None:
+            return submodule
+
+        submodule = Submodule(obj, self._wrapped_fn)
+        self._submodule_cache[obj] = submodule
+
+        return submodule
