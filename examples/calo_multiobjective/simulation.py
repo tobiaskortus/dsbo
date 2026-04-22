@@ -114,7 +114,7 @@ class G4CaloSimToImg(SimulationTransform):
     def transform(self, design: dict):
 
         data = np.load(self.simulation_path(), allow_pickle=True)
-        l  = torch.tensor(data[' ']).int()
+        l  = torch.tensor(data['sensor_layer']).int()
         E  = torch.tensor(data['sensor_energy']).float()
         y = torch.tensor(data["contains:e+"]).long()
 
