@@ -7,7 +7,7 @@ from functools import wraps
 import weakref
 from dsbo.utils.io import Workdir, get_workdir
 from dsbo.modules.compile import dryrunnable, is_dry_run
-from dsbo.modules.dsl import ModuleDslMixin  # noqa: F401
+from dsbo.modules.dsl import ModuleDslMixin
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import AbstractFilePath, with_remote_workdir
 from dsbo.worker.config import SlurmWorkerConfig
@@ -96,7 +96,7 @@ class dynamic_submodule:
                 object.__setattr__(self, "fn", fn)
 
             def __setattr__(self, name, value):
-                if name in ("_parent", "fn") or name.startswith("_"):
+                if name in ("_parent", "fn", "i", "resources") or name.startswith("_"):
                     object.__setattr__(self, name, value)
                 else:
                     setattr(self._parent, name, value)
