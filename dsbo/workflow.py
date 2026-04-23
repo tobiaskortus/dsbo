@@ -136,6 +136,7 @@ class Workflow:
                 task_map: dict[str, str] = {}
                 name_map: dict[str, str] = {}
                 exec_ids = []
+                batch_path = getattr(get_workdir(), "root", None)
                 for i, candidate in enumerate(candidates):
                     with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
                         delayed_map = {}
@@ -159,7 +160,7 @@ class Workflow:
                 storage = get_current_storage()
                 if storage is not None:
                     wf_record = storage.save_workflow(self._representation)
-                    storage.register_runs(wf_record, exec_ids)
+                    storage.register_runs(wf_record, exec_ids, batch_path)
                     plugin = storage.create_task_stream_plugin(task_map, name_map=name_map)
                     worker.client.register_plugin(plugin, name="dsbo_task_stream")
 

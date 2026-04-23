@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Dict, Generator, List, Optional
 from peewee import SqliteDatabase
 
-from dsbo.storage.models import JobStatus, WorkflowRecord, ExecutionRecord, JobTraceRecord
+from dsbo.storage.models import JobStatus, WorkflowRecord, BatchRecord, ExecutionRecord, JobTraceRecord
 
 
 _current_storage: contextvars.ContextVar["StudyStorage | None"] = contextvars.ContextVar(
@@ -52,8 +52,8 @@ class StudyStorage:
     def _open_db(self):
         self._db = SqliteDatabase(self._db_path, pragmas={"journal_mode": "wal"})
         self._db.connect(reuse_if_open=True)
-        with self._db.bind_ctx([WorkflowRecord, ExecutionRecord, JobTraceRecord]):
-            self._db.create_tables([WorkflowRecord, ExecutionRecord, JobTraceRecord], safe=True)
+        with self._db.bind_ctx([WorkflowRecord, BatchRecord, ExecutionRecord, JobTraceRecord]):
+            self._db.create_tables([WorkflowRecord, BatchRecord, ExecutionRecord, JobTraceRecord], safe=True)
 
 
     def __enter__(self):
@@ -78,18 +78,20 @@ class StudyStorage:
             if node.resources is not None:
                 G_serializable.nodes[i]['resources'] = node.resources._asdict()
 
-        graph_json = json.dumps(nx.node_link_data(G_serializable))
+        graph_json = json.dumps(nx.node_link_data(G_serializable, edges="edges"))
         with self._db.bind_ctx([WorkflowRecord]):
             return WorkflowRecord.create(graph=graph_json, num_tasks=repr.number_of_nodes())
 
 
-    def register_runs(self, wf_record: WorkflowRecord, exec_ids: list[str]) -> None:
+    def register_runs(self, wf_record: WorkflowRecord, exec_ids: list[str], batch_path: str) -> BatchRecord:
         if self._readonly:
             raise RuntimeError("Cannot register runs to readonly StudyStorage.")
 
-        with self._db.bind_ctx([ExecutionRecord]):
+        with self._db.bind_ctx([BatchRecord, ExecutionRecord]):
+            batch = BatchRecord.create(workflow=wf_record, batch_id=batch_path)
             for exec_id in exec_ids:
-                ExecutionRecord.create(workflow=wf_record, exec_id=exec_id)
+                ExecutionRecord.create(workflow=wf_record, batch=batch, exec_id=exec_id)
+        return batch
 
     def create_task_stream_plugin(self, task_map: Dict[str, str] | None = None, name_map: Dict[str, str] | None = None) -> "TaskStreamPlugin":
         from dsbo.storage.taskstream import TaskStreamPlugin
@@ -133,6 +135,21 @@ class StudyStorage:
         return TaskStreamPlugin(on_transition=on_transition, task_map=task_map, name_map=name_map)
 
 
+    def get_batches(self) -> List[BatchRecord]:
+        with self._db.bind_ctx([WorkflowRecord, BatchRecord]):
+            return list(BatchRecord.select().order_by(BatchRecord.id))
+
+
+    def get_executions_by_batch(self, batch_id: int) -> List[ExecutionRecord]:
+        with self._db.bind_ctx([WorkflowRecord, BatchRecord, ExecutionRecord]):
+            return list(
+                ExecutionRecord
+                .select()
+                .where(ExecutionRecord.batch == batch_id)
+                .order_by(ExecutionRecord.id)
+            )
+
+
     def get_workflows(self) -> List[ExecutionRecord]:
         with self._db.bind_ctx([WorkflowRecord, ExecutionRecord]):
             return list(ExecutionRecord.select().order_by(ExecutionRecord.id))
@@ -158,6 +175,17 @@ class StudyStorage:
             graph_data = json.loads(record.graph)
             graph = nx.node_link_graph(graph_data) if as_nx else graph_data
             return graph
+
+
+    def get_job_traces_by_batch(self, batch_id: int) -> List[JobTraceRecord]:
+        with self._db.bind_ctx([BatchRecord, ExecutionRecord, JobTraceRecord]):
+            return list(
+                JobTraceRecord
+                .select()
+                .join(ExecutionRecord)
+                .where(ExecutionRecord.batch == batch_id)
+                .order_by(JobTraceRecord.start)
+            )
 
 
     def get_job_traces(self, exec_id: str) -> List[JobTraceRecord]:

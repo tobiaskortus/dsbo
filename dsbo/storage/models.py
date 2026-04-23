@@ -15,9 +15,15 @@ class WorkflowRecord(Model):
     graph     = CharField() #Store the workflow graph as a JSON string
     num_tasks = IntegerField(default=0)
 
+class BatchRecord(Model):
+    id       = AutoField(index=True)
+    workflow = ForeignKeyField(WorkflowRecord, backref="batches", on_delete="CASCADE")
+    batch_id = CharField(index=True)  # Path to the directory containing all runs in this batch
+
 class ExecutionRecord(Model):
     id       = AutoField(index=True)
     workflow = ForeignKeyField(WorkflowRecord, backref="executions", on_delete="CASCADE")
+    batch    = ForeignKeyField(BatchRecord, backref="executions", on_delete="CASCADE", null=True)
     exec_id  = CharField(index=True, unique=True)
     status              = EnumField(JobStatus, default=JobStatus.PENDING)
     num_jobs            = IntegerField(default=0)
