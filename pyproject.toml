@@ -21,6 +21,7 @@ dependencies = [
     "grpcio-tools",
     "graphviz",
     "matplotlib",
+    "lancedb",
     "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main"
 ]
 
