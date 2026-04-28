@@ -75,7 +75,7 @@ class SimulationDataset:
         self._table.add(rows)
 
     def cleanup(self):
-        pass
+        self._db.drop_table("iteration_0")
 
     @property
     def data_loader(self):
