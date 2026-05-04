@@ -159,9 +159,9 @@ class Workflow:
 
                 storage = get_current_storage()
                 if storage is not None:
-                    wf_record = storage.save_workflow(self._representation)
-                    storage.register_runs(wf_record, exec_ids, batch_path)
-                    plugin = storage.create_task_stream_plugin(task_map, name_map=name_map)
+                    wf_record = storage.workflow.add_workflow(self._representation)
+                    storage.workflow.add_runs(wf_record, exec_ids, batch_path)
+                    plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
                     worker.client.register_plugin(plugin, name="dsbo_task_stream")
 
                 futures_computed = worker.compute(batch_delays)
@@ -339,5 +339,3 @@ def update_task_graph(task_graph: Workflow, groups: list[list[Module]]) -> Workf
 
 def optimize(workflow: Workflow) -> Workflow:
     return update_task_graph(workflow, mergeable_components(workflow))
-
-

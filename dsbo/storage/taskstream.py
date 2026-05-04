@@ -1,19 +1,18 @@
-from re import match
-from typing import Callable, Dict, Optional
-from unittest import case
+from typing import Dict, Optional
 from distributed.diagnostics.plugin import SchedulerPlugin
 
 from dsbo.storage.models import JobStatus
+from dsbo.storage import TransitionWriter
 
 class TaskStreamPlugin(SchedulerPlugin):
     def __init__(
         self,
-        on_transition: Callable[[str, str, str, float, float, Optional[str], str], None],
+        writer: TransitionWriter,
         task_map: Dict[str, str],
         name_map: Dict[str, str],
     ) -> None:
         super().__init__()
-        self.on_transition = on_transition
+        self.writer = writer
         self.task_map: Dict[str, str] = task_map
         self.name_map: Dict[str, str] = name_map
         self.log_buffer: Dict[str, list] = {}
@@ -35,7 +34,8 @@ class TaskStreamPlugin(SchedulerPlugin):
                 name    = self.name_map[key]
                 messages = self.log_buffer.pop(key, [])
                 log = "\n".join(messages)
-                self.on_transition(key, name, worker.name, startstop["start"], startstop["stop"], exec_id, log, status)
+
+                self.writer(key, name, worker.name, startstop["start"], startstop["stop"], exec_id, log, status)
             except Exception as e:
                 print(f"[TaskStreamPlugin] transition error: {e}")
 
