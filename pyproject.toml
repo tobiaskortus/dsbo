@@ -24,6 +24,7 @@ dependencies = [
     "duckdb",
     "duckdb-engine",
     "sqlmodel",
+    "sqlite-vec",
     "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main"
 ]
 
