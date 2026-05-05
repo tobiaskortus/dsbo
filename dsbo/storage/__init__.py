@@ -119,12 +119,17 @@ class TrialStorageBase(ABC):
     def get_trials(self) -> list[Trial]:
         pass
 
+    @abstractmethod
+    def get_similar_trials(self, query_vec: np.ndarray | torch.Tensor, k: int = 10, metric: str = "l2") -> list["Trial"]:
+        pass
+
+
 class StudyStorageBase:
     def __init__(self, db_path: Path | str):
         self._trial_storage: Optional[TrialStorageBase] = None
         self._workflow_storage: Optional[WorkflowStorageBase] = None
         self._intermediates_storage: Optional[IntermediatesStorageBase] = None
-    
+
     @property
     def workflow(self) -> WorkflowStorageBase:
         return self._workflow_storage

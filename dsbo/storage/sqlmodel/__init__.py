@@ -1,20 +1,77 @@
 from __future__ import annotations
 
+from calendar import c
 import time
 import json
 import torch
 import numpy as np
 import dataclasses
 from pathlib import Path
-from typing import  List, Optional
+from typing import List, Optional
 
 import networkx as nx
-from sqlalchemy import Engine
+from sqlalchemy import Engine, event as sa_event
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase
 from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow
+
+
+DUCKDB_VECTOR_METRICS = {
+        "l2":     "array_distance",
+        "cosine": "array_cosine_distance",
+        "ip":     "array_negative_inner_product",
+    }
+
+
+def _configure_duckdb_vss(engine: Engine, vector_dim: int) -> None:
+    @sa_event.listens_for(engine, "connect")
+    def _load_vss(conn, _):
+        try:
+            conn.execute("LOAD vss")
+        except Exception:
+            conn.execute("INSTALL vss")
+            conn.execute("LOAD vss")
+        conn.execute("SET hnsw_enable_experimental_persistence = true")
+
+    with engine.connect() as conn:
+        conn.exec_driver_sql(
+            f"CREATE TABLE IF NOT EXISTS trial_vectors "
+            f"(trial_id VARCHAR, vec FLOAT[{vector_dim}])"
+        )
+        conn.commit()
+
+    with engine.connect() as conn:
+        try:
+            conn.exec_driver_sql(
+                f"CREATE INDEX IF NOT EXISTS trial_vectors_hnsw "
+                f"ON trial_vectors USING HNSW(vec)"
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+
+def _configure_sqlite_vec(engine: Engine, vector_dim: int) -> None:
+    import sqlite_vec
+
+    @sa_event.listens_for(engine, "connect")
+    def _load_vec(conn, _):
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+
+    with engine.connect() as conn:
+        conn.exec_driver_sql(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_trials "
+            f"USING vec0(design float[{vector_dim}])"
+        )
+        conn.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS vec_trial_map "
+            "(rowid INTEGER PRIMARY KEY, trial_id TEXT NOT NULL)"
+        )
+        conn.commit()
 
 
 @dataclasses.dataclass
@@ -183,61 +240,172 @@ class IntermediatesStorage(IntermediatesStorageBase):
 
 
 class TrialStorage(TrialStorageBase):
-    def __init__(self, engine: Engine, readonly: bool = False):
+    def __init__(self, engine: Engine, readonly: bool = False, vector_dim: int | None = None, backend: str = "duckdb"):
         super().__init__()
         self._engine = engine
+        self._backend = backend
         self._readonly = readonly
+        self._vector_dim = vector_dim
 
     def add_trial(self, step: int, design_vec: np.ndarray | torch.Tensor, objectives: dict) -> None:
         if self._readonly:
             raise RuntimeError("Cannot write to readonly TrialStorage.")
-        
+
         if isinstance(design_vec, torch.Tensor):
             design_vec = design_vec.detach().cpu().numpy()
 
         arr = np.asarray(design_vec, dtype=np.float32)
         with Session(self._engine) as session:
-            session.add(Trial(
-                step=step,
-                design=arr.tobytes(),
-                objectives=objectives,
-            ))
+            trial = Trial(step=step, design=arr.tobytes(), objectives=objectives)
+            session.add(trial)
             session.commit()
+            session.refresh(trial)
+            trial_id = trial.id
+
+        if self._vector_dim is not None:
+            self._index_design(trial_id, arr)
+
+    def _index_design(self, trial_id: str, arr: np.ndarray) -> None:
+        def _index_design_duckdb():
+            with self._engine.connect() as conn:
+                conn.exec_driver_sql(
+                    f"INSERT INTO trial_vectors VALUES (?, ?::FLOAT[{self._vector_dim}])",
+                    (trial_id, arr.tolist()),
+                )
+                conn.commit()
+
+        def _index_design_sqlite():
+            with self._engine.connect() as conn:
+                result = conn.exec_driver_sql(
+                    "SELECT COALESCE(MAX(rowid), 0) + 1 FROM vec_trial_map"
+                )
+                next_rowid = result.scalar()
+                conn.exec_driver_sql(
+                    "INSERT INTO vec_trials(rowid, design) VALUES (?, ?)",
+                    (next_rowid, arr.tobytes()),
+                )
+                conn.exec_driver_sql(
+                    "INSERT INTO vec_trial_map(rowid, trial_id) VALUES (?, ?)",
+                    (next_rowid, trial_id),
+                )
+                conn.commit()
+
+        match self._backend:
+            case "duckdb":
+                _index_design_duckdb()
+            case "sqlite":
+                _index_design_sqlite()
+            case _:
+                raise ValueError(f"Unsupported backend: {self._backend}")
+            
 
     def get_trials(self) -> list[Trial]:
         with Session(self._engine) as session:
             return session.exec(select(Trial).order_by(Trial.step)).all()
 
+
+    def get_similar_trials(self, query_vec: np.ndarray | torch.Tensor, 
+                              k: int = 10, metric: str = "l2") -> list[Trial]:
+        
+        def _search_duckdb(arr: np.ndarray, k: int, metric: str) -> list[Trial]:
+            fn = DUCKDB_VECTOR_METRICS.get(metric)
+            if fn is None:
+                raise ValueError(
+                    f"Unsupported metric '{metric}' for DuckDB. "
+                    f"Choose one of: {list(DUCKDB_VECTOR_METRICS)}")
+            
+            with self._engine.connect() as conn:
+                result = conn.exec_driver_sql(
+                    f"SELECT trial_id FROM trial_vectors "
+                    f"ORDER BY {fn}(vec, ?::FLOAT[{self._vector_dim}]) LIMIT {k}",
+                    (arr.tolist(),),
+                )
+                trial_ids = [row[0] for row in result]
+
+            return trial_ids
+
+    
+        def _search_sqlite(arr: np.ndarray, k: int, metric: str) -> list[Trial]:
+            if metric != "l2":
+                raise ValueError(
+                    "sqlite-vec only supports 'l2' metric. "
+                    "Use the DuckDB backend for cosine or inner-product search.")
+            
+            with self._engine.connect() as conn:
+                result = conn.exec_driver_sql(
+                    "SELECT vec_trial_map.trial_id "
+                    "FROM vec_trials "
+                    "JOIN vec_trial_map ON vec_trials.rowid = vec_trial_map.rowid "
+                    "WHERE vec_trials.design MATCH ? AND k = ? "
+                    "ORDER BY vec_trials.distance",
+                    (arr.tobytes(), k),
+                )
+                trial_ids = [row[0] for row in result]
+            
+            return trial_ids
+
+
+        if self._vector_dim is None:
+            raise NotImplementedError(
+                "Vector search is not enabled. Pass vector_dim to StudyStorage.create() to enable it."
+            )
+
+        if isinstance(query_vec, torch.Tensor):
+            query_vec = query_vec.detach().cpu().numpy()
+
+        arr = np.asarray(query_vec, dtype=np.float32)
+
+        match self._backend:
+            case "duckdb":
+                trial_ids =  _search_duckdb(arr, k, metric)
+            case "sqlite":
+                trial_ids =  _search_sqlite(arr, k, metric)
+            case _:
+                raise ValueError(f"Unsupported backend: {self._backend}")
+            
+        if not trial_ids: return []
+        
+        with Session(self._engine) as session:
+            trials = session.exec(select(Trial).where(Trial.id.in_(trial_ids))).all()
+
+        id_to_trial = {t.id: t for t in trials}
+        return [id_to_trial[tid] for tid in trial_ids if tid in id_to_trial]
+
+
 class StudyStorage(StudyStorageBase):
 
-    def __init__(self, engine: Engine, *, readonly: bool = False):
+    def __init__(self, engine: Engine, *, readonly: bool = False, vector_dim: int | None = None, backend: str = "duckdb"):
         super().__init__(db_path="")
         self._engine = engine
         self._readonly = readonly
         SQLModel.metadata.create_all(engine)
 
-        self._trial_storage = TrialStorage(engine, readonly)
+        self._trial_storage = TrialStorage(engine, readonly, vector_dim=vector_dim, backend=backend)
         self._workflow_storage = WorkflowStorage(engine, readonly)
         self._intermediates_storage = IntermediatesStorage(engine, readonly)
 
 
     @classmethod
-    def create(cls, db_path: Path | str, *, readonly: bool = False, backend: str = "duckdb") -> "StudyStorage":
-        if backend == "duckdb":
-            engine = create_engine(f"duckdb:///{db_path}", poolclass=NullPool)
-        elif backend == "sqlite":
-            engine = create_engine(
-            f"sqlite:///{db_path}",
-            connect_args={"check_same_thread": False})
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+    def create(cls, db_path: Path | str, *, readonly: bool = False, backend: str = "duckdb", 
+               vector_dim: int | None = None) -> "StudyStorage":
         
-        return cls(engine, readonly=readonly)
+        match backend:
+            case "duckdb":
+                engine = create_engine(f"duckdb:///{db_path}", poolclass=NullPool)
+                if vector_dim is not None:
+                    _configure_duckdb_vss(engine, vector_dim)
+            case "sqlite":
+                engine = create_engine( f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+                if vector_dim is not None:
+                    _configure_sqlite_vec(engine, vector_dim)
+            case _:
+                raise ValueError(f"Unsupported backend: {backend}")
 
+        return cls(engine, readonly=readonly, vector_dim=vector_dim, backend=backend)
 
     @classmethod
-    def open(cls, db_path: Path | str, backend: str = "duckdb") -> "StudyStorage":
-        return cls.create(db_path, readonly=True, backend=backend)
+    def open(cls, db_path: Path | str, backend: str = "duckdb", vector_dim: int | None = None) -> "StudyStorage":
+        return cls.create(db_path, readonly=True, backend=backend, vector_dim=vector_dim)
 
     def __exit__(self, exc_type, exc, tb):
         super().__exit__(exc_type, exc, tb)
