@@ -14,7 +14,6 @@ dependencies = [
     "torch",
     "numpy",
     "pandas",
-    "peewee",
     "dask[distributed]",
     "dask-jobqueue",
     "grpcio",
@@ -22,6 +21,9 @@ dependencies = [
     "graphviz",
     "matplotlib",
     "lancedb",
+    "duckdb",
+    "duckdb-engine",
+    "sqlmodel",
     "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main"
 ]
 
