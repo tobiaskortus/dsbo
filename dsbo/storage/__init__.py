@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import torch
 import contextvars
+import numpy as np
 import networkx as nx
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -8,7 +10,7 @@ from contextlib import contextmanager
 from typing import Dict, Generator, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Workflow
+    from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Workflow, Trial
 
 
 class TransitionWriter(ABC):
@@ -105,9 +107,21 @@ class IntermediatesStorageBase(ABC):
         pass
 
 
+class TrialStorageBase(ABC):
+    def __init__(self):
+        pass
+
+    @abstractmethod
+    def add_trial(self, step: int, design_vec: np.array | torch.Tensor, objectives: dict):
+        pass
+
+    @abstractmethod
+    def get_trials(self) -> list[Trial]:
+        pass
 
 class StudyStorageBase:
     def __init__(self, db_path: Path | str):
+        self._trial_storage: Optional[TrialStorageBase] = None
         self._workflow_storage: Optional[WorkflowStorageBase] = None
         self._intermediates_storage: Optional[IntermediatesStorageBase] = None
     
@@ -118,6 +132,10 @@ class StudyStorageBase:
     @property
     def intermediates(self) -> IntermediatesStorageBase:
         return self._intermediates_storage
+    
+    @property
+    def trials(self) -> TrialStorageBase:
+        return self._trial_storage
 
     def __enter__(self):
         self._storage_token = _current_storage.set(self)

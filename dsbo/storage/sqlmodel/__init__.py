@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 import json
+import torch
+import numpy as np
 import dataclasses
 from pathlib import Path
 from typing import  List, Optional
@@ -11,8 +13,8 @@ from sqlalchemy import Engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, WorkflowStorageBase
-from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Workflow
+from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase
+from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow
 
 
 @dataclasses.dataclass
@@ -180,6 +182,32 @@ class IntermediatesStorage(IntermediatesStorageBase):
             session.commit()
 
 
+class TrialStorage(TrialStorageBase):
+    def __init__(self, engine: Engine, readonly: bool = False):
+        super().__init__()
+        self._engine = engine
+        self._readonly = readonly
+
+    def add_trial(self, step: int, design_vec: np.ndarray | torch.Tensor, objectives: dict) -> None:
+        if self._readonly:
+            raise RuntimeError("Cannot write to readonly TrialStorage.")
+        
+        if isinstance(design_vec, torch.Tensor):
+            design_vec = design_vec.detach().cpu().numpy()
+
+        arr = np.asarray(design_vec, dtype=np.float32)
+        with Session(self._engine) as session:
+            session.add(Trial(
+                step=step,
+                design=arr.tobytes(),
+                objectives=objectives,
+            ))
+            session.commit()
+
+    def get_trials(self) -> list[Trial]:
+        with Session(self._engine) as session:
+            return session.exec(select(Trial).order_by(Trial.step)).all()
+
 class StudyStorage(StudyStorageBase):
 
     def __init__(self, engine: Engine, *, readonly: bool = False):
@@ -187,6 +215,8 @@ class StudyStorage(StudyStorageBase):
         self._engine = engine
         self._readonly = readonly
         SQLModel.metadata.create_all(engine)
+
+        self._trial_storage = TrialStorage(engine, readonly)
         self._workflow_storage = WorkflowStorage(engine, readonly)
         self._intermediates_storage = IntermediatesStorage(engine, readonly)
 

@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import enum
 import uuid
-from typing import Optional
+from typing import Optional, List, Dict
 
-from sqlalchemy import Column
-from sqlalchemy import Double
+from sqlalchemy import Double, Column, LargeBinary, JSON
 from sqlmodel import Field, SQLModel
 
 
@@ -60,3 +59,15 @@ class Intermediate(SQLModel, table=True):
     step:     int
     value:    float
     walltime: float = Field(sa_column=Column(Double))
+
+
+class Trial(SQLModel, table=True):
+    id:         str = Field(default_factory=_new_id, primary_key=True)
+    step:       int
+    design:     bytes = Field(sa_column=Column(LargeBinary))
+    objectives: Dict[str, List[float]] = Field(sa_column=Column(JSON))
+
+    @property
+    def design_vector(self) -> "np.ndarray":
+        import numpy as np
+        return np.frombuffer(self.design, dtype=np.float32).copy()
