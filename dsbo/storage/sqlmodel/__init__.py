@@ -256,7 +256,7 @@ class TrialStorage(TrialStorageBase):
 
         arr = np.asarray(design_vec, dtype=np.float32)
         with Session(self._engine) as session:
-            trial = Trial(step=step, design=arr.tobytes(), objectives=objectives)
+            trial = Trial(step=int(step), design=arr.tobytes(), objectives=objectives)
             session.add(trial)
             session.commit()
             session.refresh(trial)
