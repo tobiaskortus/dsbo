@@ -112,7 +112,8 @@ class TrialStorageBase(ABC):
         pass
 
     @abstractmethod
-    def add_trial(self, step: int, design_vec: np.array | torch.Tensor, objectives: dict):
+    def add_trial(self, step: int, design_vec: np.array | torch.Tensor, objectives: dict, 
+                  constraints: Optional[dict] = None, feasible: bool = True) -> "Trial":
         pass
 
     @abstractmethod

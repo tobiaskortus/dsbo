@@ -247,7 +247,9 @@ class TrialStorage(TrialStorageBase):
         self._readonly = readonly
         self._vector_dim = vector_dim
 
-    def add_trial(self, step: int, design_vec: np.ndarray | torch.Tensor, objectives: dict) -> None:
+    def add_trial(self, step: int, design_vec: np.ndarray | torch.Tensor, objectives: dict,
+                  constraints: Optional[dict] = None, feasible: bool = True) -> None:
+        
         if self._readonly:
             raise RuntimeError("Cannot write to readonly TrialStorage.")
 
@@ -256,7 +258,10 @@ class TrialStorage(TrialStorageBase):
 
         arr = np.asarray(design_vec, dtype=np.float32)
         with Session(self._engine) as session:
-            trial = Trial(step=int(step), design=arr.tobytes(), objectives=objectives)
+            trial = Trial(step=int(step), design=arr.tobytes(), 
+                          objectives=objectives, constraints=constraints, 
+                          feasible=feasible)
+            
             session.add(trial)
             session.commit()
             session.refresh(trial)

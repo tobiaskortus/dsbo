@@ -62,10 +62,13 @@ class Intermediate(SQLModel, table=True):
 
 
 class Trial(SQLModel, table=True):
-    id:         str = Field(default_factory=_new_id, primary_key=True)
+    id:         str     = Field(default_factory=_new_id, primary_key=True)
     step:       int
-    design:     bytes = Field(sa_column=Column(LargeBinary))
-    objectives: Dict[str, List[float]] = Field(sa_column=Column(JSON))
+    feasible:   bool    = Field(index=True)
+    design:     bytes   = Field(sa_column=Column(LargeBinary))
+    
+    objectives: Dict[str, float]  = Field(sa_column=Column(JSON))
+    constraints: Optional[Dict[str, float]] = Field(default=None, sa_column=Column(JSON, nullable=True))
 
     @property
     def design_vector(self) -> "np.ndarray":
