@@ -1,103 +1,167 @@
 import pytest
-from unittest.mock import patch, MagicMock
 
-from dsbo.modules.dsl import DependencyDict, Module
+from dsbo.modules.dsl import ModuleDslMixin, DependencyDict
 
-def test_rshift_modules():
-    a = Module()
-    b = Module()
-
-    dep_expr = a >> b
-
-    assert isinstance(dep_expr, dict)
-    assert dep_expr == {a: [b]}
-
-def test_rshift_invalid():
-    a = Module()
-
-    with pytest.raises(TypeError):
-        _ = a >> "not a module"
-
-    with pytest.raises(TypeError):
-        _ = a >> 123
-
-def test_mult_modules():
-    a = Module()
-
-    dep_expr = a * 3
-
-    assert isinstance(dep_expr, dict)
-
-    replicas = list(dep_expr.keys())
-    assert len(replicas) == 3
-    for i, module in enumerate(replicas):
-        assert isinstance(module, Module)
-        assert module.iter == i
-        assert dep_expr[module] == []
-
-def test_mult_modules_invalid():
-    a = Module()
-
-    with pytest.raises(TypeError):
-        _ = a * "not an int"
-
-    with pytest.raises(TypeError):
-        _ = a * 3.5
+@pytest.fixture(scope="session", autouse=True)
+def depdict_obj_factory():
+        def depdict_obj():
+            module1 = ModuleDslMixin()
+            module2 = ModuleDslMixin()
+            module3 = ModuleDslMixin()
+            depdict = DependencyDict({module1: [module2, module3]})
+            return module1, module2 , module3, depdict  
+        return depdict_obj
 
 
-def test_or_modules():
-    a = Module()
-    b = Module()
-
-    dep_exp = a | b
-
-    assert isinstance(dep_exp, dict)
-    assert dep_exp == {a: [], b: []}
-
-
-def test_or_rshift():
-    a = Module()
-    b = Module()
-    c = Module()
-    d = Module()
-
-    dep_exp = (a >> b) | (c >> d)
-
-    assert isinstance(dep_exp, dict)
-    assert dep_exp == {a: [b], c: [d]}
+@pytest.fixture(scope="session", autouse=True)
+def depdict_obj_many_factory():
+    def depdict_obj_many():
+        module1 = ModuleDslMixin()
+        module2 = ModuleDslMixin()
+        module3 = ModuleDslMixin()
+        module4 = ModuleDslMixin()
+        depdict = DependencyDict({module1: [module3, module4],
+                                module2: [module3, module4]})
+        
+        return module1, module2 , module3, module4, depdict
+    return depdict_obj_many
 
 
-def test_or_rshift_merge():
-    a = Module(); b = Module()
-    c = Module(); d = Module()
-    e = Module()
+def test_module_replicate_index():
+    module = ModuleDslMixin()
+    module0 = module.replicate(0)
 
-    dep_exp = ((a >> b) | (c >> d)) >> e
+    with pytest.raises(AttributeError):
+        module.i 
 
-    assert isinstance(dep_exp, dict)
-    assert dep_exp == {a: [b], c: [d], b: [e], d: [e]}
+    assert module0.i == 0
 
 
-def test_or_mul_rshift_merge():
-    a = Module(); b = Module()
-    c = Module(); d = Module()
-    e = Module()
+def test_module_replicate_shallow_copy():
+    module = ModuleDslMixin()
+    class SomeObject:
+        def __init__(self) -> None:
+            self.var1 = 1
+            self.var2 = 2
 
-    a2 = a * 2
-    b2 = b * 2
-    c2 = c * 2
-    d2 = d * 2
+    obj = SomeObject()
+    module.obj = obj
 
-    dep_exp = ((a2 >> b2) | (c2 >> d2)) >> e
+    module0 = module.replicate(0)
 
-    b_replicas = [x for vs in b2.values() for x in vs]
-    d_replicas = [x for vs in d2.values() for x in vs]
+    assert module0.obj == module.obj
 
-    for node in b_replicas + d_replicas:
-        assert node in dep_exp
-        assert dep_exp[node] == [e]
-    # Ensure no original (non-replica) module was left pointing to `e` —
-    # that would indicate an extra intermediate node was inserted by the DSL.
-    for orig in (a, b, c, d):
-        assert not (orig in dep_exp and dep_exp[orig] == [e])
-            
+
+def test_module_or_module_module():
+    module1 = ModuleDslMixin()
+    module2 = ModuleDslMixin()
+
+    module_or = module1 | module2
+
+    assert isinstance(module_or, DependencyDict)
+    assert module_or == {module1: [], module2: []}
+
+
+def test_module_or_module_depdict(depdict_obj_factory):
+    module1 = ModuleDslMixin()
+    module2, module3, module4, depdict = depdict_obj_factory()
+
+    module_or = module1 | depdict
+    
+    assert isinstance(module_or, DependencyDict)
+    assert module_or == {module1: [], 
+                         module2: [module3, module4]}
+
+
+def test_module_rshift_module_module():
+    module1 = ModuleDslMixin()
+    module2 = ModuleDslMixin()
+
+    module_rshift = module1 >> module2
+
+    assert isinstance(module_rshift, DependencyDict)
+    assert module_rshift == {module1: [module2]}
+
+
+def test_module_rshift_module_depdict_one_to_one(depdict_obj_factory):
+    module1 = ModuleDslMixin()
+    module2, module3, module4, depdict = depdict_obj_factory()
+
+    module_rshift = module1 >> depdict
+
+    assert isinstance(module_rshift, DependencyDict)
+    assert module_rshift == {module1: [module2],
+                             module2: [module3, module4]}
+    
+
+def test_module_rshift_module_depdict_one_to_many(depdict_obj_many_factory):
+    module1 = ModuleDslMixin()
+    module2, module3, module4, module5, depdict = depdict_obj_many_factory()
+
+    depdict = DependencyDict({module2: [module4, module5],
+                              module3: [module4, module5]})
+    
+    module_rshift = module1 >> depdict
+    
+    assert isinstance(module_rshift, DependencyDict)
+    assert module_rshift == {module1: [module2, module3],
+                             module2: [module4, module5],
+                             module3: [module4, module5]}
+
+    
+def test_module_mul_int():
+    module1 = ModuleDslMixin()
+
+    module_mul = module1 * 3
+
+    assert isinstance(module_mul, DependencyDict)
+    assert len(module_mul.keys()) == 3
+    
+    for i, (key, val) in enumerate(module_mul.items()):
+        assert key.i == i
+        assert val == []
+
+
+def test_module_mul_dynamic():
+    assert False
+
+
+def test_depdict_or_depdict_module(depdict_obj_factory):
+    module4 = ModuleDslMixin()
+    module1, module2, module3, depdict = depdict_obj_factory()
+
+    depdict_or = depdict | module4
+
+    assert isinstance(depdict_or, DependencyDict)
+    assert depdict_or == {module1: [module2, module3],
+                          module4: []}
+
+
+def test_depdict_or_depdict_depdict(depdict_obj_factory):
+    module1, module2, module3, depdict1 = depdict_obj_factory()
+    module4, module5, module6, depdict2 = depdict_obj_factory()
+
+    depdict_or = depdict1 | depdict2
+
+    assert isinstance(depdict_or, DependencyDict)
+    assert depdict_or == {module1: [module2, module3],
+                          module4: [module5, module6]}
+    
+
+def test_depdict_mul_int(depdict_obj_factory):
+    _, _, _, depdict = depdict_obj_factory()
+
+    depdict_mul = depdict * 3
+
+    assert isinstance(depdict_mul, DependencyDict)
+    assert len(depdict_mul.keys()) == 3
+
+    for i, (key, val) in enumerate(depdict_mul.items()):
+        assert key.i == i
+        assert len(val) == 2
+        for v in val:
+            assert v.i == i
+
+
+def test_depdict_mul_dynamic(depdict_obj_factory):
+    assert False

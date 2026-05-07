@@ -7,8 +7,8 @@ from dsbo.backends.optuna import OptunaBackend
 from dsbo.backends.aido import AidoBackend
 from dsbo.transforms import MiniframeMergeTransform
 from dsbo.worker.dask import AdaptiveHeterogeneousDaskSlurmWorker
-from dsbo.worker.config import DEFAULT_CPU_CONFIG, DEFAULT_GPU_CONFIG, SlurmWorkerConfig
-from dsbo.workflow import  Workflow, optimize
+from dsbo.worker.config import DEFAULT_CPU_CONFIG, GPU_CONFIG, SlurmWorkerConfig
+from dsbo.workflow import  PatchableWorkflow, Workflow, optimize
 from dsbo.parameters import Constant, Constant, ParameterSpace, Group, Continuous, Categorical, Integer, Sampler
 
 from examples.calo_multiobjective.reconstruction import G4CaloReconstruction
@@ -55,15 +55,15 @@ if __name__ == "__main__":
     constraint = MultiConstraint(G4CaloCostConstraint(max_cost=100_000),
                                  G4CaloLengthConstraint(max_length=200))
     
-    SINGLE_CORE_CONFIG = SlurmWorkerConfig(processes=5, job_cpu=5, walltime="48:00:00", memory="48GB", partition="epyc-256")
-    DEFAULT_GPU_CONFIG = SlurmWorkerConfig(job_cpu=4, gpu_resources="gpu:1", memory="16GB", walltime="48:00:00")
+    CPU_CONFIG = SlurmWorkerConfig(processes=5, job_cpu=5, walltime="48:00:00", memory="48GB", partition="epyc-256")
+    GPU_CONFIG = SlurmWorkerConfig(job_cpu=4, gpu_resources="gpu:1", memory="16GB", walltime="48:00:00")
 
-    simulation       = G4CaloSimulation("/home/nyl93mev/minicalosim_90baa21.sif").to(SINGLE_CORE_CONFIG)
-    simulation_merge = MiniframeMergeTransform("output_df_*").to(SINGLE_CORE_CONFIG)
-    sim2reco         = G4CaloSimToReco().to(SINGLE_CORE_CONFIG)
-    reconstruction   = G4CaloReconstruction("/home/nyl93mev/minicalosim_90baa21.sif").to(DEFAULT_GPU_CONFIG)
+    simulation       = G4CaloSimulation("/home/nyl93mev/minicalosim_90baa21.sif").to(CPU_CONFIG)
+    simulation_merge = MiniframeMergeTransform("output_df_*").to(CPU_CONFIG)
+    sim2reco         = G4CaloSimToReco().to(CPU_CONFIG)
+    reconstruction   = G4CaloReconstruction("/home/nyl93mev/minicalosim_90baa21.sif").to(GPU_CONFIG)
 
-    workflow = Workflow(simulation * 30 >> simulation_merge >> sim2reco >> reconstruction)
+    workflow = PatchableWorkflow(simulation * 30 >> simulation_merge >> sim2reco >> reconstruction)
     workflow = optimize(workflow)
     workflow.visualize("workflow.png")
     
@@ -71,5 +71,5 @@ if __name__ == "__main__":
     
     with AdaptiveHeterogeneousDaskSlurmWorker.from_workflow(workflow, logdir="logdir") as worker:
         candidate = calorimeter.sample(UniformSampler(), requires_grad=True)
-        AidoBackend(f"calo_constrained", workflow, calorimeter, constraint, objectives, seed=seed).optimize(100, 20)
+        AidoBackend(f"calo_constrained", workflow, calorimeter, constraint, objectives, worker=worker, seed=seed).optimize(200, candidate)
 

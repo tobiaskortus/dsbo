@@ -1,35 +1,73 @@
-from enum import Enum
-from peewee import (IntegerField, Model, AutoField, CharField,
-                    FloatField, ForeignKeyField, TextField)
+from __future__ import annotations
 
-from dsbo.storage.fields import EnumField
+import enum
+import uuid
+from typing import Optional, List, Dict
 
-class JobStatus(str, Enum):
+from sqlalchemy import Double, Column, LargeBinary, JSON
+from sqlmodel import Field, SQLModel
+
+
+def _new_id() -> str:
+    return str(uuid.uuid4())
+
+
+class JobStatus(str, enum.Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     SUCCESS = "SUCCESS"
     FAILED  = "FAILED"
 
-class WorkflowRecord(Model):
-    id        = AutoField(index=True)
-    graph     = CharField() #Store the workflow graph as a JSON string
-    num_tasks = IntegerField(default=0)
 
-class ExecutionRecord(Model):
-    id       = AutoField(index=True)
-    workflow = ForeignKeyField(WorkflowRecord, backref="executions", on_delete="CASCADE")
-    exec_id  = CharField(index=True, unique=True)
-    status              = EnumField(JobStatus, default=JobStatus.PENDING)
-    num_jobs            = IntegerField(default=0)
-    num_successful_jobs = IntegerField(default=0)
+class Workflow(SQLModel, table=True):
+    id:        str = Field(default_factory=_new_id, primary_key=True)
+    graph:     str
+    num_tasks: int = 0
 
-class JobTraceRecord(Model):
-    id        = AutoField(index=True)
-    execution = ForeignKeyField(ExecutionRecord, backref="job_traces", on_delete="CASCADE")
-    task_key  = CharField()
-    name      = CharField()
-    worker    = CharField()
-    start     = FloatField()
-    stop      = FloatField()
-    log       = TextField()
-    status    = EnumField(JobStatus)
+
+class Batch(SQLModel, table=True):
+    id:          str = Field(default_factory=_new_id, primary_key=True)
+    workflow_id: str = Field(foreign_key="workflow.id")
+    batch_id:    str = Field(index=True)
+
+
+class Execution(SQLModel, table=True):
+    id:                  str           = Field(default_factory=_new_id, primary_key=True)
+    workflow_id:         str           = Field(foreign_key="workflow.id")
+    batch_id:            Optional[str] = Field(default=None, foreign_key="batch.id")
+    exec_id:             str           = Field(unique=True, index=True)
+    status:              JobStatus     = JobStatus.PENDING
+    num_jobs:            int           = 0
+    num_successful_jobs: int           = 0
+
+
+class JobTrace(SQLModel, table=True):
+    id:           str       = Field(default_factory=_new_id, primary_key=True)
+    execution_id: str       = Field(foreign_key="execution.id")
+    task_key:     str
+    name:         str
+    worker:       str
+    start:        float     = Field(sa_column=Column(Double))
+    stop:         float     = Field(sa_column=Column(Double))
+    log:          str
+    status:       JobStatus
+
+
+class Intermediate(SQLModel, table=True):
+    id:       str   = Field(default_factory=_new_id, primary_key=True)
+    tag:      str   = Field(index=True)
+    step:     int
+    value:    float
+    walltime: float = Field(sa_column=Column(Double))
+
+
+class Trial(SQLModel, table=True):
+    id:         str = Field(default_factory=_new_id, primary_key=True)
+    step:       int
+    design:     bytes = Field(sa_column=Column(LargeBinary))
+    objectives: Dict[str, List[float]] = Field(sa_column=Column(JSON))
+
+    @property
+    def design_vector(self) -> "np.ndarray":
+        import numpy as np
+        return np.frombuffer(self.design, dtype=np.float32).copy()

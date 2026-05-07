@@ -15,6 +15,8 @@ from IPython.display import Image, display
 from dsbo.modules import Module
 from dsbo.parameters import Candidate
 from dsbo.modules.compile import dry_run
+from dsbo.modules.dsl import DependencyDict
+from dsbo.utils.io import Workdir, get_subdir
 from dsbo.storage import get_current_storage
 from dsbo.worker.config import SlurmWorkerConfig
 from dsbo.backends.aido.surrogate import LocalSurrogate
@@ -94,9 +96,9 @@ def get_dependent_task_groups(G: nx.DiGraph):
 class Workflow:
     def __init__(self, dependencies: dict[Module, Iterable[Module]] | Module) -> None:
 
-        #Convert single module into dict forma
+        #Convert single module into DependencyDict format
         if isinstance(dependencies, Module):
-            dependencies = {dependencies: []}
+            dependencies = DependencyDict({dependencies: []})
 
         self._representation = nx.DiGraph(dependencies)
 
@@ -104,11 +106,11 @@ class Workflow:
         assert_no_duplicate_nodes(self._representation)
 
 
-    def run(self, design: dict, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
+    def run(self, design: Candidate, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
         return self.run_batch([design], catch=catch)[0]
 
     def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()) -> List[dict[str, float]]:
-        
+
         with torch.no_grad():
             from dsbo.worker.dask import WorkerContext
             worker = WorkerContext.get_current_worker()
@@ -136,6 +138,7 @@ class Workflow:
                 task_map: dict[str, str] = {}
                 name_map: dict[str, str] = {}
                 exec_ids = []
+                batch_path = getattr(get_workdir(), "root", None)
                 for i, candidate in enumerate(candidates):
                     with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
                         delayed_map = {}
@@ -158,9 +161,9 @@ class Workflow:
 
                 storage = get_current_storage()
                 if storage is not None:
-                    wf_record = storage.save_workflow(self._representation)
-                    storage.register_runs(wf_record, exec_ids)
-                    plugin = storage.create_task_stream_plugin(task_map, name_map=name_map)
+                    wf_record = storage.workflow.add_workflow(self._representation)
+                    storage.workflow.add_runs(wf_record, exec_ids, batch_path)
+                    plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
                     worker.client.register_plugin(plugin, name="dsbo_task_stream")
 
                 futures_computed = worker.compute(batch_delays)
@@ -220,32 +223,53 @@ class Workflow:
         rep_entry = {}
         rep_exit = {}
 
+        # Compute topological level for each node (determines the column in LR layout).
+        levels = task_levels(self._representation)
+
+        # Group nodes by level; within each level sort by (.i, name) so replicas of
+        # the same module and repeat end up adjacent vertically.
+        level_groups: dict[int, list] = {}
         for n in nodes:
-            color = color_map.get(res_key(n), '#d3d3d3')
-            if isinstance(n, FusedModule):
-                cluster_name = f"cluster_{id(n)}"
-                sub_ids = []
-                with dot.subgraph(name=cluster_name) as c:
-                    c.attr(label='', rank='same', style="dashed")
-                    for i, sub in enumerate(n.modules):
-                        sid = f"{id(n)}_sub_{i}"
-                        c.node(sid, label=_node_label(sub), style='filled', fillcolor=color, shape='box', color='black', penwidth='1')
-                        sub_ids.append(sid)
-                    for a, b in zip(sub_ids, sub_ids[1:]):
-                        c.edge(a, b)
-                if sub_ids:
-                    rep_entry[n], rep_exit[n] = sub_ids[0], sub_ids[-1]
-                else:
-                    rep_entry[n] = rep_exit[n] = str(id(n))
-            else:
-                nid = str(id(n))
-                dot.node(nid, label=_node_label(n), style='filled', fillcolor=color, shape='box', fontcolor='black')
-                rep_entry[n] = rep_exit[n] = nid
+            level_groups.setdefault(levels.get(n, 0), []).append(n)
+
+        for lvl, group in sorted(level_groups.items()):
+            group.sort(key=lambda n: (
+                getattr(n, 'i', None) if isinstance(getattr(n, 'i', None), int) else float('inf'),
+                n.name if hasattr(n, 'name') else '',
+            ))
+            with dot.subgraph(name=f"rank_{lvl}") as sg:
+                sg.attr(rank='same')
+                for n in group:
+                    color = color_map.get(res_key(n), '#d3d3d3')
+                    if isinstance(n, FusedModule):
+                        sub_ids = []
+                        for j, sub in enumerate(n.modules):
+                            sid = f"{id(n)}_sub_{j}"
+                            sg.node(sid, label=_node_label(sub), style='filled', fillcolor=color, shape='box', color='black', penwidth='1')
+                            sub_ids.append(sid)
+                        for a, b in zip(sub_ids, sub_ids[1:]):
+                            dot.edge(a, b)
+                        if sub_ids:
+                            rep_entry[n], rep_exit[n] = sub_ids[0], sub_ids[-1]
+                        else:
+                            rep_entry[n] = rep_exit[n] = str(id(n))
+                    else:
+                        nid = str(id(n))
+                        sg.node(nid, label=_node_label(n), style='filled', fillcolor=color, shape='box', fontcolor='black')
+                        rep_entry[n] = rep_exit[n] = nid
 
         for u, v in self._representation.edges():
             src = rep_exit.get(u, str(id(u)))
             dst = rep_entry.get(v, str(id(v)))
             dot.edge(src, dst)
+            #u_i = getattr(u, 'i', None)
+            #v_i = getattr(v, 'i', None)
+            # Cross-path edges (unindexed → indexed, or different .i) must not
+            # constrain rank to avoid pulling replica columns out of alignment.
+            #cross = (u_i is None and isinstance(v_i, int)) or (
+            #    isinstance(u_i, int) and isinstance(v_i, int) and u_i != v_i
+            #)
+            #dot.edge(src, dst, constraint='false' if cross else 'true')
 
         if keys:
             rows = ''.join([f"<TR><TD BGCOLOR='{color_map[k]}' FIXEDSIZE='TRUE' WIDTH='20' HEIGHT='14'></TD><TD ALIGN='LEFT'>&nbsp;{k}</TD></TR>" for k in keys])
@@ -338,5 +362,3 @@ def update_task_graph(task_graph: Workflow, groups: list[list[Module]]) -> Workf
 
 def optimize(workflow: Workflow) -> Workflow:
     return update_task_graph(workflow, mergeable_components(workflow))
-
-
