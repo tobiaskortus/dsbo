@@ -223,3 +223,67 @@ def test_with_remote_workdir_dryrun(mock_use_file_suffix, mock_create_subdir, mo
     assert mock_load.call_count == 0
     assert mock_create_subdir.call_count == 0
     assert mock_use_file_suffix.call_count == 0
+
+
+def test_abstract_path_eq():
+    a = AbstractPath("somepath")
+    b = AbstractPath("somepath")
+
+    assert a == b
+
+
+def test_abstract_file_path_neq():
+    a = AbstractPath("somepath")
+    b = AbstractPath("someotherpath")
+    
+    assert a != b
+
+
+def test_abstract_path_neq_incorrect_type():
+    a = AbstractPath("somepath")
+    
+    assert a != 1
+
+def test_abstract_file_path_eq():
+    a_path = AbstractPath("somepath")
+
+    a = AbstractFilePath(a_path, "file.npy", False)
+    b = AbstractFilePath(a_path, "file.npy", False)
+
+    assert a == b
+
+def test_abstract_file_path_neq_path():
+    a_path = AbstractPath("somepath")
+    b_path = AbstractPath("someotherpath")
+
+    a = AbstractFilePath(a_path, "file.npy", False)
+    b = AbstractFilePath(b_path, "file.npy", False)
+
+    assert a != b
+
+
+def test_abstract_file_path_neq_file():
+    a_path = AbstractPath("somepath")
+    b_path = AbstractPath("somepath")
+
+    a = AbstractFilePath(a_path, "file.npy", False)
+    b = AbstractFilePath(b_path, "file2.npy", False)
+
+    assert a != b
+
+def test_abstract_file_path_neq_uniue():
+    a_path = AbstractPath("somepath")
+    b_path = AbstractPath("somepath")
+
+    a = AbstractFilePath(a_path, "file.npy", False)
+    b = AbstractFilePath(b_path, "file.npy", True)
+
+    assert a != b
+
+
+def test_abstract_file_path_neq_incorrect_type():
+     a_path = AbstractPath("somepath")
+     a = AbstractFilePath(a_path, "file.npy", False)
+
+     assert a != 1
+
