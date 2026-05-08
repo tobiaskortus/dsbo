@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import torch
+import  torch.autograd.forward_ad as fw
+
 from enum import Enum
 from attr import field
 from numpy.char import lower, upper
@@ -222,7 +224,13 @@ class ParameterSpace:
                     parts.append(values[name])
         return torch.tensor(parts, dtype=torch.float32, requires_grad=requires_grad)
 
-    def sample(self, sampler: Sampler = None, requires_grad: bool = False) -> Candidate:
+    def sample(self, 
+               sampler: Sampler = None, 
+               requires_grad: bool = False,
+               sample_tangent: bool = False) -> Candidate:
+        
+        assert not (requires_grad and sample_tangent)
+
         s = sampler or self._sampler
         if s is None:
             raise RuntimeError("No sampler provided. Pass one to sample() or call register_sampler() first.")
@@ -230,8 +238,12 @@ class ParameterSpace:
         #TODO: this is hacky
         s.bind(self)
         t = s.ask()
+
         if requires_grad:
             t.requires_grad_(True)
+        if sample_tangent:
+            t = fw.make_dual(t, torch.rand_like(t))
+        
         return Candidate(self, t)
 
     def sample_batch(self, sampler: Sampler = None, batch_size: int = 16, requires_grad: bool = False) -> list[Candidate]:
