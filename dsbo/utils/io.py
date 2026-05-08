@@ -40,6 +40,12 @@ class AbstractPath:
             os.makedirs(workdir_path, exist_ok=True)
         
         return workdir_path
+    
+    def __eq__(self, other : "AbstractPath"):
+        if not isinstance(other, type(self)):
+            return False
+        
+        return self._path == other._path
 
     @property
     def pathname(self) -> str:
@@ -60,6 +66,15 @@ class AbstractFilePath:
         else:
             filename = self._filename
         return os.path.join(self._path(), filename)
+    
+
+    def __eq__(self, other: "AbstractFilePath"):
+        if not isinstance(other, type(self)):
+            return False
+
+        return (self._path == other._path and 
+                self._filename == other._filename and 
+                self._unique == other._unique)
 
     @property
     def filename(self) -> str:
