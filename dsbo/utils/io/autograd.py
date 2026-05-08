@@ -50,9 +50,9 @@ class AutogradFileInterface:
         primal, tangent = cls._get_primal_tangent(input)
 
         if tangent is None:
-            cls.write_primal(primal)
+            cls.write_primal(fpath, primal)
         else:
-            cls.write_primal_tangent(primal, tangent)
+            cls.write_primal_tangent(fpath, primal, tangent)
 
     @classmethod
     @abstractmethod
@@ -98,10 +98,10 @@ class NumpyFile(AutogradFileInterface):
             return x["primal"], None
 
     @classmethod
-    def write_primal(cls, primal):
-        np.savez_compressed("tensor.npz", primal=primal)
+    def write_primal(cls, fpath: str, primal):
+        np.savez_compressed(fpath, primal=primal)
     
     @classmethod
-    def write_primal_tangent(cls, primal, tangent):
-        np.savez_compressed("tensor.npz", primal=primal, tangent=tangent)
+    def write_primal_tangent(cls, fpath: str, primal, tangent):
+        np.savez_compressed(fpath, primal=primal, tangent=tangent)
     
