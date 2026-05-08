@@ -1,5 +1,6 @@
 import os
 import torch
+import warnings
 import matplotlib
 import networkx as nx
 from copy import deepcopy
@@ -362,3 +363,27 @@ def update_task_graph(task_graph: Workflow, groups: list[list[Module]]) -> Workf
 
 def optimize(workflow: Workflow) -> Workflow:
     return update_task_graph(workflow, mergeable_components(workflow))
+
+
+def validate_workflow_dependencies(workflow: Workflow, on_error: str = "warn"):
+    #TODO: change default on_error from "warn" to "raise" once the implementation is stable
+    assert on_error in ["raise", "warn", "ignore"]
+
+    G = workflow._representation
+    outputs = set()
+
+    def handle_on_error(node, input):
+        msg = f"Node {node} requires {input} but it is not available"
+
+        match on_error:
+            case "raise":  raise Exception(msg)
+            case "warn":   warnings.warn(msg)
+            case "ignore": pass
+
+    for node in nx.topological_sort(G):
+        if G.in_degree(node) != 0:
+            for input in node.registered_inputs:
+                if input not in outputs:
+                    handle_on_error(node, input)
+
+        outputs.update(node.registered_outputs)
