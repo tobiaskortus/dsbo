@@ -46,6 +46,9 @@ class AbstractPath:
             return False
         
         return self._path == other._path
+    
+    def __hash__(self):
+        return hash(self._path)
 
     @property
     def pathname(self) -> str:
@@ -75,6 +78,14 @@ class AbstractFilePath:
         return (self._path == other._path and 
                 self._filename == other._filename and 
                 self._unique == other._unique)
+    
+    def __hash__(self):
+        return hash((self._path, self._filename, self._unique))
+    
+    def __repr__(self):
+        name, ext = os.path.splitext(self._filename)
+        suffix = "_suffix" if self._unique else ""
+        return f"{type(self).__name__}({self._path.pathname}/{name}{suffix}{ext})"
 
     @property
     def filename(self) -> str:
