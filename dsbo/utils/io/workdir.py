@@ -1,9 +1,10 @@
-import functools
 import os
-from pathlib import Path
 import shutil
+import functools
 import contextvars
 from enum import Enum
+from pathlib import Path
+from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Generator, Generator, List, Optional, Set, Union
 
@@ -282,3 +283,17 @@ def with_remote_workdir(func: Callable) -> Callable:
                 with Workdir.use_file_suffix(suffix) if suffix else nullcontext():
                     return func(self, *args, **kwargs)
     return wrapper
+
+
+@dataclass(frozen=True)
+class PathAnnotation:
+    path: AbstractFilePath
+
+    def __call__(self):
+        return self.path()
+
+class Input(PathAnnotation):
+    pass
+    
+class Output(PathAnnotation):
+    pass
