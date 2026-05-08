@@ -271,9 +271,9 @@ def get_file_suffix() -> Optional[str]:
 
 def with_remote_workdir(func: Callable) -> Callable:
     @functools.wraps(func)
-    def wrapper(self, *args, **kwargs) -> Any:
+    def wrapper(*args, **kwargs) -> Any:
         if _is_dry_run():
-            return func(self, *args, **kwargs)
+            return func(*args, **kwargs)
         
         workdir = kwargs.pop("workdir", None)
         suffix = kwargs.pop("suffix", None)
@@ -281,7 +281,7 @@ def with_remote_workdir(func: Callable) -> Callable:
         with Workdir.load(workdir) if workdir else nullcontext():
             with Workdir.create_subdir(subdir) if subdir else nullcontext():
                 with Workdir.use_file_suffix(suffix) if suffix else nullcontext():
-                    return func(self, *args, **kwargs)
+                    return func(*args, **kwargs)
     return wrapper
 
 

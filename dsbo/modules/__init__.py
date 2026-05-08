@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import weakref
 from abc import ABC
 from contextlib import nullcontext
 from typing import Optional
 from functools import wraps
-import weakref
+from dsbo.autograd import autograd_context
 from dsbo.utils.io import Workdir, get_workdir
 from dsbo.modules.compile import dryrunnable, is_dry_run
 from dsbo.modules.dsl import ModuleDslMixin
@@ -61,11 +62,13 @@ class Module(ModuleDslMixin, ABC):
         suffix = f"[{self.i}]" if self.i is not None else ""
         return f"{type(self).__name__}{suffix}"
 
+    
+    @autograd_context
     @with_remote_workdir
     def run(self, design: dict, **kwargs):
         with nullcontext() if (is_dry_run() or get_workdir() is None) else WorkflowTaskLogger(self):
             with Workdir.use_file_suffix(str(self.i)) if self.i is not None else nullcontext():
-                return self(design=design)
+                return self(design=design, **kwargs)
 
     def to(self, resource: SlurmWorkerConfig):
         self.resources = resource
