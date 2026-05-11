@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.autograd.forward_ad as fw
 import numpy as np
@@ -17,7 +18,15 @@ class AutogradFileInterface:
                 return torch.from_numpy(primal)
         else:
             primal =  cls.open_primal(fpath)
-            return torch.from_numpy(primal)
+            x = torch.from_numpy(primal)
+
+            if torch.is_grad_enabled():
+                x.requires_grad_(True)
+                x.register_post_accumulate_grad_hook(
+                    lambda grad: cls.write_backward_gradient(grad.detach().cpu().numpy(), fpath)
+                )
+
+            return x
             
 
 
@@ -64,6 +73,13 @@ class AutogradFileInterface:
     def write_primal_tangent(cls, primal: np.array, tangent: np.array):
         pass
 
+    @classmethod
+    @abstractmethod
+    def write_backward_gradient(cls, gradient: np.array, fpath: str):
+        base, stem = os.path.splitext(fpath)
+        base += "_gradient"
+        np.savez_compressed(f"{base}{stem}", gradient=gradient)
+
         
     @classmethod
     def _get_primal_tangent(cls, input: torch.Tensor | tuple[np.ndarray | torch.Tensor, ...]) -> tuple[np.ndarray, ...]:
@@ -82,7 +98,6 @@ class AutogradFileInterface:
 class NumpyFile(AutogradFileInterface):    
     @classmethod
     def open_primal(cls, fpath):
-        print("HERE")
         return np.load(fpath)["primal"]
     
     @classmethod
