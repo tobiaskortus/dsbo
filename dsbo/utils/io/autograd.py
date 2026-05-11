@@ -1,12 +1,15 @@
 import os
 import torch
-import torch.autograd.forward_ad as fw
 import numpy as np
 from typing import overload
 from abc import ABC, abstractmethod
+import torch.autograd.forward_ad as fw
+from torch.utils.hooks import RemovableHandle
 
 
 class AutogradFileInterface:
+    handles: dict[str, RemovableHandle] = {}
+
     @classmethod
     def open(cls, fpath: str, device: str) -> torch.Tensor:
         if fw._current_level != -1:
@@ -22,9 +25,11 @@ class AutogradFileInterface:
 
             if torch.is_grad_enabled():
                 x.requires_grad_(True)
-                x.register_post_accumulate_grad_hook(
-                    lambda grad: cls.write_backward_gradient(grad.detach().cpu().numpy(), fpath)
+                handle = x.register_post_accumulate_grad_hook(
+                    lambda x: cls.write_backward_gradient(x.grad.detach().cpu().numpy(), fpath)
                 )
+
+                cls.handles[fpath] = handle
 
             return x
             
@@ -78,7 +83,16 @@ class AutogradFileInterface:
     def write_backward_gradient(cls, gradient: np.array, fpath: str):
         base, stem = os.path.splitext(fpath)
         base += "_gradient"
+
+        #if os.path.exists(f"{base}{stem}"):
+        #    #TODO: can this be always done like this?
+        #    existing = np.load(f"{base}{stem}")["gradient"]
+        #    gradient += existing
+
         np.savez_compressed(f"{base}{stem}", gradient=gradient)
+        
+        cls.handles[fpath].remove()
+        del cls.handles[fpath]
 
         
     @classmethod
