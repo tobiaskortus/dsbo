@@ -1,10 +1,13 @@
 from __future__ import annotations
+
+import weakref
 from copy import deepcopy
 from typing import Iterable, Mapping, overload
 
 
 class ModuleDslMixin:
     i: int | None
+    _replica_counts: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
     def replicate(self, i: int) -> ModuleDslMixin:
         """Shallow copy of object with updated .i for repeated elements. 
@@ -53,7 +56,9 @@ class ModuleDslMixin:
     def __mul__(self, other: int | Dynamic) -> DependencyDict | Dynamic:
         match other:
             case int():
-                reps = [self.replicate(i) for i in range(other)]
+                start = ModuleDslMixin._replica_counts.get(self, 0)
+                reps = [self.replicate(start + i) for i in range(other)]
+                ModuleDslMixin._replica_counts[self] = start + other
                 dd = DependencyDict({r: [] for r in reps})
                 dd.groups = [DependencyGroup(
                     template=self,
