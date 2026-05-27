@@ -5,8 +5,11 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+import torch
+
 from dsbo.modules import Module
 from dsbo.utils.io import Workdir
+from dsbo.utils.io.autograd import NumpyFile
 
 READERS = {
     ".csv":     pd.read_csv,
@@ -79,6 +82,26 @@ class DataFrameMergeTransform(SimulationTransform):
         output_path = self.output_file()
         save_df_by_extension(df, output_path)
 
+
+class NumpyAutogradMergeTransform(SimulationTransform):
+    def __init__(self, pattern: str, output_name: str) -> None:
+        super().__init__()
+        self.pattern = pattern
+        self.simulation_dir = Workdir.register("simulation")
+        self.output_file = Workdir.register_file("simulation", f"{output_name}.npz", unique_filename=False)
+
+    def transform(self, design, **kwargs):
+        simulation_files = Path(self.simulation_dir()).glob(self.pattern)
+        arrays = []
+        for simulation_file in simulation_files:
+            arr = NumpyFile.open(simulation_file, "cpu")
+            arrays.append(arr)
+            os.remove(simulation_file)
+
+        assert len(arrays) > 0, "No simulation files found to merge."
+            
+        merged_array = torch.cat(arrays)
+        NumpyFile.write(self.output_file(), merged_array)
 
 class NumpyRecordMergeTransform(SimulationTransform):
     def __init__(self, pattern: str, output_name: str, transform: Callable[[np.recarray], np.recarray] | None = None) -> None:
