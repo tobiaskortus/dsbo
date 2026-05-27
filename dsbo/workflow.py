@@ -11,6 +11,7 @@ from itertools import groupby
 from typing import Iterable, List
 from contextlib import nullcontext
 import matplotlib.colors as mcolors
+import torch.autograd.forward_ad as fw
 from IPython.display import Image, display
 
 from dsbo.modules import Module
@@ -115,6 +116,8 @@ class Workflow:
         with torch.no_grad():
             from dsbo.worker.dask import WorkerContext
             worker = WorkerContext.get_current_worker()
+            is_forward_ad = fw._current_level > -1
+            is_grad_enabled = torch.is_grad_enabled()
 
             if worker is None:
                 batch_results = []
@@ -124,7 +127,12 @@ class Workflow:
                             results = {}
                             for batch in self.iterate_dependent_task_groups():
                                 for task in batch:
-                                    result = task.run(design=candidate.values)
+                                    result = task.run(
+                                        design=candidate.values,
+                                        is_forward_ad=is_forward_ad,
+                                        is_grad_enabled=is_grad_enabled,
+                                        unpack_design=True,
+                                    )
                                     results.update(result)
                             batch_results.append(results)
                         except Exception as e:
