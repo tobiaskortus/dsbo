@@ -22,6 +22,21 @@ def _unpack(m: dict[str, Any]) -> dict[str, Any]:
     return {k: (fw.make_dual(v.primal, v.tangent) if isinstance(v, SerializedTensor) and v.tangent is not None and fw._current_level != -1 else v.primal if isinstance(v, SerializedTensor) else v) for k, v in m.items()}
 
 
+def train_op(func: Callable):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        level = fw._current_level
+        for _ in range(level + 1):
+            fw.exit_dual_level()
+        try:
+            with torch.enable_grad():
+                return func(*args, **kwargs)
+        finally:
+            for _ in range(level + 1):
+                fw.enter_dual_level()
+    return wrapper
+
+
 def autograd_context(func: Callable):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
