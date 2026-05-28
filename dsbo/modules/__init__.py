@@ -5,6 +5,7 @@ from abc import ABC
 from contextlib import nullcontext
 from typing import Optional
 from functools import wraps
+from dsbo.utils.io import Output, Input
 from dsbo.autograd import autograd_context
 from dsbo.utils.io import Workdir, get_workdir
 from dsbo.modules.compile import dryrunnable, is_dry_run
@@ -18,6 +19,9 @@ class Module(ModuleDslMixin, ABC):
 
     def __init__(self):
         self._registered_files = {}
+        self._registered_inputs = []
+        self._registered_outputs = []
+
         self.i: int | None = None
         self.resources = None
 
@@ -51,8 +55,20 @@ class Module(ModuleDslMixin, ABC):
 
         super().__setattr__(name, value)
 
+        #TODO: define a clear policy when Inputs and Outputs should be registered
+        # and when AbstractFilePath should be alloweds -> important to keep track of files 
+        # in e.g. MergeTransforms.
         if isinstance(value, AbstractFilePath):
             self._registered_files[name] = value
+
+        if isinstance(value, (Input, Output)):
+            self._registered_files[name] = value.path
+
+            if isinstance(value, Input):
+                self._registered_inputs += [value.path]
+            else:
+                self._registered_outputs += [value.path]
+
 
     def __repr__(self):
         return self.name
