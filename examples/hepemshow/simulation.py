@@ -36,7 +36,7 @@ class HepEmShowSimulation(SimulationBase):
                  num_events: int = 100, 
                  num_sims_per_particle: int = 10, 
                  particle_energy_min: float = 1000,
-                 particle_energy_max: float = 100_000,
+                 particle_energy_max: float = 50_000,
                  **kwargs):
         
         super().__init__(**kwargs)
@@ -46,6 +46,7 @@ class HepEmShowSimulation(SimulationBase):
         self.particle_energy_min = particle_energy_min
         self.particle_energy_max = particle_energy_max
 
+        self.target_file = Output(Workdir.register_file(DefaultPaths.SIMULATION, "target.npz", unique_filename=True))
         self.simulation_file = Output(Workdir.register_file(DefaultPaths.SIMULATION, "simulation.npz", unique_filename=True))
 
     def simulate(self, design):
@@ -57,10 +58,10 @@ class HepEmShowSimulation(SimulationBase):
 
         hepem_data = get_hepemshow_data_file()
 
-        absorbers = design["absober"].numpy()
+        absorbers = design["absorber"].numpy()
         gaps = design["gap"].numpy()
 
-        absorbers_dot = fw.unpack_dual(design["absober"]).tangent.numpy()
+        absorbers_dot = fw.unpack_dual(design["absorber"]).tangent.numpy()
         gaps_dot = fw.unpack_dual(design["gap"]).tangent.numpy()
 
         # Arguments for simulating positrons
@@ -101,10 +102,12 @@ class HepEmShowSimulation(SimulationBase):
 
         edep_per_layer, edep_per_layer_dot, particle_energies = _merge(results)
         edep_per_layer = fw.make_dual(
-            torch.from_numpy(edep_per_layer).to(design["absober"].device),
-            torch.from_numpy(edep_per_layer_dot).to(design["absober"].device),
+            torch.from_numpy(edep_per_layer).to(design["absorber"].device),
+            torch.from_numpy(edep_per_layer_dot).to(design["absorber"].device),
         )
 
-        particle_energies = torch.from_numpy(particle_energies).to(design["absober"].device)
+        particle_energies = torch.from_numpy(particle_energies).to(design["absorber"].device)
+        combined_targets = torch.stack([target, particle_energies], dim=1)
 
+        NumpyFile.write(self.target_file(), combined_targets)
         NumpyFile.write(self.simulation_file(), edep_per_layer)

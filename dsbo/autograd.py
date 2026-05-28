@@ -23,6 +23,9 @@ def _unpack(m: dict[str, Any]) -> dict[str, Any]:
 
 
 def train_op(func: Callable):
+    if hasattr(func, '_wrapped_fn'):
+        return type(func)(train_op(func._wrapped_fn))
+
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         level = fw._current_level

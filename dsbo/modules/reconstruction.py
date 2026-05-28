@@ -12,15 +12,15 @@ class ReconstructionBase(Module):
         super().__init__()
 
     def __call__(self, design: dict, **kwargs) -> Optional[dict[str, float]]:
-        self.train()
-        return self.validate()
+        self.train(design, **kwargs)
+        return self.validate(design, **kwargs)
     
     @abstractmethod
-    def train(self) -> None:
+    def train(self, design=None, **kwargs) -> None:
         pass
     
     @abstractmethod
-    def validate(self) -> Optional[dict[str, float]]:
+    def validate(self, design=None, **kwargs) -> Optional[dict[str, float]]:
         pass
 
 
