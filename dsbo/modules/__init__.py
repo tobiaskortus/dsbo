@@ -22,6 +22,8 @@ class Module(ModuleDslMixin, ABC):
         self._registered_inputs = []
         self._registered_outputs = []
 
+        self._alias = None
+
         self.i: int | None = None
         self.resources = None
 
@@ -76,7 +78,8 @@ class Module(ModuleDslMixin, ABC):
     @property
     def name(self) -> str:
         suffix = f"[{self.i}]" if self.i is not None else ""
-        return f"{type(self).__name__}{suffix}"
+        name = type(self).__name__ if self._alias is None else self._alias
+        return f"{name}{suffix}"
 
     
     @autograd_context
@@ -88,6 +91,10 @@ class Module(ModuleDslMixin, ABC):
 
     def to(self, resource: SlurmWorkerConfig):
         self.resources = resource
+        return self
+    
+    def set_alias(self, alias: str):
+        self._alias = alias
         return self
 
     @property
