@@ -9,7 +9,7 @@ from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Generator, Generator, List, Optional, Set, Union
 
 def _is_dry_run():
-    from dsbo.modules.compile import is_dry_run
+    from dsbo.utils.compile import is_dry_run
     return is_dry_run()
 
 

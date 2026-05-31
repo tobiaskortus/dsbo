@@ -19,6 +19,8 @@ def _pack(m: dict[str, Any]) -> dict[str, Any]:
 
 
 def _unpack(m: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(m, dict):
+        return m
     return {k: (fw.make_dual(v.primal, v.tangent) if isinstance(v, SerializedTensor) and v.tangent is not None and fw._current_level != -1 else v.primal if isinstance(v, SerializedTensor) else v) for k, v in m.items()}
 
 

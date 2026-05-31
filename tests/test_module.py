@@ -33,7 +33,7 @@ def test_module_init_subclass_wrapped(dryrunnable_mock):
     assert dryrunnable_mock.call_count == 1
 
 
-@patch('dsbo.modules.compile.is_dry_run', return_value=True)
+@patch('dsbo.utils.compile.is_dry_run', return_value=True)
 @patch('time.sleep')
 def test_dryrunnable(mock_sleep, mock_dry_run):
     module = DefaultModuleMock()

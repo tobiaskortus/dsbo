@@ -96,6 +96,24 @@ class DaskWorkerBase:
 
         return task_id, delayed_obj
 
+    def schedule_backward(self, module: Module, candidate, grad_output=None, dependencies: Iterable = (), priority: int | None = None) -> tuple[uuid.UUID, Delayed]:
+        suffix = get_file_suffix()
+        subdir = get_subdir()
+        workdir = getattr(get_workdir(), "workdir_root", None)
+        resources = getattr(module.resources, "resources", None)
+        task_id = uuid.uuid4()
+
+        def _backward_wrapper(module, candidate, *deps):
+            grad_candidate = candidate.detach().requires_grad_()
+            with torch.enable_grad():
+                module.backward(grad_candidate.values, grad_output, workdir=workdir, suffix=suffix, subdir=subdir)
+            return task_id, grad_candidate.grad.clone() if grad_candidate.grad is not None else None
+
+        with dask.annotate(resources=(resources or {}), priority=priority):
+            delayed_obj = delayed(_backward_wrapper, name=f"{module.name}_bwd")(module, candidate, *dependencies)
+
+        return task_id, delayed_obj
+
 class WorkerContext:
     _current_worker = contextvars.ContextVar("current_worker", default=None)
 

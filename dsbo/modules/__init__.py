@@ -8,42 +8,49 @@ from functools import wraps
 from dsbo.utils.io import Output, Input
 from dsbo.autograd import autograd_context
 from dsbo.utils.io import Workdir, get_workdir
-from dsbo.modules.compile import dryrunnable, is_dry_run
+from dsbo.utils.compile import dryrunnable, is_dry_run
 from dsbo.modules.dsl import ModuleDslMixin
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import AbstractFilePath, with_remote_workdir
 from dsbo.worker.config import SlurmWorkerConfig
 
 
+def ensure_dict_return(fn):
+    @wraps(fn)
+    def _inner(*args, **kwargs):
+        res = fn(*args, **kwargs)
+        return {} if res is None else res
+    return _inner
+
+
+def auto_wrap(cls, method_name, *decorators):
+    raw = cls.__dict__.get(method_name)
+    if raw is None or getattr(raw, "_dsbo_wrapped", False):
+        return
+    wrapped = raw
+    for decorator in decorators:
+        wrapped = decorator(wrapped)
+    setattr(wrapped, "_dsbo_wrapped", True)
+    setattr(cls, method_name, wrapped)
+
+
 class Module(ModuleDslMixin, ABC):
 
     def __init__(self):
-        self._registered_files = {}
-        self._registered_inputs = []
-        self._registered_outputs = []
+        self._registered_files: dict[str, AbstractFilePath] = {}
+        self._registered_inputs: list[AbstractFilePath] = []
+        self._registered_outputs: list[AbstractFilePath] = []
 
-        self._alias = None
+        self._alias: str | None = None
+        self._seed: int | None = None
 
         self.i: int | None = None
-        self.resources = None
+        self.resources: SlurmWorkerConfig | None = None
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        raw = cls.__dict__.get("__call__")
-        if raw is None or getattr(raw, "_dsbo_wrapped", False):
-            return
-
-        def ensure_dict_return(fn):
-            @wraps(fn)
-            def _inner(*args, **kwargs):
-                res = fn(*args, **kwargs)
-                return {} if res is None else res
-            return _inner
-
-        wrapped = dryrunnable(raw)
-        wrapped = ensure_dict_return(wrapped)
-        setattr(wrapped, "_dsbo_wrapped", True)
-        setattr(cls, "__call__", wrapped)
+        auto_wrap(cls, "__call__", dryrunnable, ensure_dict_return)
+        auto_wrap(cls, "backward", with_remote_workdir)
 
     @dryrunnable
     def __call__(self, design: dict, **kwargs) -> Optional[dict[str, float]]:
@@ -88,13 +95,20 @@ class Module(ModuleDslMixin, ABC):
         with nullcontext() if (is_dry_run() or get_workdir() is None) else WorkflowTaskLogger(self):
             with Workdir.use_file_suffix(str(self.i)) if self.i is not None else nullcontext():
                 return self(design=design, **kwargs)
+            
+    def backward(self, design: dict, grad_output: dict | None = None) -> None:
+        pass
 
-    def to(self, resource: SlurmWorkerConfig):
+    def to(self, resource: SlurmWorkerConfig) -> Module:
         self.resources = resource
         return self
     
-    def set_alias(self, alias: str):
+    def set_alias(self, alias: str) -> Module:
         self._alias = alias
+        return self
+
+    def set_seed(self, seed: int) -> Module:
+        self._seed = seed
         return self
 
     @property

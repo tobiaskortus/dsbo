@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import torch
 import warnings
@@ -15,12 +17,12 @@ import torch.autograd.forward_ad as fw
 from IPython.display import Image, display
 
 from dsbo.modules import Module
-from dsbo.parameters import Candidate
-from dsbo.modules.compile import dry_run
+from dsbo.utils.compile import dry_run
 from dsbo.modules.dsl import DependencyDict
 from dsbo.utils.io import Workdir, get_subdir
 from dsbo.storage import get_current_storage
 from dsbo.worker.config import SlurmWorkerConfig
+from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.backends.aido.surrogate import LocalSurrogate
 from dsbo.utils.io import Workdir, get_subdir, get_workdir
 
@@ -95,6 +97,215 @@ def get_dependent_task_groups(G: nx.DiGraph):
     ]
 
 
+def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()) -> List[dict]:
+    with torch.no_grad():
+        from dsbo.worker.dask import WorkerContext
+        worker = WorkerContext.get_current_worker()
+        is_forward_ad = fw._current_level > -1
+        is_grad_enabled = torch.is_grad_enabled()
+
+        if worker is None:
+            batch_results = []
+            for i, candidate in enumerate(candidates):
+                with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
+                    try:
+                        results = {}
+                        for batch in workflow.iterate_dependent_task_groups():
+                            for task in batch:
+                                result = task.run(
+                                    design=candidate.values,
+                                    is_forward_ad=is_forward_ad,
+                                    is_grad_enabled=is_grad_enabled,
+                                    unpack_design=True,
+                                )
+                                results.update(result)
+                        batch_results.append(results)
+                    except Exception as e:
+                        batch_results.append({})
+                        if not isinstance(e, catch):
+                            raise
+            return batch_results
+        else:
+            batch_delays = []
+            batch_task_ids = []
+            task_map: dict[str, str] = {}
+            name_map: dict[str, str] = {}
+            exec_ids = []
+            batch_path = getattr(get_workdir(), "root", None)
+            for i, candidate in enumerate(candidates):
+                with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
+                    delayed_map = {}
+                    task_ids = []
+                    wdir = getattr(get_workdir(), "root", None)
+                    subdir = get_subdir()
+                    exec_id = os.path.join(wdir, subdir) if (wdir and subdir) else wdir
+                    exec_ids.append(exec_id)
+                    for depth, batch in enumerate(workflow.iterate_dependent_task_groups()):
+                        for task in batch:
+                            dependencies = [delayed_map[p] for p in workflow._representation.predecessors(task)]
+                            task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
+                            delayed_map[task] = delayed_obj
+                            task_ids.append(task_id)
+                            batch_delays.append(delayed_obj)
+                            task_map[delayed_obj.key] = exec_id
+                            name_map[delayed_obj.key] = task.name
+                    batch_task_ids.append(task_ids)
+
+            storage = get_current_storage()
+            if storage is not None:
+                wf_record = storage.workflow.add_workflow(workflow._representation)
+                storage.workflow.add_runs(wf_record, exec_ids, batch_path)
+                plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
+                worker.client.register_plugin(plugin, name="dsbo_task_stream")
+
+            futures_computed = worker.compute(batch_delays)
+            results_flat = worker.gather(futures_computed, catch=catch)
+            lookup = {task_id: result for task_id, result in results_flat}
+            return [dict(chain.from_iterable(lookup.get(tid, {}).items() for tid in tids))
+                    for tids in batch_task_ids]
+
+
+def run_batch_reverse_autograd(
+    workflow: Workflow,
+    candidates: Sequence[Candidate],
+    grad_outputs: List[dict],
+    catch: tuple[Exception, ...] = (),
+) -> List[torch.Tensor]:
+    from dsbo.worker.dask import WorkerContext
+    from dsbo.utils.io.autograd import NumpyFile
+    worker = WorkerContext.get_current_worker()
+
+    G = workflow._representation
+    tasks_rev = list(reversed(list(nx.topological_sort(G))))
+
+    if worker is None:
+        gradients = []
+        for candidate, candidate_grad_output in zip(candidates, grad_outputs):
+            try:
+                grad_candidate = candidate.detach().requires_grad_()
+                with torch.enable_grad():
+                    NumpyFile.reset_gradient_state()
+                    for task in tasks_rev:
+                        is_sink = len(list(G.successors(task))) == 0
+                        task.backward(grad_candidate.values, candidate_grad_output if is_sink else None)
+                gradients.append(
+                    grad_candidate.grad.clone() if grad_candidate.grad is not None else torch.zeros_like(candidate.tensor)
+                )
+            except Exception as e:
+                gradients.append(torch.zeros_like(candidate.tensor))
+                if not isinstance(e, catch):
+                    raise
+        return gradients
+    else:
+        batch_delays = []
+        batch_task_ids = []
+        task_map: dict[str, str] = {}
+        name_map: dict[str, str] = {}
+        exec_ids = []
+        batch_path = getattr(get_workdir(), "root", None)
+
+        for i, candidate in enumerate(candidates):
+            candidate_grad_output = grad_outputs[i]
+            with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
+                delayed_map = {}
+                task_ids = []
+                wdir = getattr(get_workdir(), "root", None)
+                subdir = get_subdir()
+                exec_id = os.path.join(wdir, subdir) if (wdir and subdir) else wdir
+                exec_ids.append(exec_id)
+
+                for depth, task in enumerate(tasks_rev):
+                    forward_succs = list(G.successors(task))
+                    is_sink = len(forward_succs) == 0
+                    dependencies = [delayed_map[s] for s in forward_succs]
+                    task_grad_output = candidate_grad_output if is_sink else None
+
+                    task_id, delayed_obj = worker.schedule_backward(
+                        task, candidate, grad_output=task_grad_output,
+                        dependencies=dependencies, priority=depth,
+                    )
+                    delayed_map[task] = delayed_obj
+                    task_ids.append(task_id)
+                    batch_delays.append(delayed_obj)
+                    task_map[delayed_obj.key] = exec_id
+                    name_map[delayed_obj.key] = task.name
+                batch_task_ids.append(task_ids)
+
+        storage = get_current_storage()
+        if storage is not None:
+            wf_record = storage.workflow.add_workflow(G)
+            storage.workflow.add_runs(wf_record, exec_ids, batch_path)
+            plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
+            worker.client.register_plugin(plugin, name="dsbo_task_stream_bwd")
+
+        futures_computed = worker.compute(batch_delays)
+        results_flat = worker.gather(futures_computed, catch=catch)
+        lookup = {tid: grad for tid, grad in results_flat if grad is not None}
+
+        gradients = []
+        for candidate, task_ids in zip(candidates, batch_task_ids):
+            combined = sum(
+                (lookup[tid] for tid in task_ids if tid in lookup),
+                start=torch.zeros_like(candidate.tensor),
+            )
+            gradients.append(combined)
+        return gradients
+
+
+def candidates_from_tensor(tensor: torch.Tensor, space: ParameterSpace) -> List[Candidate]:
+    return [Candidate(space, tensor[i]) for i in range(tensor.shape[0])]
+
+
+class RunBatchAutogradFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, workflow, design_tensors: torch.Tensor, space: ParameterSpace):
+        ctx.workflow = workflow
+        ctx.space = space
+        ctx.save_for_backward(design_tensors)
+
+        candidates = candidates_from_tensor(design_tensors, space)
+        results = run_batch(workflow, candidates)
+        ctx.result_keys = list(results[0].keys()) if results else []
+
+        #Handle cases where all tasks failed by throwing an error
+        if not ctx.result_keys:
+            return design_tensors.new_zeros(design_tensors.shape[0])
+
+        vals = torch.tensor(
+            [[float(r[k]) for k in ctx.result_keys] for r in results],
+            dtype=design_tensors.dtype,
+        )
+        return vals.squeeze(-1) if len(ctx.result_keys) == 1 else vals
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (design_tensors,) = ctx.saved_tensors
+        candidates = candidates_from_tensor(design_tensors, ctx.space)
+
+        grad_output_tensor = grad_output.view(len(candidates), -1)
+        grad_outputs = [
+            {k: grad_output_tensor[i, j] for j, k in enumerate(ctx.result_keys)}
+            for i in range(len(candidates))
+        ]
+
+        gradients = run_batch_reverse_autograd(ctx.workflow, candidates, grad_outputs, catch=(RuntimeError,))
+        return None, torch.stack(gradients, dim=0), None
+
+
+def implements_backward(module: Module) -> bool:
+    return type(module).backward is not Module.backward
+
+
+def assert_workflow_supports_backward_ad(workflow: Workflow) -> None:
+    unsupported = [m for m in workflow._representation.nodes()
+                   if isinstance(m, Module) and not implements_backward(m)]
+    if unsupported:
+        raise AssertionError(
+            f"Modules {unsupported} do not implement backward(), "
+            "which is required for reverse-mode AD."
+        )
+
+
 class Workflow:
     def __init__(self, dependencies: dict[Module, Iterable[Module]] | Module) -> None:
 
@@ -111,78 +322,14 @@ class Workflow:
     def run(self, design: Candidate, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
         return self.run_batch([design], catch=catch)[0]
 
-    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()) -> List[dict[str, float]]:
-
-        with torch.no_grad():
-            from dsbo.worker.dask import WorkerContext
-            worker = WorkerContext.get_current_worker()
-            is_forward_ad = fw._current_level > -1
-            is_grad_enabled = torch.is_grad_enabled()
-
-            if worker is None:
-                batch_results = []
-                for i, candidate in enumerate(candidates):
-                    with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
-                        try:
-                            results = {}
-                            for batch in self.iterate_dependent_task_groups():
-                                for task in batch:
-                                    result = task.run(
-                                        design=candidate.values,
-                                        is_forward_ad=is_forward_ad,
-                                        is_grad_enabled=is_grad_enabled,
-                                        unpack_design=True,
-                                    )
-                                    results.update(result)
-                            batch_results.append(results)
-                        except Exception as e:
-                            batch_results.append({})
-                            if not isinstance(e, catch):
-                                raise
-                        
-                return batch_results
-            else:
-                batch_delays = []
-                batch_task_ids = []
-                task_map: dict[str, str] = {}
-                name_map: dict[str, str] = {}
-                exec_ids = []
-                batch_path = getattr(get_workdir(), "root", None)
-                for i, candidate in enumerate(candidates):
-                    with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
-                        delayed_map = {}
-                        task_ids = []
-                        wdir = getattr(get_workdir(), "root", None)
-                        subdir = get_subdir()
-                        exec_id = os.path.join(wdir, subdir) if (wdir and subdir) else wdir
-                        exec_ids.append(exec_id)
-                        for depth, batch in enumerate(self.iterate_dependent_task_groups()):
-                            for task in batch:
-                                dependencies = [delayed_map[p] for p in self._representation.predecessors(task)]
-                                task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
-                                delayed_map[task] = delayed_obj
-                                task_ids.append(task_id)
-                                batch_delays.append(delayed_obj)
-                                task_map[delayed_obj.key] = exec_id
-                                name_map[delayed_obj.key] = task.name
-
-                        batch_task_ids.append(task_ids)
-
-                storage = get_current_storage()
-                if storage is not None:
-                    wf_record = storage.workflow.add_workflow(self._representation)
-                    storage.workflow.add_runs(wf_record, exec_ids, batch_path)
-                    plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
-                    worker.client.register_plugin(plugin, name="dsbo_task_stream")
-
-                futures_computed = worker.compute(batch_delays)
-                results_flat = worker.gather(futures_computed, catch=catch)
-
-                lookup = {task_id: result for task_id, result in results_flat}
-
-                return [dict(chain.from_iterable(lookup.get(tid, {}).items() \
-                            for tid in tids)) \
-                            for tids in batch_task_ids]
+    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()):
+        if fw._current_level > -1 or not torch.is_grad_enabled():
+            with torch.no_grad():
+                return run_batch(self, candidates, catch)
+        else:
+            design_tensors = torch.stack([c.tensor for c in candidates])
+            space = candidates[0].space
+            return RunBatchAutogradFn.apply(self, design_tensors, space)
 
 
     def iterate_dependent_task_groups(self):

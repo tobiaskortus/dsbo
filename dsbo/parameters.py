@@ -182,6 +182,17 @@ class Candidate:
         return self.space._decode_values(self.tensor)
     
 
+    def detach(self) -> Candidate:
+        return Candidate(self.space, self.tensor.detach().clone())
+
+    def requires_grad_(self, requires_grad: bool = True) -> Candidate:
+        self.tensor.requires_grad_(requires_grad)
+        return self
+
+    @property
+    def grad(self) -> Optional[torch.Tensor]:
+        return self.tensor.grad
+
     def sample_tangent(self) -> Candidate:
         primal, _ = fw.unpack_dual(self.tensor)
         return Candidate(self.space, fw.make_dual(primal, torch.rand_like(primal)))
