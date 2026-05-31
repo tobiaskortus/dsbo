@@ -153,11 +153,20 @@ class InMemoryFile(AutogradFileInterface):
 
     @classmethod
     def open_primal(cls, fpath: str) -> np.ndarray:
-        return cls._storage[fpath].cpu().numpy()
+        value = cls._storage[fpath]
+        if isinstance(value, dict):
+            value = value["primal"]
+        return value.cpu().numpy()
 
     @classmethod
     def open_primal_tangent(cls, fpath: str) -> tuple[np.ndarray, np.ndarray | None]:
-        return cls.open_primal(fpath), None
+        value = cls._storage[fpath]
+        if isinstance(value, dict):
+            primal = value["primal"].cpu().numpy()
+            tangent = value.get("tangent")
+            tangent = tangent.cpu().numpy() if tangent is not None else None
+            return primal, tangent
+        return value.cpu().numpy(), None
 
     @classmethod
     def write_primal(cls, fpath: str, primal: np.ndarray):
@@ -165,7 +174,10 @@ class InMemoryFile(AutogradFileInterface):
 
     @classmethod
     def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray):
-        cls.write_primal(fpath, primal)
+        cls._storage[fpath] = {
+            "primal": torch.from_numpy(primal),
+            "tangent": torch.from_numpy(tangent),
+        }
 
     @classmethod
     def _load_gradient(cls, grad_path: str) -> np.ndarray:
