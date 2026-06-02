@@ -10,11 +10,11 @@ from typing import Sequence
 from itertools import chain
 from graphviz import Digraph
 from itertools import groupby
-from typing import Iterable, List
 from contextlib import nullcontext
 import matplotlib.colors as mcolors
 import torch.autograd.forward_ad as fw
 from IPython.display import Image, display
+from typing import Iterable, List, Any, overload
 
 from dsbo.modules import Module
 from dsbo.utils.compile import dry_run
@@ -25,6 +25,39 @@ from dsbo.worker.config import SlurmWorkerConfig
 from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.backends.aido.surrogate import LocalSurrogate
 from dsbo.utils.io import Workdir, get_subdir, get_workdir
+
+
+class ResultsBatch(list):
+    @overload
+    def __init__(self, items: list[dict[str, Any]]) -> None: ...
+
+    @overload
+    def __init__(self, *items: dict[str, Any]) -> None: ...
+
+    def __init__(self, *items):
+        if len(items) == 1 and isinstance(items[0], list):
+            super().__init__(items[0])
+        else:
+            super().__init__(items)
+
+    @overload
+    def __getitem__(self, key: int) -> torch.Tensor: ...
+
+    @overload
+    def __getitem__(self, key: str) -> list[dict]: ...
+
+    def __getitem__(self, key: int | str):
+        if isinstance(key, int):
+            return super().__getitem__(key)
+
+        values: list[Any] = []
+        values = list(chain.from_iterable(item[key] for item in self))
+
+        if values and isinstance(values[0], torch.Tensor):
+            if all(isinstance(v, torch.Tensor) for v in values):
+                return torch.stack(values)
+
+        return values
 
 
 class FusedModule(Module):
