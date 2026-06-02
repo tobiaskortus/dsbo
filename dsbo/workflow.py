@@ -289,6 +289,17 @@ def candidates_from_tensor(tensor: torch.Tensor, space: ParameterSpace) -> List[
     return [Candidate(space, tensor[i]) for i in range(tensor.shape[0])]
 
 
+def to_1d_tensor(v: Any, dtype: torch.dtype) -> torch.Tensor:
+    if isinstance(v, torch.Tensor): t = v.detach().to(dtype)
+    else: t = torch.tensor(float(v), dtype=dtype)
+    if t.dim() > 1:
+        raise ValueError(
+            f"Result values must be scalar or 1-D tensors, got shape {t.shape}. "
+            "Flatten higher-dimensional outputs before returning them from a Module."
+        )
+    return t.reshape(-1)
+
+
 class RunBatchAutogradFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, workflow, design_tensors: torch.Tensor, space: ParameterSpace):
@@ -300,25 +311,37 @@ class RunBatchAutogradFn(torch.autograd.Function):
         results = run_batch(workflow, candidates)
         ctx.result_keys = list(results[0].keys()) if results else []
 
-        #Handle cases where all tasks failed by throwing an error
         if not ctx.result_keys:
-            return design_tensors.new_zeros(design_tensors.shape[0])
+            return design_tensors.new_zeros(design_tensors.shape[0]), [], {}, {}
 
-        vals = torch.tensor(
-            [[float(r[k]) for k in ctx.result_keys] for r in results],
-            dtype=design_tensors.dtype,
-        )
-        return vals.squeeze(-1) if len(ctx.result_keys) == 1 else vals
+        dtype = design_tensors.dtype
+        first = results[0]
+
+        flat = [[to_1d_tensor(r[k], dtype) for k in ctx.result_keys] for r in results]
+
+        ctx.splits = [t.shape[0] for k, t in zip(ctx.result_keys, flat[0])]
+        ctx.result_is_scalar = {
+            k: (not isinstance(first[k], torch.Tensor) or first[k].dim() == 0)
+            for k in ctx.result_keys
+        }
+
+        vals = torch.stack([torch.cat(r) for r in flat])
+        return vals, ctx.result_keys, ctx.splits, ctx.result_is_scalar
+
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, _, __, ___):
         (design_tensors,) = ctx.saved_tensors
         candidates = candidates_from_tensor(design_tensors, ctx.space)
+        n = len(candidates)
 
-        grad_output_tensor = grad_output.view(len(candidates), -1)
+        grad_flat = grad_output.view(n, -1)
         grad_outputs = [
-            {k: grad_output_tensor[i, j] for j, k in enumerate(ctx.result_keys)}
-            for i in range(len(candidates))
+            {
+                k: (chunk.squeeze(0) if ctx.result_is_scalar[k] else chunk)
+                for chunk, k in zip(torch.split(grad_flat[i], ctx.splits), ctx.result_keys)
+            }
+            for i in range(n)
         ]
 
         gradients = run_batch_reverse_autograd(ctx.workflow, candidates, grad_outputs, catch=(RuntimeError,))
@@ -362,7 +385,16 @@ class Workflow:
         else:
             design_tensors = torch.stack([c.tensor for c in candidates])
             space = candidates[0].space
-            return RunBatchAutogradFn.apply(self, design_tensors, space)
+            vals, keys, splits, is_scalar = RunBatchAutogradFn.apply(self, design_tensors, space)
+            if not keys: return [{} for _ in candidates]
+
+            return ResultsBatch([
+                {
+                    k: (chunk.squeeze(0) if is_scalar[k] else chunk)
+                    for chunk, k in zip(torch.split(vals[i], splits), keys)
+                }
+                for i in range(len(candidates))
+            ])
 
 
     def iterate_dependent_task_groups(self):
