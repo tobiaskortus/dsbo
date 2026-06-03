@@ -195,7 +195,7 @@ class Candidate:
 
     def sample_tangent(self) -> Candidate:
         primal, _ = fw.unpack_dual(self.tensor)
-        return Candidate(self.space, fw.make_dual(primal, torch.rand_like(primal)))
+        return Candidate(self.space, fw.make_dual(primal, torch.randn_like(primal)))
     
     def set_tangent(self, tangent: torch.Tensor) -> Candidate:
         assert self.tensor.shape == tangent.shape, "Tangent must have the same shape as the primal tensor"
