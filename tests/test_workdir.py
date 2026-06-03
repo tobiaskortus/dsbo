@@ -11,6 +11,7 @@ from dsbo.utils.io import AbstractFilePath, AbstractPath, DefaultPaths, Workdir,
 @patch('os.path.exists', return_value=False)
 @patch('os.makedirs')
 def test_register_path(mock_makedirs, mock_exists):
+    Workdir._registered_paths.clear()  # Clear any previously registered paths before the test
     path1 = Workdir.register('test/simulation')
     path2 = Workdir.register('test/reconstruction')
     
