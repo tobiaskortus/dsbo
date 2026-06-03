@@ -95,8 +95,8 @@ class HepEmShowSimulation(SimulationBase):
         return tasks
 
     def _simulate_impl(self, design, grad_output: np.ndarray | None = None):
-        absorbers = design["absorber"].detach().numpy()
-        gaps = design["gap"].detach().numpy()
+        absorbers = np.clip(design["absorber"].detach().numpy(), 1e-3, None)
+        gaps      = np.clip(design["gap"].detach().numpy(), 1e-3, None)
 
         if grad_output is not None:
             tasks = self._generate_tasks(absorbers, gaps, grad_outputs=grad_output)
