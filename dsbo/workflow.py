@@ -381,7 +381,7 @@ class Workflow:
     def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()):
         if fw._current_level > -1 or not torch.is_grad_enabled():
             with torch.no_grad():
-                return run_batch(self, candidates, catch)
+                return ResultsBatch(run_batch(self, candidates, catch))
         else:
             design_tensors = torch.stack([c.tensor for c in candidates])
             space = candidates[0].space
