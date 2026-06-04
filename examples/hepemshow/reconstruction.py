@@ -110,6 +110,7 @@ def validate_model(
     val_y_file: str,
     aggr: tuple[torch.Tensor, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
+    model.eval()
     val_set, _ = load_dataset(val_X_file, val_y_file,
                               batch_size=512, shuffle=False,
                               aggr=aggr, detach_X=False)
@@ -159,3 +160,15 @@ class HepEmShowReconstruction(ReconstructionBase):
                               self.simulation_file_val(), 
                               self.target_file_val(), 
                               aggr)
+    
+
+    @validate.backward
+    def backward(self, design, grad_output = None):
+        keys = grad_output.keys()
+
+        results = self.validate(design)
+        tensors = [results[k] for k in keys]
+        grad_tensors = [grad_output[k] for k in keys]
+        
+        torch.autograd.backward(tensors, grad_tensors)
+        
