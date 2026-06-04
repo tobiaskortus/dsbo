@@ -13,6 +13,9 @@ from dsbo.modules.simulation import SimulationBase
 from dsbo.utils.io import Workdir, DefaultPaths, Output
 
 
+from concurrent.futures import ThreadPoolExecutor
+
+
 def hepem_worker_fn(kwargs):
     abs_dot = kwargs.pop("absorber_thickness_dot", None)
     gap_dot = kwargs.pop("gap_thickness_dot", None)
@@ -100,8 +103,8 @@ class HepEmShowSimulation(SimulationBase):
 
         if grad_output is not None:
             tasks = self._generate_tasks(absorbers, gaps, grad_outputs=grad_output)
-            with mp.get_context("fork").Pool(min(mp.cpu_count(), len(tasks))) as pool:
-                results = pool.map(hepem_worker_fn, tasks)
+            with ThreadPoolExecutor(max_workers=min(mp.cpu_count(), len(tasks))) as executor:
+                results = list(executor.map(hepem_worker_fn, tasks))
 
             device = design["absorber"].device
             grad_abs = torch.from_numpy(sum(r["absorber"] for r in results)).to(device)
@@ -132,8 +135,9 @@ class HepEmShowSimulation(SimulationBase):
 
         tasks = self._generate_tasks(absorbers, gaps, absorbers_dot, gaps_dot)
 
-        with mp.get_context("fork").Pool(min(mp.cpu_count(), self.num_sims_per_particle * 2)) as pool:
-            results = pool.map(hepem_worker_fn, tasks)
+        n_workers = min(mp.cpu_count(), self.num_sims_per_particle * 2)
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            results = list(executor.map(hepem_worker_fn, tasks))
 
         indices = {"e+": 0, "gamma": 1}
         target = torch.tensor([indices[task["particle"]] for task in tasks], dtype=torch.float32)
