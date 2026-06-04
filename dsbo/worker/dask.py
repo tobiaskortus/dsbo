@@ -106,7 +106,7 @@ class DaskWorkerBase:
         def _backward_wrapper(module, candidate, *deps):
             grad_candidate = candidate.detach().requires_grad_()
             with torch.enable_grad():
-                module.backward(grad_candidate.values, grad_output, workdir=workdir, suffix=suffix, subdir=subdir)
+                module.run_backward(grad_candidate.values, grad_output, workdir=workdir, suffix=suffix, subdir=subdir)
             return task_id, grad_candidate.grad.clone() if grad_candidate.grad is not None else None
 
         with dask.annotate(resources=(resources or {}), priority=priority):
@@ -185,6 +185,6 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
 
 class LocalDaskWorker(DaskWorkerBase):
     def __init__(self):
-        self.cluster = LocalCluster(cores=1, memory="1GB")
+        self.cluster = LocalCluster(cores=1, memory="4GB")
         self.cluster.adapt(minimum=1, maximum=5)
         super().__init__(self.cluster)

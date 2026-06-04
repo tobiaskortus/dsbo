@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import inspect
+import types
 import weakref
 from abc import ABC
-from contextlib import nullcontext
-from typing import Optional
+from contextlib import nullcontext, suppress
 from functools import wraps
+from typing import Optional, Callable
 from dsbo.utils.io import Output, Input
 from dsbo.autograd import autograd_context
 from dsbo.utils.io import Workdir, get_workdir
@@ -43,6 +45,7 @@ class Module(ModuleDslMixin, ABC):
 
         self._alias: str | None = None
         self._seed: int | None = None
+        self._no_grad_op: bool = False
 
         self.i: int | None = None
         self.resources: SlurmWorkerConfig | None = None
@@ -95,7 +98,12 @@ class Module(ModuleDslMixin, ABC):
         with nullcontext() if (is_dry_run() or get_workdir() is None) else WorkflowTaskLogger(self):
             with Workdir.use_file_suffix(str(self.i)) if self.i is not None else nullcontext():
                 return self(design=design, **kwargs)
-            
+
+    @with_remote_workdir
+    def run_backward(self, design: dict, grad_output: dict | None = None) -> None:
+        with Workdir.use_file_suffix(str(self.i)) if self.i is not None else nullcontext():
+            self.backward(design, grad_output)
+
     def backward(self, design: dict, grad_output: dict | None = None) -> None:
         pass
 
@@ -110,59 +118,112 @@ class Module(ModuleDslMixin, ABC):
     def set_seed(self, seed: int) -> Module:
         self._seed = seed
         return self
+    
+    def op_propagates_grad_(self, propagate_grads: bool = True) -> Module:
+        self._no_grad_op = not propagate_grads
+        return self
 
     @property
     def registered_files(self) -> dict[str, AbstractFilePath]:
         return self._registered_files
 
 
-class dynamic_submodule:
-    def __init__(self, wrapped_fn):
-        self._wrapped_fn = wrapped_fn
-        self._submodule_cache = weakref.WeakKeyDictionary()
+def dynamic_submodule(wrapped_fn):
+    class DynamicSubmodule:
+        def __init__(self, wrapped_fn: Callable):
+            self._wrapped_fn = wrapped_fn
+            self._wrapped_backward = None
+            self._submodule_cache = weakref.WeakKeyDictionary()
 
-    def __get__(self, obj, *args, **kwargs):
-        if obj is None:
-            return self._wrapped_fn
-        
-        if not isinstance(obj, Module):
-            raise TypeError(
-                f"@dynamic_submodule must be accessed on a `Module` instance; got {type(obj).__name__}."
-            )
 
-        class Submodule(Module):
-            def __init__(self, parent, fn):
-                object.__setattr__(self, "_parent", parent)
-                object.__setattr__(self, "fn", fn)
+        def backward(self,func: Callable):
+            self._assert_valid_backward_signature(func)
+            self._assert_backward_is_none()
 
-            def __setattr__(self, name, value):
-                if name in ("_parent", "fn", "i", "resources") or name.startswith("_"):
-                    object.__setattr__(self, name, value)
-                else:
-                    setattr(self._parent, name, value)
-
-            def __call__(self, design, **kwargs):
-                try:
-                    return self.fn(self._parent, design, **kwargs)
-                except Exception as e:
-                    tb = e.__traceback__
-                    if tb is not None:
-                        tb = tb.tb_next
-                    raise e.with_traceback(tb)
-
-            def __getattr__(self, name):
-                return getattr(self._parent, name)
+            self._wrapped_backward = func
             
-            @property
-            def name(self) -> str:
-                suffix = f"[{self.i}]" if self.i is not None else ""
-                return f"{type(self._parent).__name__}.{self.fn.__name__}{suffix}"
 
-        submodule = self._submodule_cache.get(obj)
-        if submodule is not None:
+        def _assert_backward_is_none(self):
+            assert self._wrapped_backward == None, \
+                    f"The backward function for {self._wrapped_fn.__name__} is " +\
+                    f"already defined as {self._wrapped_backward.__name__}"
+
+        def _assert_valid_backward_signature(self, func: Callable):
+            args = inspect.getfullargspec(func).args
+            with suppress(ValueError, AttributeError):
+                args.remove("self")
+                args.remove("args")
+                args.remove("kwargs")
+
+            assert args == ["design", "grad_output"], \
+                    f"Invalid backward arguments. Got {args} but backwards " +\
+                    f"requires [design, grad_output]"
+
+        def __getstate__(self):
+            return {"_wrapped_fn": self._wrapped_fn, "_wrapped_backward": self._wrapped_backward}
+
+        def __setstate__(self, state):
+            self._wrapped_fn = state["_wrapped_fn"]
+            self._wrapped_backward = state["_wrapped_backward"]
+            self._submodule_cache = weakref.WeakKeyDictionary()
+
+        def __get__(self, obj, *args, **kwargs):
+            if obj is None:
+                return self._wrapped_fn
+            
+            if not isinstance(obj, Module):
+                raise TypeError(
+                    f"@dynamic_submodule must be accessed on a `Module` instance; got {type(obj).__name__}."
+                )
+
+            class Submodule(Module):
+                def __init__(self, parent: Module, func: Callable, backward: Callable):
+                    object.__setattr__(self, "_parent", parent)
+                    object.__setattr__(self, "_func", func)        
+                    object.__setattr__(self, "_backward", backward)
+
+                    if backward is not None:
+                        def backward_fn(design, grad_outputs=None):
+                            backward(self, design, grad_outputs)
+
+                        object.__setattr__(self, "backward", backward_fn)
+
+                def __setattr__(self, name, value):
+                    if name in ("_parent", "fn", "i", "resources") or name.startswith("_"):
+                        object.__setattr__(self, name, value)
+                    else:
+                        setattr(self._parent, name, value)
+
+                def __call__(self, design, **kwargs):
+                    try:
+                        return self._func(self._parent, design, **kwargs)
+                    except Exception as e:
+                        tb = e.__traceback__
+                        if tb is not None:
+                            tb = tb.tb_next
+                        raise e.with_traceback(tb)
+
+                def __getattr__(self, name):
+                    return getattr(self._parent, name)
+
+                def __reduce__(self):
+                    return (getattr, (self._parent, self._func.__name__))
+            
+                
+                @property
+                def name(self) -> str:
+                    suffix = f"[{self.i}]" if self.i is not None else ""
+                    return f"{type(self._parent).__name__}.{self._func.__name__}{suffix}"
+
+            submodule = self._submodule_cache.get(obj)
+
+            if submodule is not None:
+                return submodule
+        
+            submodule = Submodule(obj, self._wrapped_fn, self._wrapped_backward)
+            self._submodule_cache[obj] = submodule
+
             return submodule
+        
 
-        submodule = Submodule(obj, self._wrapped_fn)
-        self._submodule_cache[obj] = submodule
-
-        return submodule
+    return DynamicSubmodule(wrapped_fn)

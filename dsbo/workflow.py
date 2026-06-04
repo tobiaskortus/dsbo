@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
 import os
 import torch
 import warnings
 import matplotlib
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import networkx as nx
 from copy import deepcopy
 from typing import Sequence
@@ -220,7 +223,10 @@ def run_batch_reverse_autograd(
                     NumpyFile.reset_gradient_state()
                     for task in tasks_rev:
                         is_sink = len(list(G.successors(task))) == 0
-                        task.backward(grad_candidate.values, candidate_grad_output if is_sink else None)
+                        if task._no_grad_op:
+                            continue
+
+                        task.run_backward(grad_candidate.values, candidate_grad_output if is_sink else None)
                 gradients.append(
                     grad_candidate.grad.clone() if grad_candidate.grad is not None else torch.zeros_like(candidate.tensor)
                 )
@@ -349,12 +355,13 @@ class RunBatchAutogradFn(torch.autograd.Function):
 
 
 def implements_backward(module: Module) -> bool:
-    return type(module).backward is not Module.backward
+    return (type(module).backward is not Module.backward) or \
+           (getattr(module, "_backward", None) is not None)
 
 
 def assert_workflow_supports_backward_ad(workflow: Workflow) -> None:
     unsupported = [m for m in workflow._representation.nodes()
-                   if isinstance(m, Module) and not implements_backward(m)]
+                   if isinstance(m, Module) and not implements_backward(m) if not m._no_grad_op]
     if unsupported:
         raise AssertionError(
             f"Modules {unsupported} do not implement backward(), "
@@ -369,6 +376,7 @@ class Workflow:
         if isinstance(dependencies, Module):
             dependencies = DependencyDict({dependencies: []})
 
+        self._dependency_groups = dependencies.groups if isinstance(dependencies, DependencyDict) else []
         self._representation = nx.DiGraph(dependencies)
 
         assert_no_self_loops(self._representation)
@@ -409,46 +417,130 @@ class Workflow:
         return workers
 
     def visualize(self, filename=None, format='png'):
-        
-        def _node_label(node):
-            res = getattr(node, 'resources', None)
-            name = ','.join(m.name for m in node.modules) if isinstance(node, FusedModule) else (node.name if hasattr(node, 'name') else str(node))
-            wk = 'default' if res is None else f'gpu={res.gpu_resources}, cpu={res.job_cpu}, mem={res.memory}'
-            return f"{name}\n{wk}"
-        
+        def _res_key(n):
+            res = getattr(n, 'resources', None)
+            return 'default' if res is None else f"mem={res.memory}, cpu={res.job_cpu}, gpu={res.gpu_resources}"
+
+        def _node_label(n):
+            name = n.name if hasattr(n, 'name') else str(n)
+            return f"{name}\n{_res_key(n)}"
+
+        def _build_color_map(nodes):
+            keys = list(dict.fromkeys(_res_key(n) for n in nodes))
+            cmap = matplotlib.colormaps['Set3']
+            color_map = {k: mcolors.to_hex(cmap(i % cmap.N)) for i, k in enumerate(keys)}
+            keys = [k for k in keys if k != 'default'] + (['default'] if 'default' in keys else [])
+            return keys, color_map
+
+        def _build_dep_group_key(nodes):
+            lookup = {
+                node: gi
+                for gi, dg in enumerate(self._dependency_groups)
+                for node in dg.nodes
+                if node in nodes
+            }
+            return lambda n: ('dg', lookup[n]) if n in lookup else ('single', id(n))
+
+        def _no_grad(n):
+            return getattr(n, '_no_grad_op', False)
+
+        def _faded(hex_color, blend=0.7):
+            """Blend a hex colour toward white to signal disabled gradients."""
+            r, g, b = mcolors.to_rgb(hex_color)
+            r2 = r + (1 - r) * blend
+            g2 = g + (1 - g) * blend
+            b2 = b + (1 - b) * blend
+            return mcolors.to_hex((r2, g2, b2))
+
+        def _add_node(sg, n):
+            nid = str(id(n))
+            fill     = _faded(_color(n))        if _no_grad(n) else _color(n)
+            style    = 'filled,dashed'          if _no_grad(n) else 'filled'
+            sg.node(nid, label=_node_label(n), style=style, fillcolor=fill,
+                    shape='box', fontcolor='black', color='black')
+            rep_entry[n] = rep_exit[n] = nid
+
+        def _add_replica_group(sg, first, last, count):
+            _add_node(sg, first)
+            _add_node(sg, last)
+            dot.edge(
+                str(id(first)), str(id(last)),
+                label=f'×{count}', style='dashed', arrowhead='none',
+                constraint='false', color='black', fontcolor='black',
+                penwidth='1', fontsize='11', labelfloat='false',
+            )
+
+        def _render_with_legend(out_format):
+            graph_bytes = dot.pipe(format='png')
+            if not keys:
+                return graph_bytes if out_format == 'png' else dot.pipe(format=out_format)
+
+            graph_img = plt.imread(io.BytesIO(graph_bytes))
+            h, w = graph_img.shape[:2]
+            dpi, legend_h = 100, 0.55
+            fig_w, fig_h = w / dpi, h / dpi + legend_h
+
+            fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+            ax_g = fig.add_axes([0, legend_h / fig_h, 1, h / dpi / fig_h])
+            ax_g.imshow(graph_img)
+            ax_g.axis('off')
+
+            ax_l = fig.add_axes([0, 0, 1, legend_h / fig_h])
+            ax_l.axis('off')
+            worker_patches = [mpatches.Patch(facecolor=color_map[k], edgecolor='#aaaaaa', linewidth=0.5, label=k) for k in keys]
+
+            has_no_grad = any(_no_grad(n) for n in nodes)
+            has_grad    = any(not _no_grad(n) for n in nodes)
+
+            worker_legend = ax_l.legend(
+                handles=worker_patches, ncol=min(4, len(worker_patches)), loc='center',
+                frameon=False, fontsize=8, handlelength=1.2, handleheight=0.9,
+                columnspacing=1.2, handletextpad=0.5,
+                title='Compute Resources', title_fontsize=8,
+            )
+            worker_legend.get_title().set_fontweight('bold')
+
+            if has_no_grad and has_grad:
+                grad_patches = [
+                    mpatches.Patch(facecolor='white', edgecolor='black',
+                                   linewidth=1, linestyle='solid', label='grad'),
+                    mpatches.Patch(facecolor='white', edgecolor='black',
+                                   linewidth=1, linestyle='dashed', label='no grad'),
+                ]
+                ax_l.add_artist(worker_legend)
+                ax_l.legend(
+                    handles=grad_patches, ncol=1, loc='center right',
+                    frameon=False, fontsize=8, handlelength=1.2, handleheight=0.9,
+                    columnspacing=1.2, handletextpad=0.5,
+                )
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format=out_format, bbox_inches='tight', dpi=dpi)
+            plt.close(fig)
+            buf.seek(0)
+            return buf.read()
+
         fmt = format
         if filename:
             base, ext = os.path.splitext(filename)
             if ext:
-                filename = base
-                fmt = ext.lstrip('.')
+                filename, fmt = base, ext.lstrip('.')
+
         dot = Digraph(format=fmt)
         dot.attr(rankdir='LR')
+        dot.attr('node', fontsize='10')
+        dot.attr('edge', arrowsize='0.6')
 
-        def res_key(n):
-            res = getattr(n, 'resources', None)
-            return 'default' if res is None else f"mem={res.memory}, cpu={res.job_cpu}, gpu={res.gpu_resources}"
-
-        nodes = list(self._representation.nodes())
-        keys = []
-        groups = {}
-        for n in nodes:
-            k = res_key(n)
-            groups.setdefault(k, []).append(n)
-            if k not in keys:
-                keys.append(k)
-
-        cmap = matplotlib.colormaps['Set3']
-        color_map = {k: mcolors.to_hex(cmap(i % cmap.N)) for i, k in enumerate(keys)}
-
-        rep_entry = {}
-        rep_exit = {}
-
-        # Compute topological level for each node (determines the column in LR layout).
+        nodes = set(self._representation.nodes())
+        keys, color_map = _build_color_map(nodes)
+        _color = lambda n: color_map.get(_res_key(n), '#d3d3d3')
+        _dep_group_key = _build_dep_group_key(nodes)
         levels = task_levels(self._representation)
 
-        # Group nodes by level; within each level sort by (.i, name) so replicas of
-        # the same module and repeat end up adjacent vertically.
+        rep_entry: dict = {}
+        rep_exit:  dict = {}
+        hidden_nodes: set = set()
+
         level_groups: dict[int, list] = {}
         for n in nodes:
             level_groups.setdefault(levels.get(n, 0), []).append(n)
@@ -460,47 +552,27 @@ class Workflow:
             ))
             with dot.subgraph(name=f"rank_{lvl}") as sg:
                 sg.attr(rank='same')
-                for n in group:
-                    color = color_map.get(res_key(n), '#d3d3d3')
-                    if isinstance(n, FusedModule):
-                        sub_ids = []
-                        for j, sub in enumerate(n.modules):
-                            sid = f"{id(n)}_sub_{j}"
-                            sg.node(sid, label=_node_label(sub), style='filled', fillcolor=color, shape='box', color='black', penwidth='1')
-                            sub_ids.append(sid)
-                        for a, b in zip(sub_ids, sub_ids[1:]):
-                            dot.edge(a, b)
-                        if sub_ids:
-                            rep_entry[n], rep_exit[n] = sub_ids[0], sub_ids[-1]
-                        else:
-                            rep_entry[n] = rep_exit[n] = str(id(n))
+                for (kind, _), pg in groupby(group, key=_dep_group_key):
+                    pg = list(pg)
+                    if kind == 'dg' and len(pg) > 2:
+                        hidden_nodes.update(pg[1:-1])
+                        _add_replica_group(sg, pg[0], pg[-1], len(pg))
                     else:
-                        nid = str(id(n))
-                        sg.node(nid, label=_node_label(n), style='filled', fillcolor=color, shape='box', fontcolor='black')
-                        rep_entry[n] = rep_exit[n] = nid
+                        for n in pg:
+                            _add_node(sg, n)
 
         for u, v in self._representation.edges():
-            src = rep_exit.get(u, str(id(u)))
-            dst = rep_entry.get(v, str(id(v)))
-            dot.edge(src, dst)
-            #u_i = getattr(u, 'i', None)
-            #v_i = getattr(v, 'i', None)
-            # Cross-path edges (unindexed → indexed, or different .i) must not
-            # constrain rank to avoid pulling replica columns out of alignment.
-            #cross = (u_i is None and isinstance(v_i, int)) or (
-            #    isinstance(u_i, int) and isinstance(v_i, int) and u_i != v_i
-            #)
-            #dot.edge(src, dst, constraint='false' if cross else 'true')
+            if u in hidden_nodes or v in hidden_nodes:
+                continue
+            dot.edge(rep_exit.get(u, str(id(u))), rep_entry.get(v, str(id(v))))
 
-        if keys:
-            rows = ''.join([f"<TR><TD BGCOLOR='{color_map[k]}' FIXEDSIZE='TRUE' WIDTH='20' HEIGHT='14'></TD><TD ALIGN='LEFT'>&nbsp;{k}</TD></TR>" for k in keys])
-            table = f"<TABLE BORDER='0' CELLBORDER='0' CELLSPACING='4'>{rows}</TABLE>"
-            dot.node('legend', label=f'<{table}>', shape='none')
-
+      
         if filename is not None:
-            return dot.render(filename, cleanup=True)
-        img = dot.pipe(format=format)
-        display(Image(img))
+            out_path = f"{filename}.{fmt}"
+            with open(out_path, 'wb') as f:
+                f.write(_render_with_legend(fmt))
+            return out_path
+        display(Image(_render_with_legend(format)))
 
 
     @property
