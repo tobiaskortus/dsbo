@@ -81,7 +81,7 @@ def train_model(model: nn.Module, train_X_file: str, train_y_file: str) -> nn.Mo
         return val_loss/len(val_loader)
 
 
-    for epoch in tqdm(range(10)):
+    for epoch in tqdm(range(30)):
         for X, y in train_loader:
             y_particle = y[:, 0]
             y_energy = y[:, 1]
@@ -101,7 +101,7 @@ def train_model(model: nn.Module, train_X_file: str, train_y_file: str) -> nn.Mo
         val_losses += [val_loss]
         print(f"Epoch {epoch}: train loss = {train_losses[-3]:.4f}, particle loss = {train_losses[-2]:.4f}, energy loss = {train_losses[-1]:.4f}, val loss = {val_loss:.4f}")
 
-    return model, aggr
+    return model, aggr, train_losses, val_losses
 
 
 def validate_model(
@@ -126,6 +126,30 @@ def validate_model(
             "mse": torch.cat(e_losses)}
 
 
+def visualize_losses(train_losses: list[float], val_losses: list[float], file_path: str | None = None):
+    import matplotlib.pyplot as plt
+
+    train_losses = torch.tensor(train_losses).view(-1, 3)
+    val_losses = torch.tensor(val_losses)
+
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses[:, 0], label="train loss")
+    plt.plot(train_losses[:, 1], label="particle loss")
+    plt.plot(train_losses[:, 2], label="energy loss")
+    plt.legend()
+    plt.yscale("log")
+    plt.title("Training Losses")
+
+    plt.subplot(1, 2, 2)
+    plt.plot(val_losses, label="validation loss")
+    plt.legend()
+    plt.yscale("log")
+    plt.title("Validation Loss")
+
+    if file_path: plt.savefig(file_path)
+    else: plt.show()
+
 class HepEmShowReconstruction(ReconstructionBase):
     def __init__(self, num_detector_layers: int = 50):
         super().__init__()
@@ -137,6 +161,8 @@ class HepEmShowReconstruction(ReconstructionBase):
         self.simulation_file_val = Input(Workdir.register_file(DefaultPaths.SIMULATION, "val_X.npz"))
         self.target_file_val = Input(Workdir.register_file(DefaultPaths.SIMULATION, "val_y.npz"))
 
+        self.plot_file = Workdir.register_file(DefaultPaths.RECONSTRUCTION, "losses.png")
+
         self.model_file = Workdir.register_file(DefaultPaths.RECONSTRUCTION, "model.pt")
         self.aggr_file = Workdir.register_file(DefaultPaths.RECONSTRUCTION, "normalization.pt")
 
@@ -144,11 +170,12 @@ class HepEmShowReconstruction(ReconstructionBase):
     @dynamic_submodule
     def train(self, design, **kwargs):
         model = ReconstructioModel(self.num_detector_layers)
-        model, aggr = train_model(model, self.simulation_file_train(), self.target_file_train())
+        model, aggr, train_losses, val_losses = train_model(model, self.simulation_file_train(), self.target_file_train())
 
         torch.save(model.state_dict(), self.model_file())
         torch.save(aggr, self.aggr_file())
-    
+        visualize_losses(train_losses, val_losses, self.plot_file())
+
     @dynamic_submodule
     def validate(self, design, **kwargs) -> dict[str, torch.Tensor]:
         model = ReconstructioModel(self.num_detector_layers)
