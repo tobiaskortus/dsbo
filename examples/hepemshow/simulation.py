@@ -1,6 +1,7 @@
 import pyhepemshow
 from pyhepemshow import get_hepemshow_data_file
 
+import os
 import torch
 import random
 import numpy as np
@@ -103,7 +104,9 @@ class HepEmShowSimulation(SimulationBase):
 
         if grad_output is not None:
             tasks = self._generate_tasks(absorbers, gaps, grad_outputs=grad_output)
-            with ThreadPoolExecutor(max_workers=min(mp.cpu_count(), len(tasks))) as executor:
+
+            n_workers = min(len(os.sched_getaffinity(0)) - 1, self.num_sims_per_particle * 2)
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
                 results = list(executor.map(hepem_worker_fn, tasks))
 
             device = design["absorber"].device
@@ -135,7 +138,7 @@ class HepEmShowSimulation(SimulationBase):
 
         tasks = self._generate_tasks(absorbers, gaps, absorbers_dot, gaps_dot)
 
-        n_workers = min(mp.cpu_count(), self.num_sims_per_particle * 2)
+        n_workers = min(len(os.sched_getaffinity(0)) - 1, self.num_sims_per_particle * 2)
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             results = list(executor.map(hepem_worker_fn, tasks))
 
