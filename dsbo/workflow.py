@@ -254,9 +254,12 @@ def run_batch_reverse_autograd(
                 exec_ids.append(exec_id)
 
                 for depth, task in enumerate(tasks_rev):
+                    if task._no_grad_op:
+                        continue
+
                     forward_succs = list(G.successors(task))
                     is_sink = len(forward_succs) == 0
-                    dependencies = [delayed_map[s] for s in forward_succs]
+                    dependencies = [delayed_map[s] for s in forward_succs if s in delayed_map]
                     task_grad_output = candidate_grad_output if is_sink else None
 
                     task_id, delayed_obj = worker.schedule_backward(
