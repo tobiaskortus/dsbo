@@ -10,7 +10,8 @@ from contextlib import contextmanager
 from typing import Dict, Generator, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Workflow, Trial
+    from dsbo.storage.taskstream import TaskStreamPlugin
+    from dsbo.storage.models import Batch, Execution, JobStatus, JobTrace, Workflow, Trial
 
 
 class TransitionWriter(ABC):
@@ -24,24 +25,24 @@ class TransitionWriter(ABC):
         stop: float,
         exec_id: str,
         log: str,
-        status: "JobStatus",
+        status: JobStatus,
     ) -> None:
         pass
 
-_current_storage: contextvars.ContextVar["StudyStorage | None"] = contextvars.ContextVar(
+_current_storage: contextvars.ContextVar[StudyStorageBase | None] = contextvars.ContextVar(
     "current_storage", default=None)
 
 
 @contextmanager
-def use_storage(storage: "StudyStorage") -> Generator["StudyStorage", None, None]:
+def use_storage(storage: StudyStorageBase) -> Generator[StudyStorageBase, None, None]:
     token = _current_storage.set(storage)
     try:
         yield storage
     finally:
         _current_storage.reset(token)
+    
 
-
-def get_current_storage() -> Optional["StudyStorage"]:
+def get_current_storage() -> Optional[StudyStorageBase]:
     return _current_storage.get()
 
 
@@ -52,23 +53,23 @@ class WorkflowStorageBase(ABC):
         self._readonly = readonly
 
     @abstractmethod
-    def add_workflow(self, repr: nx.DiGraph) -> "Workflow":
+    def add_workflow(self, repr: nx.DiGraph) -> Workflow:
         pass
         
     @abstractmethod
-    def add_runs(self, wf: "Workflow", exec_ids: list[str], batch_id: str) -> "Batch":
+    def add_runs(self, wf: Workflow, exec_ids: list[str], batch_id: str) -> "Batch":
         pass
 
     @abstractmethod
-    def get_batches(self) -> List["Batch"]:
+    def get_batches(self) -> List[Batch]:
         pass
 
     @abstractmethod
-    def get_executions_by_batch(self, batch_id: str) -> List["Execution"]:
+    def get_executions_by_batch(self, batch_id: str) -> List[Execution]:
         pass
 
     @abstractmethod
-    def get_workflows(self) -> List["Workflow"]:
+    def get_workflows(self) -> List[Workflow]:
         pass
 
     @abstractmethod
@@ -80,14 +81,14 @@ class WorkflowStorageBase(ABC):
         pass
 
     @abstractmethod
-    def get_job_traces_by_batch(self, batch_id: str) -> List["JobTrace"]:
+    def get_job_traces_by_batch(self, batch_id: str) -> List[JobTrace]:
         pass
 
     @abstractmethod
-    def get_job_traces(self, exec_id: str) -> List["JobTrace"]:
+    def get_job_traces(self, exec_id: str) -> List[JobTrace]:
         pass
 
-    def create_task_stream_plugin(self, task_map: Dict[str, str] | None = None, name_map: Dict[str, str] | None = None) -> "TaskStreamPlugin":
+    def create_task_stream_plugin(self, task_map: Dict[str, str] | None = None, name_map: Dict[str, str] | None = None) -> TaskStreamPlugin:
         from dsbo.storage.taskstream import TaskStreamPlugin
         if self._readonly:
             raise RuntimeError("Cannot create TaskStreamPlugin from readonly StudyStorage.")
@@ -113,7 +114,7 @@ class TrialStorageBase(ABC):
 
     @abstractmethod
     def add_trial(self, step: int, design_vec: np.array | torch.Tensor, objectives: dict, 
-                  constraints: Optional[dict] = None, feasible: bool = True) -> "Trial":
+                  constraints: Optional[dict] = None, feasible: bool = True) -> Trial:
         pass
 
     @abstractmethod
@@ -121,7 +122,7 @@ class TrialStorageBase(ABC):
         pass
 
     @abstractmethod
-    def get_similar_trials(self, query_vec: np.ndarray | torch.Tensor, k: int = 10, metric: str = "l2") -> list["Trial"]:
+    def get_similar_trials(self, query_vec: np.ndarray | torch.Tensor, k: int = 10, metric: str = "l2") -> list[Trial]:
         pass
 
 
