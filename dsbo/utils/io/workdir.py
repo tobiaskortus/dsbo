@@ -1,14 +1,15 @@
-import functools
 import os
-from pathlib import Path
 import shutil
+import functools
 import contextvars
 from enum import Enum
+from pathlib import Path
+from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Generator, Generator, List, Optional, Set, Union
 
 def _is_dry_run():
-    from dsbo.modules.compile import is_dry_run
+    from dsbo.utils.compile import is_dry_run
     return is_dry_run()
 
 
@@ -40,6 +41,15 @@ class AbstractPath:
             os.makedirs(workdir_path, exist_ok=True)
         
         return workdir_path
+    
+    def __eq__(self, other : "AbstractPath"):
+        if not isinstance(other, type(self)):
+            return False
+        
+        return self._path == other._path
+    
+    def __hash__(self):
+        return hash(self._path)
 
     @property
     def pathname(self) -> str:
@@ -60,6 +70,23 @@ class AbstractFilePath:
         else:
             filename = self._filename
         return os.path.join(self._path(), filename)
+    
+
+    def __eq__(self, other: "AbstractFilePath"):
+        if not isinstance(other, type(self)):
+            return False
+
+        return (self._path == other._path and 
+                self._filename == other._filename and 
+                self._unique == other._unique)
+    
+    def __hash__(self):
+        return hash((self._path, self._filename, self._unique))
+    
+    def __repr__(self):
+        name, ext = os.path.splitext(self._filename)
+        suffix = "_suffix" if self._unique else ""
+        return f"{type(self).__name__}({self._path.pathname}/{name}{suffix}{ext})"
 
     @property
     def filename(self) -> str:
@@ -244,9 +271,9 @@ def get_file_suffix() -> Optional[str]:
 
 def with_remote_workdir(func: Callable) -> Callable:
     @functools.wraps(func)
-    def wrapper(self, *args, **kwargs) -> Any:
+    def wrapper(*args, **kwargs) -> Any:
         if _is_dry_run():
-            return func(self, *args, **kwargs)
+            return func(*args, **kwargs)
         
         workdir = kwargs.pop("workdir", None)
         suffix = kwargs.pop("suffix", None)
@@ -254,5 +281,19 @@ def with_remote_workdir(func: Callable) -> Callable:
         with Workdir.load(workdir) if workdir else nullcontext():
             with Workdir.create_subdir(subdir) if subdir else nullcontext():
                 with Workdir.use_file_suffix(suffix) if suffix else nullcontext():
-                    return func(self, *args, **kwargs)
+                    return func(*args, **kwargs)
     return wrapper
+
+
+@dataclass(frozen=True)
+class PathAnnotation:
+    path: AbstractFilePath
+
+    def __call__(self):
+        return self.path()
+
+class Input(PathAnnotation):
+    pass
+    
+class Output(PathAnnotation):
+    pass

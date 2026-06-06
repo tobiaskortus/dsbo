@@ -1,13 +1,18 @@
 from __future__ import annotations
+
 import dask
-import contextvars
 import uuid
-from dask.distributed import Client, Future
-from contextlib import contextmanager
+import torch
+import contextvars
+import torch.autograd.forward_ad as fw
+
+from contextlib import contextmanager, nullcontext
 from dask.delayed import Delayed, delayed
+from dask.distributed import Client, Future
 from dask_jobqueue.local import LocalCluster
-from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
 from dask_heterogeneous.slurm import HeterogeneousSlurmCluster
+from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
+from dsbo.autograd import SerializedTensor, _pack, _unpack
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,6 +26,7 @@ dask.config.set({
     "distributed.worker.memory.pause": 0.95,
     "distributed.worker.memory.terminate": 0.98,
 })
+
 
 class DaskWorkerBase:
     def __init__(self, cluster):
@@ -47,17 +53,17 @@ class DaskWorkerBase:
         internally
         """
         if not catch:
-            return self.client.gather(futures)
+            return [(tid, _unpack(p)) for tid, p in self.client.gather(futures)]
 
         results = []
         for f in futures:
             try:
-                r = self.client.gather(f)
+                tid, p = self.client.gather(f)
+                results.append((tid, _unpack(p)))
             except Exception as e:
                 if isinstance(e, catch):
                     continue
                 raise
-            results.append(r)
         return results
 
     def schedule(self, module: Module, design: dict, dependencies: Iterable = (), priority: int | None = None) -> tuple[uuid.UUID, Delayed]:
@@ -65,15 +71,46 @@ class DaskWorkerBase:
         subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
         resources = getattr(module.resources, "resources", None)
+        packed_design = _pack(design)
+
+        is_forward_ad = fw._current_level > -1
+        is_grad_enabled = torch.is_grad_enabled()
 
         task_id = uuid.uuid4()
 
         def _module_wrapper(module, design_arg, *deps):
-            result = module.run(design=design_arg, workdir=workdir, suffix=suffix, subdir=subdir)
-            return task_id, result
+            packed_result = module.run(
+                design=design_arg,
+                workdir=workdir,
+                suffix=suffix,
+                subdir=subdir,
+                is_forward_ad=is_forward_ad,
+                is_grad_enabled=is_grad_enabled,
+                pack_result=is_forward_ad,
+                unpack_design=True,
+            )
+            return task_id, packed_result
 
         with dask.annotate(resources=(resources or {}), priority=priority):
-            delayed_obj = delayed(_module_wrapper, name=module.name)(module, design, *dependencies)
+            delayed_obj = delayed(_module_wrapper, name=module.name)(module, packed_design, *dependencies)
+
+        return task_id, delayed_obj
+
+    def schedule_backward(self, module: Module, candidate, grad_output=None, dependencies: Iterable = (), priority: int | None = None) -> tuple[uuid.UUID, Delayed]:
+        suffix = get_file_suffix()
+        subdir = get_subdir()
+        workdir = getattr(get_workdir(), "workdir_root", None)
+        resources = getattr(module.resources, "resources", None)
+        task_id = uuid.uuid4()
+
+        def _backward_wrapper(module, candidate, *deps):
+            grad_candidate = candidate.detach().requires_grad_()
+            with torch.enable_grad():
+                module.run_backward(grad_candidate.values, grad_output, workdir=workdir, suffix=suffix, subdir=subdir)
+            return task_id, grad_candidate.grad.clone() if grad_candidate.grad is not None else None
+
+        with dask.annotate(resources=(resources or {}), priority=priority):
+            delayed_obj = delayed(_backward_wrapper, name=f"{module.name}_bwd")(module, candidate, *dependencies)
 
         return task_id, delayed_obj
 
@@ -148,6 +185,6 @@ class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
 
 class LocalDaskWorker(DaskWorkerBase):
     def __init__(self):
-        self.cluster = LocalCluster(cores=1, memory="1GB")
+        self.cluster = LocalCluster(cores=1, memory="4GB")
         self.cluster.adapt(minimum=1, maximum=5)
         super().__init__(self.cluster)

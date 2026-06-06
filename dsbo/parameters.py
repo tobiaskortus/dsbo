@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import torch
+import  torch.autograd.forward_ad as fw
+
 from enum import Enum
 from attr import field
 from numpy.char import lower, upper
@@ -150,24 +152,56 @@ class Candidate:
     @property
     def values(self) -> Dict[str, Any]:
         if not isinstance(self.space, ParameterMap):
-            result: Dict[str, Any] = {}
-            for name, p in self.space._params.items():
-                match p:
-                    case Constant():
-                        result[name] = p.value
-                    case Categorical():   # Categorical — argmax over one-hot slice
-                        offset, w = self._index[name]
-                        result[name] = p.choices[int(self.tensor[offset:offset + w].argmax().item())]
-                    case Continuous():
-                        offset, _ = self._index[name]
-                        result[name] = self.tensor[offset]
-                    case Integer():
-                        offset, _ = self._index[name]
-                        result[name] = int(round(self.tensor[offset].item()))
-                    case _:
-                        raise ValueError(f"Unsupported parameter type: {type(p)}")
-            return result
+            def collect(spec, _parts):
+                result = {}
+                for name, p in spec.items():
+                    parts = (*_parts, name)
+                    match p:
+                        case Group():
+                            result.update(collect(p.params, parts))
+                        case Constant():
+                            result[self.space._key_fn(parts)] = p.value
+                        case Vector():
+                            first_key = self.space._key_fn((*_parts, f"{name}_1"))
+                            offset, _ = self._index[first_key]
+                            result[self.space._key_fn(parts)] = self.tensor[offset:offset + p.size]
+                        case Categorical():
+                            key = self.space._key_fn(parts)
+                            offset, w = self._index[key]
+                            result[key] = p.choices[int(self.tensor[offset:offset + w].argmax().item())]
+                        case Continuous():
+                            key = self.space._key_fn(parts)
+                            offset, _ = self._index[key]
+                            result[key] = self.tensor[offset]
+                        case Integer():
+                            key = self.space._key_fn(parts)
+                            offset, _ = self._index[key]
+                            result[key] = int(round(self.tensor[offset].item()))
+                return result
+            return collect(self.space._spec, ())
         return self.space._decode_values(self.tensor)
+    
+
+    def detach(self) -> Candidate:
+        return Candidate(self.space, self.tensor.detach().clone())
+
+    def requires_grad_(self, requires_grad: bool = True) -> Candidate:
+        self.tensor.requires_grad_(requires_grad)
+        return self
+
+    @property
+    def grad(self) -> Optional[torch.Tensor]:
+        return self.tensor.grad
+
+    def sample_tangent(self) -> Candidate:
+        primal, _ = fw.unpack_dual(self.tensor)
+        return Candidate(self.space, fw.make_dual(primal, torch.randn_like(primal)))
+    
+    def set_tangent(self, tangent: torch.Tensor) -> Candidate:
+        assert self.tensor.shape == tangent.shape, "Tangent must have the same shape as the primal tensor"
+        
+        primal, _ = fw.unpack_dual(self.tensor)
+        return Candidate(self.space, fw.make_dual(primal, tangent))
     
     def __contains__(self, key: str) -> bool:
         params = (self.space.target._params \
@@ -208,21 +242,34 @@ class ParameterSpace:
         self._sampler = sampler
 
     def encode(self, values: Dict[str, Any], requires_grad: bool = False) -> torch.Tensor:
+        # Pre-expand any vector values (values[name] = array) into individual keys
+        expanded = dict(values)
+        for base_key, (_, flat_keys) in _collect_vectors(self._spec, self._key_fn).items():
+            if base_key in values:
+                for flat_key, v in zip(flat_keys, values[base_key]):
+                    expanded[flat_key] = v
+
         parts: List[float] = []
         for name, p in self:
             match p:
                 case Constant():
                     continue
                 case Categorical():
-                    v = values[name]
+                    v = expanded[name]
                     one_hot = [0.0] * len(p.choices)
                     one_hot[p.choices.index(v)] = 1.0
                     parts.extend(one_hot)
                 case _:
-                    parts.append(values[name])
+                    parts.append(expanded[name])
         return torch.tensor(parts, dtype=torch.float32, requires_grad=requires_grad)
 
-    def sample(self, sampler: Sampler = None, requires_grad: bool = False) -> Candidate:
+    def sample(self, 
+               sampler: Sampler = None, 
+               requires_grad: bool = False,
+               sample_tangent: bool = False) -> Candidate:
+        
+        assert not (requires_grad and sample_tangent)
+
         s = sampler or self._sampler
         if s is None:
             raise RuntimeError("No sampler provided. Pass one to sample() or call register_sampler() first.")
@@ -230,8 +277,12 @@ class ParameterSpace:
         #TODO: this is hacky
         s.bind(self)
         t = s.ask()
+
         if requires_grad:
             t.requires_grad_(True)
+        if sample_tangent:
+            t = fw.make_dual(t, torch.rand_like(t))
+        
         return Candidate(self, t)
 
     def sample_batch(self, sampler: Sampler = None, batch_size: int = 16, requires_grad: bool = False) -> list[Candidate]:
@@ -268,4 +319,19 @@ def _collect(params: Dict[str, Union[DesignParameter, Group]],
                 out[key_fn((*_parts, f"{name}_{i}"))] = Continuous(spec.lower, spec.upper, spec.log)
         else:
             out[key_fn(parts)] = spec
+    return out
+
+
+def _collect_vectors(params: Dict[str, Union[DesignParameter, Group]],
+                     key_fn: Callable[[Tuple[str, ...]], str] = '.'.join,
+                     _parts: Tuple[str, ...] = ()) -> Dict[str, Tuple[Vector, List[str]]]:
+    """Returns {base_key: (Vector, [flat_keys])} for all Vector params, recursing into Groups."""
+    out: Dict[str, Tuple[Vector, List[str]]] = {}
+    for name, spec in params.items():
+        parts = (*_parts, name)
+        if isinstance(spec, Group):
+            out.update(_collect_vectors(spec.params, key_fn, parts))
+        elif isinstance(spec, Vector):
+            flat_keys = [key_fn((*_parts, f"{name}_{i}")) for i in range(1, spec.size + 1)]
+            out[key_fn(parts)] = (spec, flat_keys)
     return out

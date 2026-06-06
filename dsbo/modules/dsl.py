@@ -1,10 +1,13 @@
 from __future__ import annotations
+
+import weakref
 from copy import deepcopy
 from typing import Iterable, Mapping, overload
 
 
 class ModuleDslMixin:
     i: int | None
+    _replica_counts: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
     def replicate(self, i: int) -> ModuleDslMixin:
         """Shallow copy of object with updated .i for repeated elements. 
@@ -53,7 +56,9 @@ class ModuleDslMixin:
     def __mul__(self, other: int | Dynamic) -> DependencyDict | Dynamic:
         match other:
             case int():
-                reps = [self.replicate(i) for i in range(other)]
+                start = ModuleDslMixin._replica_counts.get(self, 0)
+                reps = [self.replicate(start + i) for i in range(other)]
+                ModuleDslMixin._replica_counts[self] = start + other
                 dd = DependencyDict({r: [] for r in reps})
                 dd.groups = [DependencyGroup(
                     template=self,
@@ -79,6 +84,7 @@ class DependencyDict(dict):
 
         super().__init__(mapping)
         self.groups: list[DependencyGroup] = []
+        self.annotated_groups: list[AnnotatedDependencyGroup] = []
 
     @property
     def template_to_nodes(self) -> dict[object, list[ModuleDslMixin]]:
@@ -93,6 +99,10 @@ class DependencyDict(dict):
         return [g.template for g in self.groups
                 if isinstance(g.template, ModuleDslMixin)
                 and getattr(g.template, 'surrogate', None) is not None]
+    
+    @property
+    def nodes(self) -> set[ModuleDslMixin]:
+        return set(self.keys()) | set(x for vs in self.values() for x in vs)
 
     @staticmethod
     def _combine_groups(a: list[DependencyGroup], b: list[DependencyGroup]) -> list[DependencyGroup]:
@@ -342,3 +352,13 @@ class DependencyGroup:
         for node, tmpl in node_to_template.items():
             template_to_nodes.setdefault(tmpl, []).append(node)
         return template_to_nodes
+    
+
+class AnnotatedDependencyGroup:
+    def __init__(
+        self,
+        dependencies: ModuleDslMixin | DependencyDict,
+        annotation: str,
+    ) -> None:
+        self.dependencies = dependencies
+        self.annotation = annotation

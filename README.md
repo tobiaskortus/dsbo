@@ -1,13 +1,29 @@
-<img src="dsbo.png" width="190" align="left" style="margin-right: 20px; margin-bottom: 10px;">
+<img src="dsbo.png" width="190" align="left" style="margin-right: 20px; margin-bottom: 40px;">
 
 <h1 style="font-size: clamp(1.0rem, 5vw, 2.5rem);">dsbo - Surrogate-based Optimization  for Particle Detector Design</h1>
 <br clear="left"/>
 
 
+> [!WARNING]
+> dsbo is prototype software! If you notice any issues or have any suggestions for improvements, please write up a GitHub issue detailing the problem or proposal. We also recommend “watching” the GitHub repository to keep track of new releases, and upgrading promptly when they occur.
+
+
 
 ## Getting started
 
+```sh
+pip install dsbo        #Full installation
+pip install dsbo[aido]  #Partial installation of a subset of backends
+```
 
+```
+git clone git@github.com:tobiaskortus/dsbo.git
+pip install .
+```
+
+```
+pip install git+https://github.com/tobiaskortus/dsbo
+```
 
 ## Backend Support
 
@@ -26,6 +42,9 @@ The following backends are available but considered **experimental**. They may n
 
 - **RoDeO** — <https://github.com/eoezkaya/RoDeO>  
   A research-oriented optimization framework with a focus on flexible problem modeling and exploration algorithms.
+
+- **AIDO** — <https://github.com/kylianschmidt/aido>  
+  Integrated into unified surrogate interface provided by dsbo. 
 
 - **Optuna** — <https://optuna.org>  
   A widely-used (hyperparameter) optimization framework offering efficient sampling strategies, pruning mechanisms, and integration with ML frameworks.

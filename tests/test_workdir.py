@@ -11,6 +11,7 @@ from dsbo.utils.io import AbstractFilePath, AbstractPath, DefaultPaths, Workdir,
 @patch('os.path.exists', return_value=False)
 @patch('os.makedirs')
 def test_register_path(mock_makedirs, mock_exists):
+    Workdir._registered_paths.clear()  # Clear any previously registered paths before the test
     path1 = Workdir.register('test/simulation')
     path2 = Workdir.register('test/reconstruction')
     
@@ -49,7 +50,7 @@ def test_register_path_no_context(mock_makedirs, mock_exists):
 
 @patch('os.path.exists', return_value=False)
 @patch('os.makedirs')
-@patch('dsbo.utils.io._is_dry_run', return_value=True)
+@patch('dsbo.utils.io.workdir._is_dry_run', return_value=True)
 def test_register_path_dry_run(mock_is_dry_run, mock_makedirs, mock_exists):
     path = Workdir.register('test/simulation')
     path_val = path()  # Call the path to trigger path creation    
@@ -207,7 +208,7 @@ def test_with_remote_workdir(mock_makedirs, mock_exists, mock_listdir):
 
 
 
-@patch('dsbo.utils.io._is_dry_run', return_value=True)
+@patch('dsbo.utils.io.workdir._is_dry_run', return_value=True)
 @patch('dsbo.utils.io.Workdir.load')
 @patch('dsbo.utils.io.Workdir.create_subdir')
 @patch('dsbo.utils.io.Workdir.use_file_suffix')
@@ -223,3 +224,67 @@ def test_with_remote_workdir_dryrun(mock_use_file_suffix, mock_create_subdir, mo
     assert mock_load.call_count == 0
     assert mock_create_subdir.call_count == 0
     assert mock_use_file_suffix.call_count == 0
+
+
+def test_abstract_path_eq():
+    a = AbstractPath("somepath")
+    b = AbstractPath("somepath")
+
+    assert a == b
+
+
+def test_abstract_file_path_neq():
+    a = AbstractPath("somepath")
+    b = AbstractPath("someotherpath")
+    
+    assert a != b
+
+
+def test_abstract_path_neq_incorrect_type():
+    a = AbstractPath("somepath")
+    
+    assert a != 1
+
+def test_abstract_file_path_eq():
+    a_path = AbstractPath("somepath")
+
+    a = AbstractFilePath(a_path, "file.npy", False)
+    b = AbstractFilePath(a_path, "file.npy", False)
+
+    assert a == b
+
+def test_abstract_file_path_neq_path():
+    a_path = AbstractPath("somepath")
+    b_path = AbstractPath("someotherpath")
+
+    a = AbstractFilePath(a_path, "file.npy", False)
+    b = AbstractFilePath(b_path, "file.npy", False)
+
+    assert a != b
+
+
+def test_abstract_file_path_neq_file():
+    a_path = AbstractPath("somepath")
+    b_path = AbstractPath("somepath")
+
+    a = AbstractFilePath(a_path, "file.npy", False)
+    b = AbstractFilePath(b_path, "file2.npy", False)
+
+    assert a != b
+
+def test_abstract_file_path_neq_uniue():
+    a_path = AbstractPath("somepath")
+    b_path = AbstractPath("somepath")
+
+    a = AbstractFilePath(a_path, "file.npy", False)
+    b = AbstractFilePath(b_path, "file.npy", True)
+
+    assert a != b
+
+
+def test_abstract_file_path_neq_incorrect_type():
+     a_path = AbstractPath("somepath")
+     a = AbstractFilePath(a_path, "file.npy", False)
+
+     assert a != 1
+

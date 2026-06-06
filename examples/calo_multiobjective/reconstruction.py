@@ -16,7 +16,7 @@ class G4CaloReconstruction(ReconstructionContainerWrapper):
         self.input_path  = Workdir.register(DefaultPaths.SIMULATION)
         self.output_path = Workdir.register(DefaultPaths.RECONSTRUCTION)
 
-    def train(self, **kwargs) -> None:
+    def train(self, design=None, **kwargs) -> None:
         self.output_file = os.path.join(self.input_path(), "output_df.pkl")
         self.reco_path = os.path.join(self.output_path(), "reco_df")
         self.model_path = os.path.join(self.output_path(), "model")
@@ -28,6 +28,6 @@ class G4CaloReconstruction(ReconstructionContainerWrapper):
         train_args = python_script_args(self.script_path, args=args)
         super().call_container(train_args, True)
     
-    def validate(self, **kwargs) -> Optional[dict[str, float]]:
+    def validate(self, design=None, **kwargs) -> Optional[dict[str, float]]:
         losses = tuple(map(float, np.loadtxt(self.reco_path)))
         return {"energy_resolution": losses[0], "particle_id": losses[1]}
