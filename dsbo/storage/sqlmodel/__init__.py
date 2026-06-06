@@ -155,15 +155,24 @@ class WorkflowStorage(WorkflowStorageBase):
     def add_runs(self, wf: Workflow, exec_ids: list[str], batch_id: str) -> Batch:
         if self._readonly:
             raise RuntimeError("Cannot register runs to readonly StudyStorage.")
-        batch = Batch(workflow_id=wf.id, batch_id=batch_id)
+        
+        batch = None
+        if len(exec_ids) > 1:
+            batch = Batch(workflow_id=wf.id, batch_id=batch_id)
+
         with Session(self._engine) as session:
-            session.add(batch)
-            session.flush()
+            if batch is not None:
+                session.add(batch)
+                session.flush()
+
             for exec_id in exec_ids:
-                session.add(Execution(workflow_id=wf.id, batch_id=batch.id, exec_id=exec_id))
+                session.add(Execution(workflow_id=wf.id, batch_id=batch.id if batch is not None else None, exec_id=exec_id))
+            
             session.commit()
-            session.refresh(batch)
+            if batch is not None:
+                session.refresh(batch)
         return batch
+
 
 
     def get_batches(self) -> List[Batch]:
@@ -411,7 +420,10 @@ class StudyStorage(StudyStorageBase):
     @classmethod
     def open(cls, db_path: Path | str, backend: str = "duckdb", vector_dim: int | None = None) -> "StudyStorage":
         return cls.create(db_path, readonly=True, backend=backend, vector_dim=vector_dim)
+    
+    def close(self):
+        self._engine.dispose()
 
     def __exit__(self, exc_type, exc, tb):
         super().__exit__(exc_type, exc, tb)
-        self._engine.dispose()
+        self.close()
