@@ -42,6 +42,8 @@ class Execution(SQLModel, table=True):
     status:              JobStatus     = JobStatus.PENDING
     num_jobs:            int           = 0
     num_successful_jobs: int           = 0
+    start:               float         = Field(sa_column=Column(Double), default=-1.0)
+    stop:                float         = Field(sa_column=Column(Double), default=-1.0)
 
 
 class JobTrace(SQLModel, table=True):

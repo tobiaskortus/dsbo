@@ -108,17 +108,20 @@ class SQLModelTransitionWriter(TransitionWriter):
                 )
             )
 
+            if execution.start < 0:
+                execution.start = start
+
             execution.num_jobs += 1
             if status == JobStatus.SUCCESS:
                 execution.num_successful_jobs += 1
-
-            if status == JobStatus.FAILED:
+            elif status == JobStatus.FAILED:
                 execution.status = JobStatus.FAILED
             elif execution.status == JobStatus.PENDING:
                 execution.status = JobStatus.RUNNING
 
             if execution.num_jobs >= wf.num_tasks and execution.status != JobStatus.FAILED:
                 execution.status = JobStatus.SUCCESS
+                execution.stop = stop
 
             session.add(execution)
             session.commit()

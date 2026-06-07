@@ -135,6 +135,8 @@ class TrialStorageBase(ABC):
                     assert set(constraints.keys()) == self._trial_constraint_keys, \
                         f"Constraint keys {set(constraints.keys())} do not match existing keys {self._trial_constraint_keys}."
                     
+                return func(self, step, design_vec, objectives, constraints, feasible)
+                    
             return validator
 
         auto_wrap(cls, "add_trial", validate_objective_and_constraint_keys)
