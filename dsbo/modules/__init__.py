@@ -1,39 +1,19 @@
 from __future__ import annotations
 
 import inspect
-import types
 import weakref
 from abc import ABC
-from contextlib import nullcontext, suppress
-from functools import wraps
 from typing import Optional, Callable
 from dsbo.utils.io import Output, Input
 from dsbo.autograd import autograd_context
-from dsbo.utils.io import Workdir, get_workdir
-from dsbo.utils.compile import dryrunnable, is_dry_run
-from dsbo.modules.dsl import ModuleDslMixin
 from dsbo.logger import WorkflowTaskLogger
-from dsbo.utils.io import AbstractFilePath, with_remote_workdir
+from dsbo.modules.dsl import ModuleDslMixin
+from contextlib import nullcontext, suppress
+from dsbo.utils.io import Workdir, get_workdir
 from dsbo.worker.config import SlurmWorkerConfig
-
-
-def ensure_dict_return(fn):
-    @wraps(fn)
-    def _inner(*args, **kwargs):
-        res = fn(*args, **kwargs)
-        return {} if res is None else res
-    return _inner
-
-
-def auto_wrap(cls, method_name, *decorators):
-    raw = cls.__dict__.get(method_name)
-    if raw is None or getattr(raw, "_dsbo_wrapped", False):
-        return
-    wrapped = raw
-    for decorator in decorators:
-        wrapped = decorator(wrapped)
-    setattr(wrapped, "_dsbo_wrapped", True)
-    setattr(cls, method_name, wrapped)
+from dsbo.utils.compile import dryrunnable, is_dry_run
+from dsbo.utils.functools import auto_wrap, ensure_dict_return
+from dsbo.utils.io import AbstractFilePath, with_remote_workdir
 
 
 class Module(ModuleDslMixin, ABC):

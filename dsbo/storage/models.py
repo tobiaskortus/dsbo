@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import enum
 import uuid
-from typing import Optional, List, Dict
+from typing import TYPE_CHECKING, Optional, List, Dict
 
 from sqlalchemy import Double, Column, LargeBinary, JSON
 from sqlmodel import Field, SQLModel
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 def _new_id() -> str:
@@ -71,6 +74,6 @@ class Trial(SQLModel, table=True):
     constraints: Optional[Dict[str, float]] = Field(default=None, sa_column=Column(JSON, nullable=True))
 
     @property
-    def design_vector(self) -> "np.ndarray":
+    def design_vector(self) -> np.ndarray:
         import numpy as np
         return np.frombuffer(self.design, dtype=np.float32).copy()

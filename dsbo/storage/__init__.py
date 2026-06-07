@@ -1,4 +1,5 @@
 from __future__ import annotations
+import functools
 
 import torch
 import contextvars
@@ -7,7 +8,9 @@ import networkx as nx
 from pathlib import Path
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Dict, Generator, List, Optional, TYPE_CHECKING
+from typing import Callable, Dict, Generator, List, Optional, TYPE_CHECKING
+
+from dsbo.utils.functools import auto_wrap
 
 if TYPE_CHECKING:
     from dsbo.storage.taskstream import TaskStreamPlugin
@@ -110,8 +113,33 @@ class IntermediatesStorageBase(ABC):
 
 class TrialStorageBase(ABC):
     def __init__(self):
-        pass
+        self._trial_objective_keys = set()
+        self._trial_constraint_keys = set()
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        def validate_objective_and_constraint_keys(func: Callable):
+            @functools.wraps(func)
+            def validator(self, step: int, design_vec: np.array | torch.Tensor, objectives: dict, 
+                    constraints: Optional[dict] = None, feasible: bool = True):
+                if len(self._trial_objective_keys) == 0:
+                    self._trial_objective_keys = set(objectives.keys())
+                else:
+                    assert set(objectives.keys()) == self._trial_objective_keys, \
+                        f"Objective keys {set(objectives.keys())} do not match existing keys {self._trial_objective_keys}."
+                    
+                if len(self._trial_constraint_keys) == 0 and constraints is not None:
+                    self._trial_constraint_keys = set(constraints.keys())
+                elif constraints is not None:
+                    assert set(constraints.keys()) == self._trial_constraint_keys, \
+                        f"Constraint keys {set(constraints.keys())} do not match existing keys {self._trial_constraint_keys}."
+                    
+            return validator
+
+        auto_wrap(cls, "add_trial", validate_objective_and_constraint_keys)
+
+        
     @abstractmethod
     def add_trial(self, step: int, design_vec: np.array | torch.Tensor, objectives: dict, 
                   constraints: Optional[dict] = None, feasible: bool = True) -> Trial:
