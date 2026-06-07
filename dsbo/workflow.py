@@ -16,7 +16,6 @@ from itertools import groupby
 from contextlib import nullcontext
 import matplotlib.colors as mcolors
 import torch.autograd.forward_ad as fw
-from IPython.display import Image, display
 from typing import Iterable, List, Any, overload
 
 from dsbo.modules import Module
@@ -575,6 +574,8 @@ class Workflow:
             with open(out_path, 'wb') as f:
                 f.write(_render_with_legend(fmt))
             return out_path
+        
+        from IPython.display import Image, display
         display(Image(_render_with_legend(format)))
 
 
