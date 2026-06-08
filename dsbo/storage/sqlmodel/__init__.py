@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import List, Optional
 
 import networkx as nx
-from sqlalchemy import Engine, event as sa_event
+from sqlalchemy import Engine, event as sa_event, inspect
 from sqlalchemy.pool import NullPool
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, case, create_engine, select
 
 from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase
 from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow
@@ -90,39 +90,66 @@ class SQLModelTransitionWriter(TransitionWriter):
     ) -> None:
         engine = create_engine(self.url, poolclass=NullPool)
         with Session(engine) as session:
-            execution = session.exec(
-                select(Execution).where(Execution.exec_id == exec_id)
-            ).one()
+            execution = session.exec(select(Execution).where(Execution.exec_id == exec_id)).one()
             wf = session.get(Workflow, execution.workflow_id)
 
-            session.add(
-                JobTrace(
-                    execution_id=execution.id,
-                    task_key=key,
-                    name=name,
-                    worker=worker,
-                    start=start,
-                    stop=stop,
-                    log=log,
-                    status=status,
+            if status in (JobStatus.RUNNING, JobStatus.QUEUED):
+                query = select(JobTrace).where(
+                    JobTrace.execution_id == execution.id,
+                    JobTrace.task_key == key
                 )
-            )
+                job_trace = session.exec(query).first()
+                
+                if job_trace is None:
+                    job_trace = JobTrace(
+                        execution_id=execution.id,
+                        task_key=key,
+                        name=name,
+                        worker=worker,
+                        start=start,
+                        stop=stop,
+                        log=log,
+                        status=status,
+                    )
+                else:
+                    job_trace.status = status
+                    if status == JobStatus.RUNNING:
+                        job_trace.start = start
+                        job_trace.worker = worker
+            else:
+                query = select(JobTrace).where(
+                    JobTrace.execution_id == execution.id,
+                    JobTrace.task_key == key
+                )
+                job_trace = session.exec(query).one()
+                job_trace.worker = worker
+                job_trace.start = start
+                job_trace.stop = stop
+                job_trace.log = log
+                job_trace.status = status
 
-            if execution.start < 0:
-                execution.start = start
+            session.add(job_trace)
 
-            execution.num_jobs += 1
-            if status == JobStatus.SUCCESS:
-                execution.num_successful_jobs += 1
-            elif status == JobStatus.FAILED:
-                execution.status = JobStatus.FAILED
-            elif execution.status == JobStatus.PENDING:
-                execution.status = JobStatus.RUNNING
+            if execution.start < 0: execution.start = start
 
-            if execution.num_jobs >= wf.num_tasks and execution.status != JobStatus.FAILED:
+            match status:
+                case JobStatus.SUCCESS:
+                    execution.num_successful_jobs += 1
+                case JobStatus.FAILED:
+                    execution.status = JobStatus.FAILED
+                case JobStatus.RUNNING:
+                    execution.status = JobStatus.RUNNING 
+                case JobStatus.QUEUED:
+                    execution.status = JobStatus.QUEUED
+                case _:
+                    execution.status = JobStatus.PENDING
+            
+            #Mark execution as SUCCESS if all jobs are done and none have failed
+            if execution.num_successful_jobs >= wf.num_tasks and execution.status != JobStatus.FAILED:
                 execution.status = JobStatus.SUCCESS
                 execution.stop = stop
 
+            execution.updated_at = stop
             session.add(execution)
             session.commit()
 
@@ -168,7 +195,8 @@ class WorkflowStorage(WorkflowStorageBase):
                 session.flush()
 
             for exec_id in exec_ids:
-                session.add(Execution(workflow_id=wf.id, batch_id=batch.id if batch is not None else None, exec_id=exec_id))
+                session.add(Execution(workflow_id=wf.id, batch_id=batch.id if batch is not None else None, 
+                                      exec_id=exec_id, num_jobs=wf.num_tasks))
             
             session.commit()
             if batch is not None:
@@ -182,11 +210,14 @@ class WorkflowStorage(WorkflowStorageBase):
             return session.exec(select(Batch)).all()
 
 
-    def get_executions_by_batch(self, batch_id: str) -> List[Execution]:
+    def get_executions(self, batch_id: Optional[str] = None, updated_after: Optional[float] = None) -> List[Execution]:
         with Session(self._engine) as session:
-            return session.exec(
-                select(Execution).where(Execution.batch_id == batch_id)
-            ).all()
+            query = select(Execution)
+            if batch_id is not None:
+                query = query.where(Execution.batch_id == batch_id)
+            if updated_after is not None:
+                query = query.where(Execution.updated_at > updated_after)
+            return session.exec(query).all()
 
 
     def get_workflows(self) -> List[Workflow]:
@@ -214,25 +245,33 @@ class WorkflowStorage(WorkflowStorageBase):
         return nx.node_link_graph(data) if as_nx else data
 
 
-    def get_job_traces_by_batch(self, batch_id: str) -> List[JobTrace]:
+    def get_job_traces_by_batch(self, batch_id: str, after_trace_id: Optional[int] = None) -> List[JobTrace]:
         with Session(self._engine) as session:
-            return session.exec(
+            query = (
                 select(JobTrace)
                 .select_from(JobTrace)
                 .join(Execution, JobTrace.execution_id == Execution.id)
                 .where(Execution.batch_id == batch_id)
-                .order_by(JobTrace.start)
-            ).all()
+            )
+            
+            if after_trace_id is not None:
+                query = query.where(JobTrace.id > after_trace_id)
+            
+            return session.exec(query.order_by(JobTrace.id)).all()
 
-    def get_job_traces(self, exec_id: str) -> List[JobTrace]:
+    def get_job_traces(self, exec_id: str, after_trace_id: Optional[int] = None) -> List[JobTrace]:
         with Session(self._engine) as session:
-            return session.exec(
+            query = (
                 select(JobTrace)
                 .select_from(JobTrace)
                 .join(Execution, JobTrace.execution_id == Execution.id)
                 .where(Execution.exec_id == exec_id)
-                .order_by(JobTrace.start)
-            ).all()
+            )
+            
+            if after_trace_id is not None:
+                query = query.where(JobTrace.id > after_trace_id)
+            
+            return session.exec(query.order_by(JobTrace.id)).all()
 
 
 class IntermediatesStorage(IntermediatesStorageBase):
@@ -259,7 +298,7 @@ class TrialStorage(TrialStorageBase):
         self._vector_dim = vector_dim
 
     def add_trial(self, step: int, design_vec: np.ndarray | torch.Tensor, objectives: dict,
-                  constraints: Optional[dict] = None, feasible: bool = True) -> None:
+                  constraints: Optional[dict] = None, feasible: bool = True) -> Trial:
         
         if self._readonly:
             raise RuntimeError("Cannot write to readonly TrialStorage.")
@@ -280,6 +319,9 @@ class TrialStorage(TrialStorageBase):
 
         if self._vector_dim is not None:
             self._index_design(trial_id, arr)
+
+        return trial
+
 
     def _index_design(self, trial_id: str, arr: np.ndarray) -> None:
         def _index_design_duckdb():
@@ -315,10 +357,12 @@ class TrialStorage(TrialStorageBase):
                 raise ValueError(f"Unsupported backend: {self._backend}")
             
 
-    def get_trials(self) -> list[Trial]:
+    def get_trials(self, since_step: Optional[int] = None) -> list[Trial]:
         with Session(self._engine) as session:
-            return session.exec(select(Trial).order_by(Trial.step)).all()
-
+            query = select(Trial)
+            if since_step is not None:
+                query = query.where(Trial.step > since_step)
+            return session.exec(query.order_by(Trial.step)).all()
 
     def get_similar_trials(self, query_vec: np.ndarray | torch.Tensor, 
                               k: int = 10, metric: str = "l2") -> list[Trial]:
@@ -394,7 +438,9 @@ class StudyStorage(StudyStorageBase):
         super().__init__(db_path="")
         self._engine = engine
         self._readonly = readonly
-        SQLModel.metadata.create_all(engine)
+        inspector = inspect(engine)
+        if not inspector.get_table_names():  # DB is empty
+            SQLModel.metadata.create_all(engine)
 
         self._trial_storage = TrialStorage(engine, readonly, vector_dim=vector_dim, backend=backend)
         self._workflow_storage = WorkflowStorage(engine, readonly)

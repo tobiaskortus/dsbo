@@ -68,7 +68,7 @@ class WorkflowStorageBase(ABC):
         pass
 
     @abstractmethod
-    def get_executions_by_batch(self, batch_id: str) -> List[Execution]:
+    def get_executions(self, batch_id: Optional[str] = None, updated_after: Optional[float] = None) -> List[Execution]:
         pass
 
     @abstractmethod
@@ -84,11 +84,11 @@ class WorkflowStorageBase(ABC):
         pass
 
     @abstractmethod
-    def get_job_traces_by_batch(self, batch_id: str) -> List[JobTrace]:
+    def get_job_traces_by_batch(self, batch_id: str, after_trace_id: Optional[int] = None) -> List[JobTrace]:
         pass
 
     @abstractmethod
-    def get_job_traces(self, exec_id: str) -> List[JobTrace]:
+    def get_job_traces(self, exec_id: str, after_trace_id: Optional[int] = None) -> List[JobTrace]:
         pass
 
     def create_task_stream_plugin(self, task_map: Dict[str, str] | None = None, name_map: Dict[str, str] | None = None) -> TaskStreamPlugin:
@@ -148,7 +148,7 @@ class TrialStorageBase(ABC):
         pass
 
     @abstractmethod
-    def get_trials(self) -> list[Trial]:
+    def get_trials(self, since_step: Optional[int] = None) -> list[Trial]:
         pass
 
     @abstractmethod

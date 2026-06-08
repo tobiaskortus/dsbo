@@ -4,6 +4,7 @@ import enum
 import uuid
 from typing import TYPE_CHECKING, Optional, List, Dict
 
+import time
 from sqlalchemy import Double, Column, LargeBinary, JSON
 from sqlmodel import Field, SQLModel
 
@@ -17,6 +18,7 @@ def _new_id() -> str:
 
 class JobStatus(str, enum.Enum):
     PENDING = "PENDING"
+    QUEUED  = "QUEUED"
     RUNNING = "RUNNING"
     SUCCESS = "SUCCESS"
     FAILED  = "FAILED"
@@ -44,17 +46,18 @@ class Execution(SQLModel, table=True):
     num_successful_jobs: int           = 0
     start:               float         = Field(sa_column=Column(Double), default=-1.0)
     stop:                float         = Field(sa_column=Column(Double), default=-1.0)
+    updated_at:          float         = Field(sa_column=Column(Double, index=True), default_factory=time.time)
 
 
 class JobTrace(SQLModel, table=True):
-    id:           str       = Field(default_factory=_new_id, primary_key=True)
-    execution_id: str       = Field(foreign_key="execution.id")
+    id:           Optional[int] = Field(default=None, primary_key=True)
+    execution_id: str           = Field(foreign_key="execution.id")
     task_key:     str
     name:         str
-    worker:       str
-    start:        float     = Field(sa_column=Column(Double))
-    stop:         float     = Field(sa_column=Column(Double))
-    log:          str
+    worker:       str       = Field(default="")
+    start:        float     = Field(sa_column=Column(Double), default=-1.0)
+    stop:         float     = Field(sa_column=Column(Double), default=-1.0)
+    log:          str       = Field(default="")
     status:       JobStatus
 
 
