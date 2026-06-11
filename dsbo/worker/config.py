@@ -2,7 +2,7 @@ from typing import NamedTuple, Optional
 import re
 
 #TODO rename to SlurmJobSpec
-class SlurmWorkerConfig(NamedTuple):
+class WorkerSpec(NamedTuple):
     partition: Optional[str] = None
     walltime: str = "48:00:00"
     memory: str = "48GB"
@@ -37,5 +37,5 @@ class SlurmWorkerConfig(NamedTuple):
         return { self.resource_key: 1 }
     
 
-DEFAULT_GPU_CONFIG = SlurmWorkerConfig(gpu_resources="gpu:1")
-DEFAULT_CPU_CONFIG = SlurmWorkerConfig()
+DEFAULT_GPU_CONFIG = WorkerSpec(gpu_resources="gpu:1")
+DEFAULT_CPU_CONFIG = WorkerSpec()

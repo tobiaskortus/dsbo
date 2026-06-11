@@ -14,7 +14,7 @@ from dsbo.utils.compile import dryrunnable, is_dry_run
 from dsbo.modules.dsl import ModuleDslMixin
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import AbstractFilePath, with_remote_workdir
-from dsbo.worker.config import SlurmWorkerConfig
+from dsbo.worker.config import WorkerSpec
 
 
 def ensure_dict_return(fn):
@@ -48,7 +48,7 @@ class Module(ModuleDslMixin, ABC):
         self._no_grad_op: bool = False
 
         self.i: int | None = None
-        self.resources: SlurmWorkerConfig | None = None
+        self.resources: WorkerSpec | None = None
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -107,7 +107,7 @@ class Module(ModuleDslMixin, ABC):
     def backward(self, design: dict, grad_output: dict | None = None) -> None:
         pass
 
-    def to(self, resource: SlurmWorkerConfig) -> Module:
+    def to(self, resource: WorkerSpec) -> Module:
         self.resources = resource
         return self
     

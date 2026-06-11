@@ -16,7 +16,7 @@ from dsbo.autograd import SerializedTensor, _pack, _unpack
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from dsbo.worker.config import SlurmWorkerConfig
+    from dsbo.worker.config import WorkerSpec
     from dsbo.workflow import Workflow
     from dsbo.modules import Module
 
@@ -132,7 +132,7 @@ class WorkerContext:
         return cls._current_worker.get()
 
 
-def get_num_gpus(worker_config: SlurmWorkerConfig) -> int:
+def get_num_gpus(worker_config: WorkerSpec) -> int:
     """Extract the number of GPUs from the gpu_resources SLURM string."""
     if worker_config.gpu_resources is None:
         return 0
@@ -144,7 +144,7 @@ def get_num_gpus(worker_config: SlurmWorkerConfig) -> int:
             raise ValueError(f"Invalid gpu_resources format: {worker_config.gpu_resources}") from e
 
 
-def get_extra_args(worker_config: SlurmWorkerConfig) -> tuple[list[str], list[str]]:
+def get_extra_args(worker_config: WorkerSpec) -> tuple[list[str], list[str]]:
     """Generate extra arguments for the Dask SlurmCluster based on the worker configuration."""
     resource_name = worker_config.resource_key
     if worker_config.gpu_resources is None:
@@ -156,7 +156,7 @@ def get_extra_args(worker_config: SlurmWorkerConfig) -> tuple[list[str], list[st
 
 
 class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
-    def __init__(self, job_specs: Iterable[SlurmWorkerConfig], logdir: str = "logs"):
+    def __init__(self, job_specs: Iterable[WorkerSpec], logdir: str = "logs"):
         self.logdir = logdir
 
         spec_dict = {

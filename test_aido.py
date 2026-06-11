@@ -7,7 +7,7 @@ from dsbo.backends.optuna import OptunaBackend
 from dsbo.backends.aido import AidoBackend
 from dsbo.transforms import MiniframeMergeTransform
 from dsbo.worker.dask import AdaptiveHeterogeneousDaskSlurmWorker
-from dsbo.worker.config import DEFAULT_CPU_CONFIG, GPU_CONFIG, SlurmWorkerConfig
+from dsbo.worker.config import DEFAULT_CPU_CONFIG, GPU_CONFIG, WorkerSpec
 from dsbo.workflow import  PatchableWorkflow, Workflow, optimize
 from dsbo.parameters import Constant, Constant, ParameterSpace, Group, Continuous, Categorical, Integer, Sampler
 
@@ -55,8 +55,8 @@ if __name__ == "__main__":
     constraint = MultiConstraint(G4CaloCostConstraint(max_cost=100_000),
                                  G4CaloLengthConstraint(max_length=200))
     
-    CPU_CONFIG = SlurmWorkerConfig(processes=5, job_cpu=5, walltime="48:00:00", memory="48GB", partition="epyc-256")
-    GPU_CONFIG = SlurmWorkerConfig(job_cpu=4, gpu_resources="gpu:1", memory="16GB", walltime="48:00:00")
+    CPU_CONFIG = WorkerSpec(processes=5, job_cpu=5, walltime="48:00:00", memory="48GB", partition="epyc-256")
+    GPU_CONFIG = WorkerSpec(job_cpu=4, gpu_resources="gpu:1", memory="16GB", walltime="48:00:00")
 
     simulation       = G4CaloSimulation("/home/nyl93mev/minicalosim_90baa21.sif").to(CPU_CONFIG)
     simulation_merge = MiniframeMergeTransform("output_df_*").to(CPU_CONFIG)
