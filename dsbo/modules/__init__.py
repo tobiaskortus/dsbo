@@ -14,7 +14,7 @@ from dsbo.utils.compile import dryrunnable, is_dry_run
 from dsbo.modules.dsl import ModuleDslMixin
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import AbstractFilePath, with_remote_workdir
-from dsbo.worker.config import WorkerSpec
+from dsbo.worker.spec import WorkerSpec
 
 
 def ensure_dict_return(fn):

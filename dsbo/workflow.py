@@ -1,33 +1,29 @@
 from __future__ import annotations
 
-import io
 import os
 import torch
 import warnings
-import matplotlib
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import networkx as nx
+
 from copy import deepcopy
-from typing import Sequence
 from itertools import chain
-from graphviz import Digraph
 from itertools import groupby
 from contextlib import nullcontext
-import matplotlib.colors as mcolors
 import torch.autograd.forward_ad as fw
-from IPython.display import Image, display
-from typing import Iterable, List, Any, overload
+from typing import Any, Iterable, List, Sequence, TYPE_CHECKING, overload
 
 from dsbo.modules import Module
 from dsbo.utils.compile import dry_run
 from dsbo.modules.dsl import DependencyDict
-from dsbo.utils.io import Workdir, get_subdir
 from dsbo.storage import get_current_storage
-from dsbo.worker.config import WorkerSpec
-from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.backends.aido.surrogate import LocalSurrogate
 from dsbo.utils.io import Workdir, get_subdir, get_workdir
+from dsbo.parameters import Candidate
+
+if TYPE_CHECKING:
+    from dsbo.worker.spec import WorkerSpec
+    from dsbo.parameters import ParameterSpace
+    
 
 
 class ResultsBatch(list):
@@ -420,6 +416,14 @@ class Workflow:
         return workers
 
     def visualize(self, filename=None, format='png'):
+        import io
+        import matplotlib
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import matplotlib.colors as mcolors
+        from graphviz import Digraph
+        from IPython.display import Image, display
+
         def _res_key(n):
             res = getattr(n, 'resources', None)
             return 'default' if res is None else f"mem={res.memory}, cpu={res.job_cpu}, gpu={res.gpu_resources}"

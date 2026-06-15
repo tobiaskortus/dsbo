@@ -6,17 +6,19 @@ import torch
 import contextvars
 import torch.autograd.forward_ad as fw
 
-from contextlib import contextmanager, nullcontext
+from collections import ChainMap
 from dask.delayed import Delayed, delayed
 from dask.distributed import Client, Future
+
 from dask_jobqueue.local import LocalCluster
-from dask_heterogeneous.slurm import HeterogeneousSlurmCluster
-from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
+from contextlib import contextmanager, nullcontext
 from dsbo.autograd import SerializedTensor, _pack, _unpack
+from dask_heterogeneous.hybrid import HybridCluster
+from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from dsbo.worker.config import WorkerSpec
+    from dsbo.worker.spec import WorkerSpec
     from dsbo.workflow import Workflow
     from dsbo.modules import Module
 
@@ -36,6 +38,10 @@ class DaskWorkerBase:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self.client.close()
+        self.cluster.close()
+
+    def close(self):
         self.client.close()
         self.cluster.close()
 
@@ -132,59 +138,27 @@ class WorkerContext:
         return cls._current_worker.get()
 
 
-def get_num_gpus(worker_config: WorkerSpec) -> int:
-    """Extract the number of GPUs from the gpu_resources SLURM string."""
-    if worker_config.gpu_resources is None:
-        return 0
-    else:
-        try:
-            resource_str = worker_config.gpu_resources
-            return int(resource_str.split(":")[-1])
-        except Exception as e:
-            raise ValueError(f"Invalid gpu_resources format: {worker_config.gpu_resources}") from e
-
-
-def get_extra_args(worker_config: WorkerSpec) -> tuple[list[str], list[str]]:
-    """Generate extra arguments for the Dask SlurmCluster based on the worker configuration."""
-    resource_name = worker_config.resource_key
-    if worker_config.gpu_resources is None:
-        return ([f"--resources {resource_name}=1"], [])
-    else:
-        num_gpus = get_num_gpus(worker_config)
-        return ([f"--resources {resource_name}={num_gpus}"],
-                [f"--gres={worker_config.gpu_resources}"])
-
-
-class AdaptiveHeterogeneousDaskSlurmWorker(DaskWorkerBase):
+class HeterogeneousDaskWorker(DaskWorkerBase):
     def __init__(self, job_specs: Iterable[WorkerSpec], logdir: str = "logs"):
         self.logdir = logdir
+        cluster_spec = dict(ChainMap(*[s.get_spec_dict() for s in job_specs]))
 
-        spec_dict = {
-            spec.resource_key: {
-                "cores": spec.job_cpu,
-                "queue": spec.partition,
-                "memory": spec.memory,
-                "walltime": spec.walltime,
-                "job_extra_directives": get_extra_args(spec)[1],
-                "processes": spec.processes,
-                "job_cpu": spec.job_cpu,
-                "resources": spec.resources,
-            }
-            for spec in job_specs
-        }
+        adapt_config = dict()
+        scale_config = dict()
 
-        self.cluster = HeterogeneousSlurmCluster(spec=spec_dict, log_directory=logdir)
-        self.cluster.adapt({spec_key: (0, 5) for spec_key in spec_dict.keys()})
+        for spec in job_specs:
+            assert (spec.min_worker is not None and 
+                    spec.max_worker is not None), "Define static or adaptive scaling with .scale() or .adapt()"
+
+            #TODO: enable constant scaling of workers + combinations of adapt and scale
+            adapt_config[spec.spec_key] = (spec.min_worker, spec.max_worker)
+
+        print(adapt_config)
+        self.cluster = HybridCluster(spec=cluster_spec, log_directory=logdir)
+        self.cluster.adapt(adapt_config)
         super().__init__(self.cluster)
 
     @classmethod
-    def from_workflow(cls, workflow: Workflow, logdir: str = "logs") -> "AdaptiveHeterogeneousDaskSlurmWorker":
+    def from_workflow(cls, workflow: Workflow, logdir: str = "logs") -> "HeterogeneousDaskWorker":
         job_specs = workflow.get_unique_workers()
         return cls(job_specs=job_specs, logdir=logdir)
-
-
-class LocalDaskWorker(DaskWorkerBase):
-    def __init__(self):
-        self.cluster = LocalCluster(cores=1, memory="4GB")
-        self.cluster.adapt(minimum=1, maximum=5)
-        super().__init__(self.cluster)
