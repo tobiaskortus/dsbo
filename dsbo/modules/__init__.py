@@ -14,6 +14,26 @@ from dsbo.worker.config import SlurmWorkerConfig
 from dsbo.utils.compile import dryrunnable, is_dry_run
 from dsbo.utils.functools import auto_wrap, ensure_dict_return
 from dsbo.utils.io import AbstractFilePath, with_remote_workdir
+from dsbo.worker.config import WorkerSpec
+
+
+def ensure_dict_return(fn):
+    @wraps(fn)
+    def _inner(*args, **kwargs):
+        res = fn(*args, **kwargs)
+        return {} if res is None else res
+    return _inner
+
+
+def auto_wrap(cls, method_name, *decorators):
+    raw = cls.__dict__.get(method_name)
+    if raw is None or getattr(raw, "_dsbo_wrapped", False):
+        return
+    wrapped = raw
+    for decorator in decorators:
+        wrapped = decorator(wrapped)
+    setattr(wrapped, "_dsbo_wrapped", True)
+    setattr(cls, method_name, wrapped)
 
 
 class Module(ModuleDslMixin, ABC):
@@ -28,7 +48,7 @@ class Module(ModuleDslMixin, ABC):
         self._no_grad_op: bool = False
 
         self.i: int | None = None
-        self.resources: SlurmWorkerConfig | None = None
+        self.resources: WorkerSpec | None = None
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -87,7 +107,7 @@ class Module(ModuleDslMixin, ABC):
     def backward(self, design: dict, grad_output: dict | None = None) -> None:
         pass
 
-    def to(self, resource: SlurmWorkerConfig) -> Module:
+    def to(self, resource: WorkerSpec) -> Module:
         self.resources = resource
         return self
     

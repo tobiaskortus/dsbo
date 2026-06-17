@@ -105,7 +105,8 @@ class HepEmShowSimulation(SimulationBase):
         if grad_output is not None:
             tasks = self._generate_tasks(absorbers, gaps, grad_outputs=grad_output)
 
-            n_workers = min(len(os.sched_getaffinity(0)) - 1, self.num_sims_per_particle * 2)
+            n_workers = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else mp.cpu_count()
+            n_workers = min(n_workers - 1, self.num_sims_per_particle * 2)
             with ThreadPoolExecutor(max_workers=n_workers) as executor:
                 results = list(executor.map(hepem_worker_fn, tasks))
 
@@ -137,8 +138,9 @@ class HepEmShowSimulation(SimulationBase):
             gaps_dot = None
 
         tasks = self._generate_tasks(absorbers, gaps, absorbers_dot, gaps_dot)
-
-        n_workers = min(len(os.sched_getaffinity(0)) - 1, self.num_sims_per_particle * 2)
+        
+        n_workers = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else mp.cpu_count()
+        n_workers = min(n_workers - 1, self.num_sims_per_particle * 2)
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             results = list(executor.map(hepem_worker_fn, tasks))
 

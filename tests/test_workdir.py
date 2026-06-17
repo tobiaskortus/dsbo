@@ -1,11 +1,13 @@
 import os
 from os import path
+import sys
+import warnings
 
 import pytest
 from unittest import mock
 from unittest.mock import patch
 
-from dsbo.utils.io import AbstractFilePath, AbstractPath, DefaultPaths, Workdir, get_file_suffix, get_subdir, get_workdir, with_remote_workdir
+from dsbo.utils.io import AbstractFilePath, AbstractPath, DefaultPaths, PathInfo, Workdir, get_file_suffix, get_subdir, get_workdir, with_remote_workdir
 
 
 @patch('os.path.exists', return_value=False)
@@ -84,9 +86,15 @@ def test_get_workdir_set(mock_makedirs, mock_exists):
 
 @patch('os.path.exists', return_value=False)
 @patch('os.makedirs')
-def test_get_workdir_none(mock_makedirs, mock_exists):
-    workdir = get_workdir()
-    assert workdir is None
+def test_get_workdir_auto_creates(mock_makedirs, mock_exists):
+    #Reset workdir context to make sure that the warning is triggered
+    Workdir._current_workdir.set(None)
+
+    with pytest.warns(UserWarning, match="No Workdir context active — using cwd as workdir root."):
+        workdir = get_workdir()
+
+    assert isinstance(workdir, Workdir)
+    assert workdir.root == os.getcwd()
 
 
 @patch('os.path.exists', return_value=False)
@@ -288,3 +296,33 @@ def test_abstract_file_path_neq_incorrect_type():
 
      assert a != 1
 
+
+@patch('os.path.exists', return_value=False)
+@patch('os.makedirs')
+def test_path_info_file(mock_makedirs, mock_exists):
+    """Nested create_subdir and use_file_suffix produce correct PathInfo."""
+    with Workdir.create("tmp", "simulation"):
+        with Workdir.create_subdir("batch_0"):
+            with Workdir.create_subdir("subbatch_0"):
+                with Workdir.use_file_suffix("0"):
+                    with Workdir.use_file_suffix("1"):
+                        filepath = Workdir.register_file("simulation", "data.npz")
+                        path = filepath()
+                        info = Workdir.get_path_info(path)
+                        assert info is not None
+                        assert info.root == "tmp"
+                        assert info.subdirs == ("batch_0", "subbatch_0")
+                        assert info.suffix == "0_1"
+                        assert info.subdir_path == "batch_0/subbatch_0"
+                        assert info.rel_path == "simulation"
+
+
+@patch('os.path.exists', return_value=False)
+@patch('os.makedirs')
+def test_path_info_no_workdir_context(mock_makedirs, mock_exists):
+    filepath = Workdir.register_file("simulation", "data.npz")
+    path = filepath()
+    info = Workdir.get_path_info(path)
+    assert info is not None
+    assert info.root == os.getcwd()
+    assert info.rel_path == "simulation"

@@ -23,7 +23,7 @@ from dsbo.utils.compile import dry_run
 from dsbo.modules.dsl import DependencyDict
 from dsbo.utils.io import Workdir, get_subdir
 from dsbo.storage import get_current_storage
-from dsbo.worker.config import SlurmWorkerConfig
+from dsbo.worker.config import WorkerSpec
 from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.backends.aido.surrogate import LocalSurrogate
 from dsbo.utils.io import Workdir, get_subdir, get_workdir
@@ -411,7 +411,7 @@ class Workflow:
         for batch in get_dependent_task_groups(self._representation):
             yield batch
 
-    def get_unique_workers(self) -> set[SlurmWorkerConfig]:
+    def get_unique_workers(self) -> set[WorkerSpec]:
         workers = set()
         for node in self._representation.nodes():
             if node.resources is not None:
