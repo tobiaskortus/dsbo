@@ -270,6 +270,17 @@ class Workdir(dict):
         if cls._cwd_workdir is None:
             cls._cwd_workdir = cls(os.getcwd())
         return cls._cwd_workdir
+    
+
+    @classmethod
+    def get_current_dir(cls) -> str:
+        workdir = get_workdir()
+        subdir_parts = get_subdir_parts()
+        if subdir_parts:
+            return os.path.join(workdir.workdir_root, *subdir_parts)
+        
+        return workdir.workdir_root
+
 
 
 def get_workdir() -> Workdir:
