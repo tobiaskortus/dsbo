@@ -13,7 +13,7 @@ from sqlalchemy import Engine, event as sa_event, inspect
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, case, create_engine, select
 
-from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase
+from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase, ArtifactStorageBase
 from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow
 
 
@@ -432,6 +432,13 @@ class TrialStorage(TrialStorageBase):
         return [id_to_trial[tid] for tid in trial_ids if tid in id_to_trial]
 
 
+class ArtifactStorage(ArtifactStorageBase):
+    def write_artifact_metadata(self, tag: str, step: int, metadata: dict) -> None:
+        pass
+
+    def load_artifact_metadata(self, tag: str, step: int | None = None) -> Optional[dict]:
+        pass
+
 class StudyStorage(StudyStorageBase):
 
     def __init__(self, engine: Engine, *, readonly: bool = False, vector_dim: int | None = None, backend: str = "duckdb"):
@@ -445,6 +452,7 @@ class StudyStorage(StudyStorageBase):
         self._trial_storage = TrialStorage(engine, readonly, vector_dim=vector_dim, backend=backend)
         self._workflow_storage = WorkflowStorage(engine, readonly)
         self._intermediates_storage = IntermediatesStorage(engine, readonly)
+        self._artifact_storage = ArtifactStorage("artifacts") #TODO: use the correct name
 
 
     @classmethod

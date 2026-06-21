@@ -8,9 +8,10 @@ import networkx as nx
 from pathlib import Path
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Callable, Dict, Generator, List, Optional, TYPE_CHECKING
+from typing import Callable, Dict, Generator, List, Mapping, Optional, TYPE_CHECKING
 
 from dsbo.utils.functools import auto_wrap
+from dsbo.storage.artifacts import LocalModelRegistry
 
 if TYPE_CHECKING:
     from dsbo.storage.taskstream import TaskStreamPlugin
@@ -160,6 +161,7 @@ class StudyStorageBase:
     def __init__(self, db_path: Path | str):
         self._trial_storage: Optional[TrialStorageBase] = None
         self._workflow_storage: Optional[WorkflowStorageBase] = None
+        self._artifact_storage: Optional[ArtifactStorageBase] = None
         self._intermediates_storage: Optional[IntermediatesStorageBase] = None
 
     @property
@@ -169,10 +171,14 @@ class StudyStorageBase:
     @property
     def intermediates(self) -> IntermediatesStorageBase:
         return self._intermediates_storage
-    
+
     @property
     def trials(self) -> TrialStorageBase:
         return self._trial_storage
+    
+    @property
+    def artifacts(self) -> ArtifactStorageBase:
+        return self._artifact_storage
 
     def __enter__(self):
         self._storage_token = _current_storage.set(self)
@@ -180,3 +186,24 @@ class StudyStorageBase:
 
     def __exit__(self, exc_type, exc, tb):
         _current_storage.reset(self._storage_token)
+
+
+class ArtifactStorageBase(ABC):
+    def __init__(self, storage_name: str):
+        self.model_registry = LocalModelRegistry(f"{storage_name}.artifacts")
+
+    def write_to_model_registry(self, artifact: torch.nn.Module, tag: str, step: int) -> None:
+        fpath = self.model_registry.save(artifact, tag, step)
+        self.write_artifact_metadata(tag, step, {"artifact_type": type(artifact).__name__})
+
+    def load_from_model_registry(self, tag: str, step: int | None = None) -> Mapping[str, torch.Tensor]:
+        metadata = self.load_artifact_metadata(tag, step)
+        return self.model_registry.load(tag, step)
+
+    @abstractmethod
+    def write_artifact_metadata(self, tag: str, step: int, metadata: dict) -> None:
+        pass
+
+    @abstractmethod
+    def load_artifact_metadata(self, tag: str, step: int | None = None) -> Optional[dict]:
+        pass
