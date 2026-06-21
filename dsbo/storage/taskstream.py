@@ -1,3 +1,4 @@
+import time
 from typing import Dict, Optional
 from distributed.diagnostics.plugin import SchedulerPlugin
 
@@ -28,6 +29,19 @@ class TaskStreamPlugin(SchedulerPlugin):
 
         def trigger_on_transition(status: JobStatus) -> None:
             try:
+                if status == JobStatus.RUNNING or status == JobStatus.QUEUED:
+                    ts = self.scheduler.tasks[key]
+                    worker = None
+                    if ts is not None and ts.processing_on is not None:
+                        worker = ts.processing_on
+    
+                    exec_id = self.task_map[key]
+                    name    = self.name_map[key]
+                    if status == JobStatus.RUNNING:  
+                        approx_start = time.time()
+                    self.writer(key, name, worker.name if worker != None else "unknown", approx_start, -1, exec_id, "", status)
+                    return
+
                 worker = self.scheduler.workers[kwargs["worker"]]
                 startstop = kwargs["startstops"][0]
                 exec_id = self.task_map[key]
@@ -39,9 +53,14 @@ class TaskStreamPlugin(SchedulerPlugin):
             except Exception as e:
                 print(f"[TaskStreamPlugin] transition error: {e}")
 
-
         match (start, finish):
+            case (_, "processing"):
+                trigger_on_transition(status=JobStatus.RUNNING)
+            case (_, "queued"):
+                trigger_on_transition(status=JobStatus.QUEUED)
             case (_, "memory"):
                 trigger_on_transition(status=JobStatus.SUCCESS)
             case (_, "erred"): 
                 trigger_on_transition(status=JobStatus.FAILED)
+            case (_, _):
+                pass

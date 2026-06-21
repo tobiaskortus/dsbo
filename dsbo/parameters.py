@@ -344,6 +344,44 @@ class ParameterSpace:
         return iter(self._params.items())
 
 
+class CandidateBatch(list[Candidate]):
+    def __init__(self, candidates: list[Candidate]):
+        super().__init__(candidates)
+        self._space = candidates[0].space
+
+    @property
+    def space(self) -> ParameterSpace:
+        return self[0].space
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        return torch.stack([c.tensor for c in self])
+
+    @property
+    def grad(self) -> Optional[torch.Tensor]:
+        if any(c.grad is None for c in self):
+            raise ValueError("Not all candidates have gradients")
+        return torch.stack([c.grad for c in self])
+
+    def detach(self) -> CandidateBatch:
+        return CandidateBatch([c.detach() for c in self])
+
+    def requires_grad_(self, requires_grad: bool = True) -> CandidateBatch:
+        for c in self:
+            c.requires_grad_(requires_grad)
+        return self
+
+    def sample_tangent(self) -> CandidateBatch:
+        return CandidateBatch([c.sample_tangent() for c in self])
+
+    def set_tangent(self, tangent: torch.Tensor) -> CandidateBatch:
+        assert tangent.shape[0] == len(self), "Tangent batch size must match candidate batch size"
+        for i, c in enumerate(self):
+            c.set_tangent(tangent[i])
+        return self
+
+
+
 def _collect(params: Dict[str, Union[DesignParameter, Group]], 
              key_fn: Callable[[Tuple[str, ...]], str] = '.'.join,
             _parts: Tuple[str, ...] = ()) -> Dict[str, DesignParameter]:

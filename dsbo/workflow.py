@@ -8,21 +8,29 @@ import networkx as nx
 from copy import deepcopy
 from itertools import chain
 from itertools import groupby
+import matplotlib.pyplot as plt
 from contextlib import nullcontext
+import matplotlib.colors as mcolors
+from contextlib import contextmanager
+import matplotlib.patches as mpatches
 import torch.autograd.forward_ad as fw
 from typing import Any, Iterable, List, Sequence, TYPE_CHECKING, overload
 
 from dsbo.modules import Module
-from dsbo.utils.compile import dry_run
 from dsbo.modules.dsl import DependencyDict
 from dsbo.storage import get_current_storage
+from dsbo.parameters import Candidate
+from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.backends.aido.surrogate import LocalSurrogate
 from dsbo.utils.io import Workdir, get_subdir, get_workdir
-from dsbo.parameters import Candidate
+from dsbo.surrogates.graph_transformations import (GraphMode, 
+                                                   build_module_surrogate_eval_graph, 
+                                                   build_module_surrogate_train_graph)
 
 if TYPE_CHECKING:
     from dsbo.worker.spec import WorkerSpec
     from dsbo.parameters import ParameterSpace
+    from dsbo.surrogates.workflow_surrogate import WorkflowSurrogate
     
 
 
@@ -57,6 +65,17 @@ class ResultsBatch(list):
                 return torch.stack(values)
 
         return values
+    
+    @property
+    def keys(self):
+        #TODO: handle failed tasks
+        if not self: return []
+        return self[0].keys()
+    
+    @property
+    def tensor(self):
+        #Handle failed tasks
+        return torch.stack([torch.tensor(list(item.values())) for item in self])
 
 
 class FusedModule(Module):
@@ -174,7 +193,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                     exec_ids.append(exec_id)
                     for depth, batch in enumerate(workflow.iterate_dependent_task_groups()):
                         for task in batch:
-                            dependencies = [delayed_map[p] for p in workflow._representation.predecessors(task)]
+                            dependencies = [delayed_map[p] for p in workflow.task_graph.predecessors(task)]
                             task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
                             delayed_map[task] = delayed_obj
                             task_ids.append(task_id)
@@ -185,7 +204,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
 
             storage = get_current_storage()
             if storage is not None:
-                wf_record = storage.workflow.add_workflow(workflow._representation)
+                wf_record = storage.workflow.add_workflow(workflow.task_graph)
                 storage.workflow.add_runs(wf_record, exec_ids, batch_path)
                 plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
                 worker.client.register_plugin(plugin, name="dsbo_task_stream")
@@ -207,7 +226,7 @@ def run_batch_reverse_autograd(
     from dsbo.utils.io.autograd import NumpyFile
     worker = WorkerContext.get_current_worker()
 
-    G = workflow._representation
+    G = workflow.task_graph
     tasks_rev = list(reversed(list(nx.topological_sort(G))))
 
     if worker is None:
@@ -359,7 +378,7 @@ def implements_backward(module: Module) -> bool:
 
 
 def assert_workflow_supports_backward_ad(workflow: Workflow) -> None:
-    unsupported = [m for m in workflow._representation.nodes()
+    unsupported = [m for m in workflow.task_graph.nodes()
                    if isinstance(m, Module) and not implements_backward(m) if not m._no_grad_op]
     if unsupported:
         raise AssertionError(
@@ -374,12 +393,13 @@ class Workflow:
         #Convert single module into DependencyDict format
         if isinstance(dependencies, Module):
             dependencies = DependencyDict({dependencies: []})
+        
+        self._task_graph = None
+        self._dependencies = dependencies
+        self._dependency_groups = dependencies.groups
 
-        self._dependency_groups = dependencies.groups if isinstance(dependencies, DependencyDict) else []
-        self._representation = nx.DiGraph(dependencies)
-
-        assert_no_self_loops(self._representation)
-        assert_no_duplicate_nodes(self._representation)
+        assert_no_self_loops(self.task_graph)
+        assert_no_duplicate_nodes(self.task_graph)
 
 
     def run(self, design: Candidate, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
@@ -405,12 +425,12 @@ class Workflow:
 
 
     def iterate_dependent_task_groups(self):
-        for batch in get_dependent_task_groups(self._representation):
+        for batch in get_dependent_task_groups(self.task_graph):
             yield batch
 
     def get_unique_workers(self) -> set[WorkerSpec]:
         workers = set()
-        for node in self._representation.nodes():
+        for node in self.task_graph.nodes():
             if node.resources is not None:
                 workers.add(node.resources)
         return workers
@@ -538,11 +558,11 @@ class Workflow:
         dot.attr('node', fontsize='10')
         dot.attr('edge', arrowsize='0.6')
 
-        nodes = set(self._representation.nodes())
+        nodes = set(self.task_graph.nodes())
         keys, color_map = _build_color_map(nodes)
         _color = lambda n: color_map.get(_res_key(n), '#d3d3d3')
         _dep_group_key = _build_dep_group_key(nodes)
-        levels = task_levels(self._representation)
+        levels = task_levels(self.task_graph)
 
         rep_entry: dict = {}
         rep_exit:  dict = {}
@@ -568,7 +588,7 @@ class Workflow:
                         for n in pg:
                             _add_node(sg, n)
 
-        for u, v in self._representation.edges():
+        for u, v in self.task_graph.edges():
             if u in hidden_nodes or v in hidden_nodes:
                 continue
             dot.edge(rep_exit.get(u, str(id(u))), rep_entry.get(v, str(id(v))))
@@ -579,12 +599,20 @@ class Workflow:
             with open(out_path, 'wb') as f:
                 f.write(_render_with_legend(fmt))
             return out_path
+        
+        from IPython.display import Image, display
         display(Image(_render_with_legend(format)))
 
+    @property
+    def task_graph(self) -> nx.DiGraph:
+        if self._task_graph == None:
+            self._task_graph = nx.DiGraph(self._dependencies) 
+
+        return self._task_graph
 
     @property
     def levels(self):
-        return task_levels(self._representation)
+        return task_levels(self.task_graph)
     
     @property
     def max_depth(self):
@@ -592,35 +620,91 @@ class Workflow:
 
 
 class PatchableWorkflow(Workflow):
-    """TODO: Integrate PatchableWorkflow into the main Workflow class, allowing for optional surrogate support without requiring a separate class."""
     def __init__(self, dependencies: dict[Module, Iterable[Module]] | Module) -> None:
+        self.surrogate: WorkflowSurrogate | None = None
+        self._mode: GraphMode | None = None
+        self._default_task_graph: nx.DiGraph | None = None
         super().__init__(dependencies)
-        self.surrogate = None
 
-    def patch(self, surrogate: LocalSurrogate):
+    def patch(self, surrogate: WorkflowSurrogate):
         self.surrogate = surrogate
 
-    def run(self, candidate: Candidate, use_surrogate: bool = True) -> dict[str, float]:
-        if self.surrogate and use_surrogate:
-            if not self.surrogate.trust_region(candidate) or self.surrogate.model is None:
-                #TODO: Accessing the _strategy attribute directly is a bit hacky!
-                self.surrogate._strategy.update(candidate)
-                self.surrogate.fit(candidate, workflow_callback=super().run_batch)
-            
-            print("Using surrogate predictions")
-            with dry_run():
-                self.surrogate.eval()
-                scheme = super().run(candidate)
-                x = candidate.tensor.unsqueeze(0).repeat(64, 1)
-                y = self.surrogate(x).mean(dim=0)
-                if y.numel() == 1: y = [y]
-                return {k: v for k, v in  zip(scheme.keys(), y)}
+    @contextmanager
+    def mode(self, mode: GraphMode):
+        old = self._mode
+        self._mode = mode
+        try: yield 
+        finally: self._mode = old
 
-        return super().run(candidate)
+
+    @property
+    def task_graph(self):
+        return self.task_graph_for(self._mode or (
+            GraphMode.WORKFLOW_SURROGATE
+            if self.surrogate is not None and self.surrogate._is_pretrained
+            else GraphMode.DEFAULT
+        ))
+
+    def task_graph_for(self, mode: GraphMode) -> nx.DiGraph:
+        if mode == GraphMode.MODULE_SURROGATE_EVAL:
+            return build_module_surrogate_eval_graph(self)
+        if mode == GraphMode.MODULE_SURROGATE_TRAIN:
+            return build_module_surrogate_train_graph(self)
+        if mode == GraphMode.WORKFLOW_SURROGATE:
+            return nx.DiGraph({self.surrogate: []})
+
+        if self._default_task_graph is None:
+            self._default_task_graph = nx.DiGraph(self._dependencies)
+        return self._default_task_graph
+
+    @property
+    def module_surrogates(self) -> dict[Module, WorkflowSurrogate]:
+        with self.mode(GraphMode.DEFAULT):
+            has_module_surrogate = lambda module: hasattr(module, "surrogate") and module.surrogate is not None
+            return {module: module.surrogate for module in self.task_graph.nodes if has_module_surrogate(module)}
+
+    @property
+    def uses_module_surrogates(self) -> bool:
+        return len(self.module_surrogates) > 0
+
+    def run_batch(self, candidates: list[Candidate], catch: tuple[Exception, ...] = ()) -> list[ResultsBatch]:
+        if self.surrogate is not None and self.surrogate._is_pretrained:
+            return [ResultsBatch([self.surrogate(candidate)]) for candidate in candidates]
+        return super().run_batch(candidates, catch)
+
+    def run(self, candidate: Candidate, catch: tuple[Exception, ...] = (), use_surrogate: bool = True) -> dict[str, float]:
+        if self.surrogate and use_surrogate:
+            if not self.surrogate.is_in_trust_region(candidate) or self.surrogate.surrogate is None:
+                with self.mode(GraphMode.DEFAULT):
+                    self.surrogate.fit(candidate, workflow_callback=super(PatchableWorkflow, self).run_batch)
+
+            return super(PatchableWorkflow, self).run(candidate, catch)
+
+        if self.uses_module_surrogates:
+            for _, surrogate in self.module_surrogates.items():
+                if not surrogate.is_in_trust_region(candidate):
+                    with self.mode(GraphMode.MODULE_SURROGATE_TRAIN):
+                        surrogate.fit(candidate, workflow_callback=super(PatchableWorkflow, self).run_batch)
+
+        with self.mode(GraphMode.DEFAULT):
+            return super(PatchableWorkflow, self).run(candidate, catch)
+
+
+
+def assert_no_mixed_surrogate_usage(workflow: PatchableWorkflow) -> None:
+    if workflow.surrogate is not None and workflow.uses_module_surrogates:
+        raise ValueError("Workflow cannot use both a workflow surrogate and module surrogates simultaneously.")
+
+
+def assert_leaf_surrogates(workflow: PatchableWorkflow) -> None:
+    for module in workflow.task_graph.nodes:
+        if hasattr(module, "surrogate") and module.surrogate is not None:
+            if len(list(workflow.task_graph.successors(module))) > 0:
+                raise ValueError("Module surrogates must be leaf nodes in the task graph.")
     
 
 def mergeable_components(task_graph: Workflow, attr="resources") -> List[List[Module]]:
-    G = task_graph._representation
+    G = task_graph.task_graph
     in_deg = dict(G.in_degree())
     out_deg = dict(G.out_degree())
 
@@ -642,7 +726,7 @@ def mergeable_components(task_graph: Workflow, attr="resources") -> List[List[Mo
 
 
 def update_task_graph(task_graph: Workflow, groups: list[list[Module]]) -> Workflow:
-    G = task_graph._representation.copy()
+    G = task_graph.task_graph.copy()
     for group in groups:
         merged = FusedModule(*group)
         preds = set().union(*(G.predecessors(t) for t in group)) - set(group)
@@ -655,7 +739,7 @@ def update_task_graph(task_graph: Workflow, groups: list[list[Module]]) -> Workf
         for s in succs: G.add_edge(merged, s)
 
     updated_task_graph= deepcopy(task_graph)
-    updated_task_graph._representation = G
+    updated_task_graph.task_graph = G
 
     return updated_task_graph
 
@@ -668,7 +752,7 @@ def validate_workflow_dependencies(workflow: Workflow, on_error: str = "warn"):
     #TODO: change default on_error from "warn" to "raise" once the implementation is stable
     assert on_error in ["raise", "warn", "ignore"]
 
-    G = workflow._representation
+    G = workflow.task_graph
     outputs = set()
 
     def handle_on_error(node, input):

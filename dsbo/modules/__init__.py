@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import inspect
-import types
 import weakref
 from abc import ABC
-from contextlib import nullcontext, suppress
 from functools import wraps
 from typing import Optional, Callable
 from dsbo.utils.io import Output, Input
 from dsbo.autograd import autograd_context
+from dsbo.logger import WorkflowTaskLogger
+from dsbo.modules.dsl import ModuleDslMixin
+from contextlib import nullcontext, suppress
 from dsbo.utils.io import Workdir, get_workdir
 from dsbo.utils.compile import dryrunnable, is_dry_run
-from dsbo.modules.dsl import ModuleDslMixin
-from dsbo.logger import WorkflowTaskLogger
+from dsbo.utils.functools import auto_wrap, ensure_dict_return
 from dsbo.utils.io import AbstractFilePath, with_remote_workdir
 from dsbo.worker.spec import WorkerSpec
 
