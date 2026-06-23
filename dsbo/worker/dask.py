@@ -10,6 +10,7 @@ from collections import ChainMap
 from dask.delayed import Delayed, delayed
 from dask.distributed import Client, Future
 
+import dsbo
 from dask_jobqueue.local import LocalCluster
 from contextlib import contextmanager, nullcontext
 from dsbo.autograd import SerializedTensor, _pack, _unpack
@@ -82,9 +83,12 @@ class DaskWorkerBase:
         is_forward_ad = fw._current_level > -1
         is_grad_enabled = torch.is_grad_enabled()
 
+        config_state = dsbo.config.get()
+
         task_id = uuid.uuid4()
 
         def _module_wrapper(module, design_arg, *deps):
+            dsbo.config._set(config_state)
             packed_result = module.run(
                 design=design_arg,
                 workdir=workdir,
@@ -107,9 +111,12 @@ class DaskWorkerBase:
         subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
         resources = getattr(module.resources, "resources", None)
+
+        config_state = dsbo.config.get()
         task_id = uuid.uuid4()
 
         def _backward_wrapper(module, candidate, *deps):
+            dsbo.config._set(config_state)
             grad_candidate = candidate.detach().requires_grad_()
             with torch.enable_grad():
                 module.run_backward(grad_candidate.values, grad_output, workdir=workdir, suffix=suffix, subdir=subdir)

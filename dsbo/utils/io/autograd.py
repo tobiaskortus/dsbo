@@ -3,7 +3,10 @@ import torch
 import numpy as np
 from abc import ABC, abstractmethod
 import torch.autograd.forward_ad as fw
+from torch.utils.data import DataLoader
 from torch.utils.hooks import RemovableHandle
+
+from dsbo.utils.io.workdir import AbstractFilePath
 
 
 class AutogradFileInterface(ABC):
@@ -190,3 +193,17 @@ class InMemoryFile(AutogradFileInterface):
     @classmethod
     def read_backward_gradient(cls, fpath: str) -> torch.Tensor:
         return torch.tensor(cls._storage[cls._gradient_path(fpath)]).float()
+
+
+class AutogradFileStorage(AutogradFileInterface):
+    @classmethod
+    @abstractmethod
+    def to_data_loader(
+        cls,
+        data_fpath_abstract: AbstractFilePath,
+        cond_fpath_abstract: AbstractFilePath,
+        batch_size: int = 64,
+        shuffle: bool = True,
+        num_workers: int = 0,
+    ) -> DataLoader:
+       pass

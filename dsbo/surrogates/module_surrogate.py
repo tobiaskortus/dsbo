@@ -5,70 +5,57 @@ from typing import Any, Callable
 
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 
 from diffusers.schedulers import DDPMScheduler, DDIMScheduler
 
 from dsbo.modules import Module
-from dsbo.utils.io import Workdir
 from dsbo.parameters import Candidate
-from dsbo.utils.io.autograd import NumpyFile
+from dsbo.config import get_active_file_backend
 from dsbo.utils.io.workdir import AbstractFilePath
 from dsbo.surrogates import SurrogateBase, SurrogateStrategy
 from dsbo.surrogates.diffusion import LocalSurrogateDiffuser, Trainer
 
 
-import os
-from pathlib import Path
+class LazyShape(tuple):
+    _fpath: AbstractFilePath
+    _resolved: tuple[int, ...] | None
 
+    def __new__(cls, fpath: AbstractFilePath):
+        instance = super().__new__(cls)
+        instance._fpath = fpath
+        instance._resolved = None
+        return instance
 
-def normalize(X: torch.Tensor) -> torch.Tensor:
-    mean = X.mean(dim=0, keepdim=True)
-    std = X.std(dim=0, keepdim=True) + 1e-8
-    return (X - mean) / std, mean, std
+    def _resolve(self):
+        if self._resolved is not None:
+            return
+        Storage = get_active_file_backend()
+        shards = Storage._discover_shards_from_abstract(self._fpath)
+        if not shards:
+            raise RuntimeError(
+                f"Cannot resolve shape: no shard files found for "
+                f"'{self._fpath.filename}'. The module must be run first."
+            )
+        arr = np.load(shards[0], mmap_mode="r")
+        self._resolved = arr.shape[1:]
 
+    def __getitem__(self, idx):  # type: ignore[override]
+        self._resolve()
+        return self._resolved[idx]
 
-def load_data(file_path: AbstractFilePath | None) -> torch.Tensor | None:
-    #TODO: This is just for testing purposes
-    if file_path is None:
-        return None
+    def __len__(self):
+        self._resolve()
+        return len(self._resolved)
 
-    from dsbo.utils.io.workdir import PathAnnotation
-    if isinstance(file_path, PathAnnotation):
-        file_path = file_path.path
+    def __iter__(self):
+        self._resolve()
+        return iter(self._resolved)
 
-    wd = Workdir._current_workdir.get()
-    if wd is None:
-        return None
-
-    search_root = Path(wd.root)
-    name, ext = os.path.splitext(file_path.filename)
-    rel = file_path.pathname
-
-    patterns = [f"**/{rel}/{file_path.filename}"]
-    if file_path._unique:
-        patterns.append(f"**/{rel}/{name}_*{ext}")
-    patterns.append(f"**/batch_*/{rel}/{file_path.filename}")
-    if file_path._unique:
-        patterns.append(f"**/batch_*/{rel}/{name}_*{ext}")
-
-    matches = sorted(set(
-        str(p) for pat in patterns
-        for p in search_root.glob(pat)
-        if p.is_file() and "_gradient" not in p.name and "_probe" not in p.parts
-    ))
-
-    chunks = []
-    for m in matches:
-        try:
-            chunks.append(torch.from_numpy(np.load(m)["primal"]).float())
-        except Exception:
-            continue
-    if not chunks:
-        return None
-    out = torch.cat(chunks, dim=0)
-    return out if out.ndim > 1 else out.unsqueeze(-1)
-
+    def __repr__(self):
+        if self._resolved is None:
+            return "LazyShape(unresolved)"
+        return repr(self._resolved)
 
 
 class ModuleSurrogateContract:
@@ -76,39 +63,34 @@ class ModuleSurrogateContract:
         self,
         output_dim: tuple[int, ...],
         output_samples: int,
+        conditional_dim: tuple[int, ...] | None = None,
         output_conditional_fn: Callable | None = None,
         data_file: AbstractFilePath | None = None,
         conditional_file: AbstractFilePath | None = None,
     ):
         self.output_dim = output_dim
         self.output_samples = output_samples
+        self.conditional_dim = conditional_dim
         self.output_conditional_fn = output_conditional_fn
         self.data_file = data_file
         self.conditional_file = conditional_file
 
-    def load_training_data(self) -> tuple[torch.Tensor, torch.Tensor]:
-        X = load_data(self.data_file)
-        C = load_data(self.conditional_file)
-        if X is None or C is None:
-            raise RuntimeError(
-                "Could not load training data — make sure the module has "
-                "been run for this candidate before calling train()."
-            )
-        if X.ndim == 1:
-            X = X.unsqueeze(-1)
-        if C.ndim == 1:
-            C = C.unsqueeze(-1)
-        return X, C
+    def to_data_loader(self, batch_size: int = 256) -> DataLoader:
+        Storage = get_active_file_backend()
+        return Storage.to_data_loader(
+            self.data_file, self.conditional_file, batch_size=batch_size
+        )
 
     def write_output(self, design: dict, output_tensor: torch.Tensor):
+        Storage = get_active_file_backend()
         primal = output_tensor.detach().cpu().numpy()
         if self.data_file is not None:
-            NumpyFile.write_primal(self.data_file(), primal)
+            Storage.write_primal(self.data_file(), primal)
         if self.conditional_file is not None:
             cond = self.output_conditional_fn(design) \
                 if self.output_conditional_fn is not None \
                 else torch.tensor(list(design.values()), dtype=torch.float32)
-            NumpyFile.write_primal(self.conditional_file(), cond.detach().cpu().numpy())
+            Storage.write_primal(self.conditional_file(), cond.detach().cpu().numpy())
 
     def __repr__(self) -> str:
         return (
@@ -156,8 +138,8 @@ class ModuleSurrogate(SurrogateBase):
 
     
     def register_contract(self, contract: ModuleSurrogateContract):
-        if contract.output_dim is None or contract.output_samples <= 0:
-            raise ValueError("output_dim and output_samples > 0 are required.")
+        if contract.output_samples <= 0:
+            raise ValueError("output_samples > 0 is required.")
         self.contract = contract
 
     @requires_contract
@@ -170,7 +152,7 @@ class ModuleSurrogate(SurrogateBase):
         pass
 
 
-class ModuleSurrogate(ModuleSurrogate):
+class DiffusersModuleSurrogate(ModuleSurrogate):
     def __init__(self, strategy: SurrogateStrategy):
         super().__init__(surrogate=None, strategy=strategy)
         self._diffusion_model: DiffusionModelWrapper | None = None
@@ -192,7 +174,9 @@ class ModuleSurrogate(ModuleSurrogate):
         self._sample_scheduler.set_timesteps(self._sample_scheduler.config.num_train_timesteps)
         with torch.no_grad():
             B = cond.shape[0]
-            x = torch.randn(B, 1, self.contract.output_dim[0], device=cond.device)
+            #Add an additional leading dimension for vector-shaped outputs to stay compatible with the diffusers API
+            output_dim = (1, *self.contract.output_dim) if len(self.contract.output_dim) == 1 else self.contract.output_dim
+            x = torch.randn(B, *output_dim, device=cond.device)
             for t in self._sample_scheduler.timesteps:
                 v = self._diffusion_model.diffusion_model(
                     x, t.expand(B).to(cond.device), parameters=cond
@@ -202,9 +186,8 @@ class ModuleSurrogate(ModuleSurrogate):
         x = x.squeeze(1)
         if len(self.contract.output_dim) > 1:
             x = x.view(B, *self.contract.output_dim)
-        x = x * self._diffusion_model.X_std + self._diffusion_model.X_mean
-        print(f"[SURROGATE __call__] output shape={x.shape}, mean={x.mean():.3f}")
 
+        x = x * self._diffusion_model.X_std + self._diffusion_model.X_mean
         self.contract.write_output(design, x)
         return {}
 
@@ -214,37 +197,42 @@ class ModuleSurrogate(ModuleSurrogate):
         candidates = self.strategy.generate_candidates(candidate, candidate.space)
         workflow_callback(candidates)
 
-        # TODO: improve this!!!!
-        X, C = self.contract.load_training_data()
+        loader = self.contract.to_data_loader(batch_size=256)
 
-        X_norm, X_mean, X_std = normalize(X)
-        C_norm, C_mean, C_std = normalize(C)
+        output_dim = self.contract.output_dim
+        cond_dim = self.contract.conditional_dim
+
+        loader.dataset.compute_stats()
 
         model = LocalSurrogateDiffuser(
-            objective_dim=X.shape[-1],
-            parameter_dim=C.shape[-1],
+            objective_dim=output_dim,
+            parameter_dim=cond_dim,
             emb_dim=128,
             hidden_dim=128,
             n_layers=4,
         )
 
-        self._diffusion_model = DiffusionModelWrapper(model, X_mean, X_std, C_mean, C_std)
+        self._diffusion_model = DiffusionModelWrapper(
+            model,
+            loader.dataset.mean_x, loader.dataset.std_x,
+            loader.dataset.mean_c, loader.dataset.std_c,
+        )
         self._noise_scheduler = DDPMScheduler(num_train_timesteps=250, prediction_type="v_prediction")
         self._sample_scheduler = DDIMScheduler(num_train_timesteps=250, prediction_type="v_prediction")
 
         optim = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=100, eta_min=1e-6)
-        loader = DataLoader(TensorDataset(X_norm, C_norm), batch_size=min(len(X), 256), shuffle=True)
 
-        loss_history = Trainer(model, self._noise_scheduler, optim, lr_scheduler, device=X.device).fit(
-            n_epochs=100, dataloader=loader, show_progress=False
-        )
+        loss_history = Trainer(
+            model, self._noise_scheduler, optim, lr_scheduler,
+            device=next(model.parameters()).device,
+        ).fit(n_epochs=100, dataloader=loader, show_progress=False)
 
         self.training_metrics = {
-            "n_samples": len(X),
+            "n_samples": len(loader.dataset),
             "n_candidates": len(candidates),
-            "output_dim": X.shape[-1],
-            "cond_dim": C.shape[-1],
+            "output_dim": output_dim,
+            "cond_dim": cond_dim,
             "loss_history": loss_history,
             "final_loss": loss_history[-1] if loss_history else None,
         }

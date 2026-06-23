@@ -72,18 +72,43 @@ class LocalSurrogateDiffuser(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
-        objective_dim: int = 64,
+        objective_dim: int | tuple[int, ...] = 64,
         emb_dim: int = 128,
         hidden_dim: int = 256,
-        parameter_dim: int = 16,
+        parameter_dim: int | tuple[int, ...] = 16,
         n_layers: int = 6,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
     ):
         super().__init__()
+        if not isinstance(objective_dim, int):
+            if len(objective_dim) != 1:
+                raise ValueError(
+                    f"objective_dim must be a 1-D vector, got shape {tuple(objective_dim)}. "
+                    "Multi-dimensional outputs are not supported."
+                )
+            objective_dim = objective_dim[0]
+        if not isinstance(parameter_dim, int):
+            if len(parameter_dim) != 1:
+                raise ValueError(
+                    f"parameter_dim must be a 1-D vector, got shape {tuple(parameter_dim)}. "
+                    "Multi-dimensional conditioning is not supported."
+                )
+            parameter_dim = parameter_dim[0]
         self.cond_dim = parameter_dim
 
         self.time_emb = PositionalEncoding(emb_dim)
         film_cond_dim = parameter_dim
+
+        self.cond_proj = nn.Sequential(
+            nn.Linear(parameter_dim, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+
+        # Learnable positional encoding for output dimensions
+        # This tells the model which dimension is which calorimeter layer
+        self.out_pos_emb = nn.Parameter(torch.zeros(1, objective_dim))
+        nn.init.normal_(self.out_pos_emb, std=0.1)
 
         self.in_fc = nn.Linear(objective_dim, emb_dim)
         self.blocks = nn.ModuleList([MLPBlock(emb_dim, hidden_dim, film_cond_dim, dropout) \
@@ -94,17 +119,23 @@ class LocalSurrogateDiffuser(ModelMixin, ConfigMixin):
         self,
         x: torch.Tensor,        # (B, 1, seq_len)
         t: torch.Tensor,        # (B,)
-        parameters: torch.Tensor | None = None,
+        c: torch.Tensor | None = None,
         return_dict: bool = True,
     )  -> LocalSurrogateDiffuserOutput | torch.Tensor:
         
         #TODO: Is this really necessary to stay compatible with diffusers or is (B, n) also fine?
         x = x.squeeze(1)
+
+        x = x + self.out_pos_emb
+        
         x = self.in_fc(x)
         x = x + self.time_emb(t)
+        
+        if c is not None:
+            x = x + self.cond_proj(c)
 
         for blk in self.blocks:
-            x = blk(x, parameters)
+            x = blk(x, c)
 
         x = self.out_fc(x)
         x = x.unsqueeze(1)
@@ -113,13 +144,13 @@ class LocalSurrogateDiffuser(ModelMixin, ConfigMixin):
             return LocalSurrogateDiffuserOutput(sample=x)
         return x
 
-    def sample(self, parameters: torch.Tensor, scheduler: SchedulerMixin) -> torch.Tensor:
-        B = parameters.shape[0]
-        x = torch.randn(B, 1, self.config.objective_dim, device=parameters.device)
+    def sample(self, c: torch.Tensor, scheduler: SchedulerMixin) -> torch.Tensor:
+        B = c.shape[0]
+        x = torch.randn(B, 1, self.config.objective_dim, device=c.device)
 
         for t_scalar in scheduler.timesteps:
-            t_batch = t_scalar.expand(B).to(parameters.device)
-            v_pred = self(x, t_batch, parameters).sample
+            t_batch = t_scalar.expand(B).to(c.device)
+            v_pred = self(x, t_batch, c).sample
             step_out = scheduler.step(v_pred, t_scalar, x)
             x = step_out.prev_sample
 
@@ -165,8 +196,9 @@ class Trainer:
         x_t = self.noise_scheduler.add_noise(x0, noise, t)
         target = self.noise_scheduler.get_velocity(x0, noise, t)
 
-        pred = self.model(x_t, t, parameters=cond).sample
-        loss = F.mse_loss(pred, target)
+        pred = self.model(x_t, t, cond).sample
+        # Model outputs (B, 1, n) — squeeze to match target (B, n)
+        loss = F.mse_loss(pred.squeeze(1), target)
 
         self.optimizer.zero_grad()
         loss.backward()

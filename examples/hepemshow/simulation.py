@@ -9,9 +9,10 @@ from pathlib import Path
 import multiprocessing as mp
 import torch.autograd.forward_ad as fw
 
-from dsbo.utils.io.autograd import NumpyFile
+from dsbo.config import get_active_file_backend
 from dsbo.modules.simulation import SimulationBase
 from dsbo.utils.io import Workdir, DefaultPaths, Output
+from dsbo.surrogates.module_surrogate import ModuleSurrogateContract, LazyShape
 
 
 from concurrent.futures import ThreadPoolExecutor
@@ -43,14 +44,15 @@ def hepem_worker_fn(kwargs):
 
 
 class HepEmShowSimulation(SimulationBase):
-    def __init__(self, 
-                 num_events: int = 100, 
-                 num_sims_per_particle: int = 10, 
-                 particle_energy_min: float = 1000,
-                 particle_energy_max: float = 50_000,
-                 verbose: bool = False,
-                 **kwargs):
-        
+    def __init__(
+        self,
+        num_events: int = 100,
+        num_sims_per_particle: int = 10,
+        particle_energy_min: float = 1000,
+        particle_energy_max: float = 50_000,
+        verbose: bool = False,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.num_events = num_events
         self.num_sims_per_particle = num_sims_per_particle
@@ -61,6 +63,7 @@ class HepEmShowSimulation(SimulationBase):
 
         self.target_file = Output(Workdir.register_file(DefaultPaths.SIMULATION, "target.npz", unique_filename=True))
         self.simulation_file = Output(Workdir.register_file(DefaultPaths.SIMULATION, "simulation.npz", unique_filename=True))
+        self._contract: ModuleSurrogateContract | None = None
 
     def _generate_tasks(self, absorbers, gaps, absorbers_dot=None, gaps_dot=None, grad_outputs=None):
         hepem_data = get_hepemshow_data_file()
@@ -166,10 +169,57 @@ class HepEmShowSimulation(SimulationBase):
 
     def simulate(self, design):
         edep_per_layer, combined_targets = self._simulate_impl(design)
-        NumpyFile.write(self.target_file(), combined_targets)
-        NumpyFile.write(self.simulation_file(), edep_per_layer)
+
+        absorbers = torch.as_tensor(design["absorber"]).float()
+        gaps = torch.as_tensor(design["gap"]).float()
+        n = combined_targets.shape[0]
+        design_tiled = torch.cat([
+            absorbers.unsqueeze(0).expand(n, -1),
+            gaps.unsqueeze(0).expand(n, -1),
+        ], dim=-1)
+        conditioning = torch.cat([combined_targets, design_tiled], dim=-1)
+
+        Storage = get_active_file_backend()
+        Storage.write(self.target_file(), conditioning)
+        Storage.write(self.simulation_file(), edep_per_layer)
 
     def backward(self, design, grad_output: torch.Tensor = None):
-        bar_edep = NumpyFile.read_backward_gradient(self.simulation_file()).numpy()
+        Storage = get_active_file_backend()
+        bar_edep = Storage.read_backward_gradient(self.simulation_file()).numpy()
         self._simulate_impl(design, grad_output=bar_edep)
 
+    @property
+    def surrogate_contract(self) -> ModuleSurrogateContract:
+        if self._contract is not None:
+            return self._contract
+
+        def output_conditional_fn(design):
+            absorbers = np.clip(design["absorber"].detach().numpy(), 1e-3, None)
+            gaps = np.clip(design["gap"].detach().numpy(), 1e-3, None)
+            indices = {"e+": 0, "gamma": 1}
+            tasks = self._generate_tasks(absorbers, gaps)
+            target = torch.tensor([indices[t["particle"]] for t in tasks], dtype=torch.float32)
+            target = target.repeat_interleave(self.num_events)
+            particle_energies = torch.FloatTensor(target.shape).uniform_(
+                self.particle_energy_min, self.particle_energy_max
+            )
+
+            design_tiled = torch.cat([
+                torch.as_tensor(absorbers).float().unsqueeze(0).expand(len(target), -1),
+                torch.as_tensor(gaps).float().unsqueeze(0).expand(len(target), -1),
+            ], dim=-1)
+
+            return torch.cat([
+                torch.stack([target, particle_energies], dim=1),
+                design_tiled,                                   
+            ], dim=-1)
+
+        self._contract = ModuleSurrogateContract(
+            output_dim=LazyShape(self.simulation_file.path),
+            conditional_dim=LazyShape(self.target_file.path),
+            output_samples=self.num_events * self.num_sims_per_particle * 2,
+            output_conditional_fn=output_conditional_fn,
+            data_file=self.simulation_file,
+            conditional_file=self.target_file,
+        )
+        return self._contract

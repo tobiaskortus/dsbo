@@ -19,6 +19,7 @@ from typing import Any, Iterable, List, Sequence, TYPE_CHECKING, overload
 from dsbo.modules import Module
 from dsbo.modules.dsl import DependencyDict
 from dsbo.storage import get_current_storage
+from dsbo.config import get_active_file_backend, config
 from dsbo.parameters import Candidate
 from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.backends.aido.surrogate import LocalSurrogate
@@ -223,7 +224,7 @@ def run_batch_reverse_autograd(
     catch: tuple[Exception, ...] = (),
 ) -> List[torch.Tensor]:
     from dsbo.worker.dask import WorkerContext
-    from dsbo.utils.io.autograd import NumpyFile
+    from dsbo.config import get_active_file_backend
     worker = WorkerContext.get_current_worker()
 
     G = workflow.task_graph
@@ -235,7 +236,7 @@ def run_batch_reverse_autograd(
             try:
                 grad_candidate = candidate.detach().requires_grad_()
                 with torch.enable_grad():
-                    NumpyFile.reset_gradient_state()
+                    get_active_file_backend().reset_gradient_state()
                     for task in tasks_rev:
                         is_sink = len(list(G.successors(task))) == 0
                         if task._no_grad_op:
@@ -681,10 +682,13 @@ class PatchableWorkflow(Workflow):
             return super(PatchableWorkflow, self).run(candidate, catch)
 
         if self.uses_module_surrogates:
-            for _, surrogate in self.module_surrogates.items():
-                if not surrogate.is_in_trust_region(candidate):
-                    with self.mode(GraphMode.MODULE_SURROGATE_TRAIN):
-                        surrogate.fit(candidate, workflow_callback=super(PatchableWorkflow, self).run_batch)
+            with Workdir.create_subdir("module_surrogate_training"):
+                for _, surrogate in self.module_surrogates.items():
+                    if not surrogate.is_in_trust_region(candidate):
+                        with self.mode(GraphMode.MODULE_SURROGATE_TRAIN):
+                            from dsbo.utils.io.sharded import ShardedNumpyStorage
+                            with config.use(file_backend=ShardedNumpyStorage):
+                                surrogate.fit(candidate, workflow_callback=super(PatchableWorkflow, self).run_batch)
 
         with self.mode(GraphMode.DEFAULT):
             return super(PatchableWorkflow, self).run(candidate, catch)

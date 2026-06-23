@@ -4,7 +4,8 @@ import inspect
 import weakref
 from abc import ABC
 from functools import wraps
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
+
 from dsbo.utils.io import Output, Input
 from dsbo.autograd import autograd_context
 from dsbo.logger import WorkflowTaskLogger
@@ -13,8 +14,12 @@ from contextlib import nullcontext, suppress
 from dsbo.utils.io import Workdir, get_workdir
 from dsbo.utils.compile import dryrunnable, is_dry_run
 from dsbo.utils.functools import auto_wrap, ensure_dict_return
-from dsbo.utils.io import AbstractFilePath, with_remote_workdir
-from dsbo.worker.spec import WorkerSpec
+from dsbo.utils.io import  AbstractFilePath, with_remote_workdir
+
+if TYPE_CHECKING:
+    from dsbo.worker.spec import WorkerSpec
+    from dsbo.surrogates.module_surrogate import ModuleSurrogate
+    from dsbo.surrogates.module_surrogate import ModuleSurrogateContract
 
 
 def ensure_dict_return(fn):
@@ -84,6 +89,15 @@ class Module(ModuleDslMixin, ABC):
 
     def __repr__(self):
         return self.name
+    
+    @property
+    def surrogate_contract(self) -> ModuleSurrogateContract:
+        raise NotImplementedError("No surrogate contract defined for this module.")
+
+    def patch(self, surrogate: ModuleSurrogate):
+        surrogate.register_contract(self.surrogate_contract)
+        self.surrogate = surrogate
+        return self
 
     @property
     def name(self) -> str:
