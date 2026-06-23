@@ -179,7 +179,7 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
             x = torch.randn(B, *output_dim, device=cond.device)
             for t in self._sample_scheduler.timesteps:
                 v = self._diffusion_model.diffusion_model(
-                    x, t.expand(B).to(cond.device), parameters=cond
+                    x, t.expand(B).to(cond.device), cond
                 ).sample
                 x = self._sample_scheduler.step(v, t, x).prev_sample
 
