@@ -163,10 +163,11 @@ class Trainer:
         model: nn.Module,
         noise_scheduler: SchedulerMixin,
         optimizer: Optimizer,
-        lr_scheduler: LRScheduler =None,
+        lr_scheduler: LRScheduler = None,
         ema_model=None,
         device=None,
         grad_clip: float = 1.0,
+        model_tag: str | None = None,
     ):
         self.model = model
         self.noise_scheduler = noise_scheduler
@@ -175,6 +176,7 @@ class Trainer:
         self.ema_model = ema_model
         self.device = device or next(model.parameters()).device
         self.grad_clip = grad_clip
+        self._model_tag = model_tag
 
         if lr_scheduler is not None:
             step_sig = inspect.signature(lr_scheduler.step)
@@ -217,6 +219,9 @@ class Trainer:
         if show_progress:
             outer = tqdm(outer, desc="Epochs")
 
+        from dsbo.storage import get_current_storage
+        storage = get_current_storage()
+
         for epoch in outer:
             epoch_loss = 0.0
             pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False)
@@ -237,5 +242,8 @@ class Trainer:
 
             if show_progress:
                 outer.set_postfix({"loss": f"{avg:.5f}"})
+
+            if storage is not None and self._model_tag is not None:
+                storage.intermediates.add_scalar(f"{self._model_tag}/mse_loss", epoch, avg)
 
         return epoch_losses

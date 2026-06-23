@@ -288,6 +288,28 @@ class IntermediatesStorage(IntermediatesStorageBase):
             session.add(Intermediate(tag=tag, step=step, value=value, walltime=time.time()))
             session.commit()
 
+    def get_scalars(self, tag: str | None = None) -> list[float] | dict[str, list[float]]:
+        with Session(self._engine) as session:
+            query = select(Intermediate).order_by(Intermediate.step)
+            if tag is not None:
+                query = query.where(Intermediate.tag == tag)
+            rows = session.exec(query).all()
+
+        if tag is not None:
+            return [r.value for r in rows]
+
+        result: dict[str, list[float]] = {}
+        for r in rows:
+            result.setdefault(r.tag, []).append(r.value)
+        return result
+
+    def get_tags(self) -> list[str]:
+        with Session(self._engine) as session:
+            rows = session.exec(
+                select(Intermediate.tag).distinct().order_by(Intermediate.tag)
+            ).all()
+        return list(rows)
+
 
 class TrialStorage(TrialStorageBase):
     def __init__(self, engine: Engine, readonly: bool = False, vector_dim: int | None = None, backend: str = "duckdb"):

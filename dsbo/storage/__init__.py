@@ -111,6 +111,14 @@ class IntermediatesStorageBase(ABC):
     def add_scalar(self, tag: str, step: int, value: float) -> None:
         pass
 
+    @abstractmethod
+    def get_scalars(self, tag: str | None = None) -> list[float] | dict[str, list[float]]:
+        pass
+
+    @abstractmethod
+    def get_tags(self) -> list[str]:
+        pass
+
 
 class TrialStorageBase(ABC):
     def __init__(self):

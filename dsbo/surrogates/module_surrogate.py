@@ -226,6 +226,7 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
         loss_history = Trainer(
             model, self._noise_scheduler, optim, lr_scheduler,
             device=next(model.parameters()).device,
+            model_tag=type(self).__name__.lower(),
         ).fit(n_epochs=100, dataloader=loader, show_progress=False)
 
         self.training_metrics = {
