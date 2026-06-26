@@ -24,7 +24,11 @@ class WelfordAggregate:
 
 
 class ShardedDataset(Dataset):
-    def __init__(self, data_paths: list[str], cond_paths: list[str]):
+    def __init__(
+        self,
+        data_paths: list[str],
+        cond_paths: list[str],
+    ):
         self._data_paths = sorted(data_paths)
         self._cond_paths = sorted(cond_paths)
         assert len(self._data_paths) == len(self._cond_paths), (
@@ -278,8 +282,8 @@ class ShardedNumpyStorage(AutogradFileStorage):
         cond_fpath_abstract: AbstractFilePath,
         batch_size: int = 64,
         shuffle: bool = True,
-        num_workers: int = 0,
-    ) -> DataLoader:
+        num_workers: int = 0
+        ) -> DataLoader:
         data_shards = cls._discover_shards_from_abstract(data_fpath_abstract)
         cond_shards = cls._discover_shards_from_abstract(cond_fpath_abstract)
 

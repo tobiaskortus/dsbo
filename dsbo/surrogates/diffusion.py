@@ -64,11 +64,11 @@ class MLPBlock(nn.Module):
 
 
 @dataclass
-class LocalSurrogateDiffuserOutput(BaseOutput):
+class MlpDiffusion1DOutput(BaseOutput):
     sample: torch.Tensor
 
 
-class LocalSurrogateDiffuser(ModelMixin, ConfigMixin):
+class MlpDiffusion1D(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
@@ -105,11 +105,6 @@ class LocalSurrogateDiffuser(ModelMixin, ConfigMixin):
             nn.Linear(emb_dim, emb_dim),
         )
 
-        # Learnable positional encoding for output dimensions
-        # This tells the model which dimension is which calorimeter layer
-        self.out_pos_emb = nn.Parameter(torch.zeros(1, objective_dim))
-        nn.init.normal_(self.out_pos_emb, std=0.1)
-
         self.in_fc = nn.Linear(objective_dim, emb_dim)
         self.blocks = nn.ModuleList([MLPBlock(emb_dim, hidden_dim, film_cond_dim, dropout) \
                                         for _ in range(n_layers)])
@@ -121,12 +116,10 @@ class LocalSurrogateDiffuser(ModelMixin, ConfigMixin):
         t: torch.Tensor,        # (B,)
         c: torch.Tensor | None = None,
         return_dict: bool = True,
-    )  -> LocalSurrogateDiffuserOutput | torch.Tensor:
+    )  -> MlpDiffusion1DOutput | torch.Tensor:
         
         #TODO: Is this really necessary to stay compatible with diffusers or is (B, n) also fine?
         x = x.squeeze(1)
-
-        x = x + self.out_pos_emb
         
         x = self.in_fc(x)
         x = x + self.time_emb(t)
@@ -141,7 +134,7 @@ class LocalSurrogateDiffuser(ModelMixin, ConfigMixin):
         x = x.unsqueeze(1)
 
         if return_dict:
-            return LocalSurrogateDiffuserOutput(sample=x)
+            return MlpDiffusion1DOutput(sample=x)
         return x
 
     def sample(self, c: torch.Tensor, scheduler: SchedulerMixin) -> torch.Tensor:
