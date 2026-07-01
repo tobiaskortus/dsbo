@@ -36,6 +36,9 @@ class Config:
             new = {k: v for k, v in cfg.items() if k != key}
             _config_var.set(new)
 
+    def state(self) -> dict[str, Any]:
+        return _config_var.get()
+
     def _set(self, state: dict[str, Any]) -> None:
         _config_var.set(state)
 

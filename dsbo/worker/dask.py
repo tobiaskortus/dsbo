@@ -83,7 +83,7 @@ class DaskWorkerBase:
         is_forward_ad = fw._current_level > -1
         is_grad_enabled = torch.is_grad_enabled()
 
-        config_state = dsbo.config.get()
+        config_state = dsbo.config.state()
 
         task_id = uuid.uuid4()
 
@@ -112,7 +112,7 @@ class DaskWorkerBase:
         workdir = getattr(get_workdir(), "workdir_root", None)
         resources = getattr(module.resources, "resources", None)
 
-        config_state = dsbo.config.get()
+        config_state = dsbo.config.state()
         task_id = uuid.uuid4()
 
         def _backward_wrapper(module, candidate, *deps):
