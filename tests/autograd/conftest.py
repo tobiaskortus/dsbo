@@ -1,12 +1,20 @@
+from dask_jobqueue.local import LocalCluster
 import torch
 import pytest
 import numpy as np
 
+from dsbo.worker.dask import DaskWorkerBase
 from dsbo.workflow import Workflow
 from dsbo.utils.io.workdir import Workdir
 from dsbo.modules import Module, Input, Output
 from dsbo.parameters import Continuous, ParameterSpace, Sampler
 from dsbo.utils.io.autograd import NumpyFile
+
+class LocalDaskWorker(DaskWorkerBase):
+    def __init__(self):
+        self.cluster = LocalCluster(cores=1, memory="500MB")
+        self.cluster.scale(2)
+        super().__init__(self.cluster)
 
 
 @pytest.fixture(scope="session", autouse=True)

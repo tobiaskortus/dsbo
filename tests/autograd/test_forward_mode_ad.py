@@ -4,7 +4,9 @@ import torch.autograd.forward_ad as fw
 from tempfile import TemporaryDirectory
 
 from dsbo.utils.io.workdir import Workdir
-from dsbo.worker.dask import LocalDaskWorker, WorkerContext
+from dsbo.worker.dask import  WorkerContext
+
+from tests.autograd.conftest import LocalDaskWorker
 
 def test_forward_mode_ad_local(space, workflow, sampler):
     with fw.dual_level():

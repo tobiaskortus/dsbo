@@ -4,8 +4,9 @@ import numpy as np
 from tempfile import TemporaryDirectory
 
 from dsbo.utils.io.workdir import Workdir
-from dsbo.worker.dask import LocalDaskWorker, WorkerContext
+from dsbo.worker.dask import WorkerContext
 
+from tests.autograd.conftest import LocalDaskWorker
 
 def test_reverse_mode_ad_local(space, workflow, sampler):
     space.register_sampler(sampler)
