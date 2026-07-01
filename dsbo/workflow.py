@@ -1,23 +1,66 @@
-from contextlib import nullcontext
+from __future__ import annotations
+
+import io
 import os
-from dsbo.utils.io import Workdir, get_subdir
 import torch
+import warnings
 import matplotlib
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import networkx as nx
 from copy import deepcopy
 from typing import Sequence
 from itertools import chain
-from dsbo.parameters import Candidate
 from graphviz import Digraph
 from itertools import groupby
-from typing import Iterable, List
+from contextlib import nullcontext
 import matplotlib.colors as mcolors
+import torch.autograd.forward_ad as fw
 from IPython.display import Image, display
+from typing import Iterable, List, Any, overload
 
 from dsbo.modules import Module
-from dsbo.modules.compile import dry_run
-from dsbo.worker.config import SlurmWorkerConfig
+from dsbo.utils.compile import dry_run
+from dsbo.modules.dsl import DependencyDict
+from dsbo.utils.io import Workdir, get_subdir
+from dsbo.storage import get_current_storage
+from dsbo.worker.config import WorkerSpec
+from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.backends.aido.surrogate import LocalSurrogate
+from dsbo.utils.io import Workdir, get_subdir, get_workdir
+
+
+class ResultsBatch(list):
+    @overload
+    def __init__(self, items: list[dict[str, Any]]) -> None: ...
+
+    @overload
+    def __init__(self, *items: dict[str, Any]) -> None: ...
+
+    def __init__(self, *items):
+        if len(items) == 1 and isinstance(items[0], list):
+            super().__init__(items[0])
+        else:
+            super().__init__(items)
+
+    @overload
+    def __getitem__(self, key: int) -> torch.Tensor: ...
+
+    @overload
+    def __getitem__(self, key: str) -> list[dict]: ...
+
+    def __getitem__(self, key: int | str):
+        if isinstance(key, int):
+            return super().__getitem__(key)
+
+        values: list[Any] = []
+        values = list(chain.from_iterable(item[key] for item in self))
+
+        if values and isinstance(values[0], torch.Tensor):
+            if all(isinstance(v, torch.Tensor) for v in values):
+                return torch.stack(values)
+
+        return values
 
 
 class FusedModule(Module):
@@ -90,78 +133,286 @@ def get_dependent_task_groups(G: nx.DiGraph):
     ]
 
 
+def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()) -> List[dict]:
+    with torch.no_grad():
+        from dsbo.worker.dask import WorkerContext
+        worker = WorkerContext.get_current_worker()
+        is_forward_ad = fw._current_level > -1
+        is_grad_enabled = torch.is_grad_enabled()
+
+        if worker is None:
+            batch_results = []
+            for i, candidate in enumerate(candidates):
+                with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
+                    try:
+                        results = {}
+                        for batch in workflow.iterate_dependent_task_groups():
+                            for task in batch:
+                                result = task.run(
+                                    design=candidate.values,
+                                    is_forward_ad=is_forward_ad,
+                                    is_grad_enabled=is_grad_enabled,
+                                    unpack_design=True,
+                                )
+                                results.update(result)
+                        batch_results.append(results)
+                    except Exception as e:
+                        batch_results.append({})
+                        if not isinstance(e, catch):
+                            raise
+            return batch_results
+        else:
+            batch_delays = []
+            batch_task_ids = []
+            task_map: dict[str, str] = {}
+            name_map: dict[str, str] = {}
+            exec_ids = []
+            batch_path = getattr(get_workdir(), "root", None)
+            for i, candidate in enumerate(candidates):
+                with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
+                    delayed_map = {}
+                    task_ids = []
+                    wdir = getattr(get_workdir(), "root", None)
+                    subdir = get_subdir()
+                    exec_id = os.path.join(wdir, subdir) if (wdir and subdir) else wdir
+                    exec_ids.append(exec_id)
+                    for depth, batch in enumerate(workflow.iterate_dependent_task_groups()):
+                        for task in batch:
+                            dependencies = [delayed_map[p] for p in workflow._representation.predecessors(task)]
+                            task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
+                            delayed_map[task] = delayed_obj
+                            task_ids.append(task_id)
+                            batch_delays.append(delayed_obj)
+                            task_map[delayed_obj.key] = exec_id
+                            name_map[delayed_obj.key] = task.name
+                    batch_task_ids.append(task_ids)
+
+            storage = get_current_storage()
+            if storage is not None:
+                wf_record = storage.workflow.add_workflow(workflow._representation)
+                storage.workflow.add_runs(wf_record, exec_ids, batch_path)
+                plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
+                worker.client.register_plugin(plugin, name="dsbo_task_stream")
+
+            futures_computed = worker.compute(batch_delays)
+            results_flat = worker.gather(futures_computed, catch=catch)
+            lookup = {task_id: result for task_id, result in results_flat}
+            return [dict(chain.from_iterable(lookup.get(tid, {}).items() for tid in tids))
+                    for tids in batch_task_ids]
+
+
+def run_batch_reverse_autograd(
+    workflow: Workflow,
+    candidates: Sequence[Candidate],
+    grad_outputs: List[dict],
+    catch: tuple[Exception, ...] = (),
+) -> List[torch.Tensor]:
+    from dsbo.worker.dask import WorkerContext
+    from dsbo.utils.io.autograd import NumpyFile
+    worker = WorkerContext.get_current_worker()
+
+    G = workflow._representation
+    tasks_rev = list(reversed(list(nx.topological_sort(G))))
+
+    if worker is None:
+        gradients = []
+        for candidate, candidate_grad_output in zip(candidates, grad_outputs):
+            try:
+                grad_candidate = candidate.detach().requires_grad_()
+                with torch.enable_grad():
+                    NumpyFile.reset_gradient_state()
+                    for task in tasks_rev:
+                        is_sink = len(list(G.successors(task))) == 0
+                        if task._no_grad_op:
+                            continue
+
+                        task.run_backward(grad_candidate.values, candidate_grad_output if is_sink else None)
+                gradients.append(
+                    grad_candidate.grad.clone() if grad_candidate.grad is not None else torch.zeros_like(candidate.tensor)
+                )
+            except Exception as e:
+                gradients.append(torch.zeros_like(candidate.tensor))
+                if not isinstance(e, catch):
+                    raise
+        return gradients
+    else:
+        batch_delays = []
+        batch_task_ids = []
+        task_map: dict[str, str] = {}
+        name_map: dict[str, str] = {}
+        exec_ids = []
+        batch_path = getattr(get_workdir(), "root", None)
+
+        for i, candidate in enumerate(candidates):
+            candidate_grad_output = grad_outputs[i]
+            with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
+                delayed_map = {}
+                task_ids = []
+                wdir = getattr(get_workdir(), "root", None)
+                subdir = get_subdir()
+                exec_id = os.path.join(wdir, subdir) if (wdir and subdir) else wdir
+                exec_ids.append(exec_id)
+
+                for depth, task in enumerate(tasks_rev):
+                    if task._no_grad_op:
+                        continue
+
+                    forward_succs = list(G.successors(task))
+                    is_sink = len(forward_succs) == 0
+                    dependencies = [delayed_map[s] for s in forward_succs if s in delayed_map]
+                    task_grad_output = candidate_grad_output if is_sink else None
+
+                    task_id, delayed_obj = worker.schedule_backward(
+                        task, candidate, grad_output=task_grad_output,
+                        dependencies=dependencies, priority=depth,
+                    )
+                    delayed_map[task] = delayed_obj
+                    task_ids.append(task_id)
+                    batch_delays.append(delayed_obj)
+                    task_map[delayed_obj.key] = exec_id
+                    name_map[delayed_obj.key] = task.name
+                batch_task_ids.append(task_ids)
+
+        storage = get_current_storage()
+        if storage is not None:
+            wf_record = storage.workflow.add_workflow(G)
+            storage.workflow.add_runs(wf_record, exec_ids, batch_path)
+            plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
+            worker.client.register_plugin(plugin, name="dsbo_task_stream_bwd")
+
+        futures_computed = worker.compute(batch_delays)
+        results_flat = worker.gather(futures_computed, catch=catch)
+        lookup = {tid: grad for tid, grad in results_flat if grad is not None}
+
+        gradients = []
+        for candidate, task_ids in zip(candidates, batch_task_ids):
+            combined = sum(
+                (lookup[tid] for tid in task_ids if tid in lookup),
+                start=torch.zeros_like(candidate.tensor),
+            )
+            gradients.append(combined)
+        return gradients
+
+
+def candidates_from_tensor(tensor: torch.Tensor, space: ParameterSpace) -> List[Candidate]:
+    return [Candidate(space, tensor[i]) for i in range(tensor.shape[0])]
+
+
+def to_1d_tensor(v: Any, dtype: torch.dtype) -> torch.Tensor:
+    if isinstance(v, torch.Tensor): t = v.detach().to(dtype)
+    else: t = torch.tensor(float(v), dtype=dtype)
+    if t.dim() > 1:
+        raise ValueError(
+            f"Result values must be scalar or 1-D tensors, got shape {t.shape}. "
+            "Flatten higher-dimensional outputs before returning them from a Module."
+        )
+    return t.reshape(-1)
+
+
+class RunBatchAutogradFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, workflow, design_tensors: torch.Tensor, space: ParameterSpace):
+        ctx.workflow = workflow
+        ctx.space = space
+        ctx.save_for_backward(design_tensors)
+
+        candidates = candidates_from_tensor(design_tensors, space)
+        results = run_batch(workflow, candidates)
+        ctx.result_keys = list(results[0].keys()) if results else []
+
+        if not ctx.result_keys:
+            return design_tensors.new_zeros(design_tensors.shape[0]), [], {}, {}
+
+        dtype = design_tensors.dtype
+        first = results[0]
+
+        flat = [[to_1d_tensor(r[k], dtype) for k in ctx.result_keys] for r in results]
+
+        ctx.splits = [t.shape[0] for k, t in zip(ctx.result_keys, flat[0])]
+        ctx.result_is_scalar = {
+            k: (not isinstance(first[k], torch.Tensor) or first[k].dim() == 0)
+            for k in ctx.result_keys
+        }
+
+        vals = torch.stack([torch.cat(r) for r in flat])
+        return vals, ctx.result_keys, ctx.splits, ctx.result_is_scalar
+
+
+    @staticmethod
+    def backward(ctx, grad_output, _, __, ___):
+        (design_tensors,) = ctx.saved_tensors
+        candidates = candidates_from_tensor(design_tensors, ctx.space)
+        n = len(candidates)
+
+        grad_flat = grad_output.view(n, -1)
+        grad_outputs = [
+            {
+                k: (chunk.squeeze(0) if ctx.result_is_scalar[k] else chunk)
+                for chunk, k in zip(torch.split(grad_flat[i], ctx.splits), ctx.result_keys)
+            }
+            for i in range(n)
+        ]
+
+        gradients = run_batch_reverse_autograd(ctx.workflow, candidates, grad_outputs, catch=(RuntimeError,))
+        return None, torch.stack(gradients, dim=0), None
+
+
+def implements_backward(module: Module) -> bool:
+    return (type(module).backward is not Module.backward) or \
+           (getattr(module, "_backward", None) is not None)
+
+
+def assert_workflow_supports_backward_ad(workflow: Workflow) -> None:
+    unsupported = [m for m in workflow._representation.nodes()
+                   if isinstance(m, Module) and not implements_backward(m) if not m._no_grad_op]
+    if unsupported:
+        raise AssertionError(
+            f"Modules {unsupported} do not implement backward(), "
+            "which is required for reverse-mode AD."
+        )
+
+
 class Workflow:
     def __init__(self, dependencies: dict[Module, Iterable[Module]] | Module) -> None:
 
-        #Convert single module into dict forma
+        #Convert single module into DependencyDict format
         if isinstance(dependencies, Module):
-            dependencies = {dependencies: []}
+            dependencies = DependencyDict({dependencies: []})
 
+        self._dependency_groups = dependencies.groups if isinstance(dependencies, DependencyDict) else []
         self._representation = nx.DiGraph(dependencies)
 
         assert_no_self_loops(self._representation)
         assert_no_duplicate_nodes(self._representation)
 
 
-    def run(self, design: dict, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
+    def run(self, design: Candidate, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
         return self.run_batch([design], catch=catch)[0]
 
-    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()) -> List[dict[str, float]]:
-        
-        with torch.no_grad():
-            from dsbo.worker.dask import WorkerContext
-            worker = WorkerContext.get_current_worker()
+    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()):
+        if fw._current_level > -1 or not torch.is_grad_enabled():
+            with torch.no_grad():
+                return ResultsBatch(run_batch(self, candidates, catch))
+        else:
+            design_tensors = torch.stack([c.tensor for c in candidates])
+            space = candidates[0].space
+            vals, keys, splits, is_scalar = RunBatchAutogradFn.apply(self, design_tensors, space)
+            if not keys: return [{} for _ in candidates]
 
-            if worker is None:
-                batch_results = []
-                for i, candidate in enumerate(candidates):
-                    with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
-                        try:
-                            results = {}
-                            for batch in self.iterate_dependent_task_groups():
-                                for task in batch:
-                                    result = task.run(design=candidate.values)
-                                    results.update(result)
-                            batch_results.append(results)
-                        except Exception as e:
-                            batch_results.append({})
-                            if not isinstance(e, catch):
-                                raise
-                        
-                return batch_results
-            else:
-                batch_delays = []
-                batch_task_ids = []
-                for i, candidate in enumerate(candidates):
-                    with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
-                        delayed_map = {}
-                        task_ids = []
-                        for depth, batch in enumerate(self.iterate_dependent_task_groups()):
-                            for task in batch:
-                                dependencies = [delayed_map[p] for p in self._representation.predecessors(task)]
-                                task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
-                                delayed_map[task] = delayed_obj
-                                
-                                task_ids.append(task_id)
-                                batch_delays.append(delayed_obj)
-
-                        batch_task_ids.append(task_ids)
-
-                futures_computed = worker.compute(batch_delays)
-                results_flat = worker.gather(futures_computed, catch=catch)
-
-                lookup = {task_id: result for task_id, result in results_flat}
-
-                return [dict(chain.from_iterable(lookup.get(tid, {}).items() \
-                            for tid in tids)) \
-                            for tids in batch_task_ids]
+            return ResultsBatch([
+                {
+                    k: (chunk.squeeze(0) if is_scalar[k] else chunk)
+                    for chunk, k in zip(torch.split(vals[i], splits), keys)
+                }
+                for i in range(len(candidates))
+            ])
 
 
     def iterate_dependent_task_groups(self):
         for batch in get_dependent_task_groups(self._representation):
             yield batch
 
-    def get_unique_workers(self) -> set[SlurmWorkerConfig]:
+    def get_unique_workers(self) -> set[WorkerSpec]:
         workers = set()
         for node in self._representation.nodes():
             if node.resources is not None:
@@ -169,77 +420,162 @@ class Workflow:
         return workers
 
     def visualize(self, filename=None, format='png'):
-        
-        def _node_label(node):
-            res = getattr(node, 'resources', None)
-            name = ','.join(m.name for m in node.modules) if isinstance(node, FusedModule) else (node.name if hasattr(node, 'name') else str(node))
-            wk = 'default' if res is None else f'gpu={res.gpu_resources}, cpu={res.job_cpu}, mem={res.memory}'
-            return f"{name}\n{wk}"
-        
+        def _res_key(n):
+            res = getattr(n, 'resources', None)
+            return 'default' if res is None else f"mem={res.memory}, cpu={res.job_cpu}, gpu={res.gpu_resources}"
+
+        def _node_label(n):
+            name = n.name if hasattr(n, 'name') else str(n)
+            return f"{name}\n{_res_key(n)}"
+
+        def _build_color_map(nodes):
+            keys = list(dict.fromkeys(_res_key(n) for n in nodes))
+            cmap = matplotlib.colormaps['Set3']
+            color_map = {k: mcolors.to_hex(cmap(i % cmap.N)) for i, k in enumerate(keys)}
+            keys = [k for k in keys if k != 'default'] + (['default'] if 'default' in keys else [])
+            return keys, color_map
+
+        def _build_dep_group_key(nodes):
+            lookup = {
+                node: gi
+                for gi, dg in enumerate(self._dependency_groups)
+                for node in dg.nodes
+                if node in nodes
+            }
+            return lambda n: ('dg', lookup[n]) if n in lookup else ('single', id(n))
+
+        def _no_grad(n):
+            return getattr(n, '_no_grad_op', False)
+
+        def _faded(hex_color, blend=0.7):
+            """Blend a hex colour toward white to signal disabled gradients."""
+            r, g, b = mcolors.to_rgb(hex_color)
+            r2 = r + (1 - r) * blend
+            g2 = g + (1 - g) * blend
+            b2 = b + (1 - b) * blend
+            return mcolors.to_hex((r2, g2, b2))
+
+        def _add_node(sg, n):
+            nid = str(id(n))
+            fill     = _faded(_color(n))        if _no_grad(n) else _color(n)
+            style    = 'filled,dashed'          if _no_grad(n) else 'filled'
+            sg.node(nid, label=_node_label(n), style=style, fillcolor=fill,
+                    shape='box', fontcolor='black', color='black')
+            rep_entry[n] = rep_exit[n] = nid
+
+        def _add_replica_group(sg, first, last, count):
+            _add_node(sg, first)
+            _add_node(sg, last)
+            dot.edge(
+                str(id(first)), str(id(last)),
+                label=f'×{count}', style='dashed', arrowhead='none',
+                constraint='false', color='black', fontcolor='black',
+                penwidth='1', fontsize='11', labelfloat='false',
+            )
+
+        def _render_with_legend(out_format):
+            graph_bytes = dot.pipe(format='png')
+            if not keys:
+                return graph_bytes if out_format == 'png' else dot.pipe(format=out_format)
+
+            graph_img = plt.imread(io.BytesIO(graph_bytes))
+            h, w = graph_img.shape[:2]
+            dpi, legend_h = 100, 0.55
+            fig_w, fig_h = w / dpi, h / dpi + legend_h
+
+            fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+            ax_g = fig.add_axes([0, legend_h / fig_h, 1, h / dpi / fig_h])
+            ax_g.imshow(graph_img)
+            ax_g.axis('off')
+
+            ax_l = fig.add_axes([0, 0, 1, legend_h / fig_h])
+            ax_l.axis('off')
+            worker_patches = [mpatches.Patch(facecolor=color_map[k], edgecolor='#aaaaaa', linewidth=0.5, label=k) for k in keys]
+
+            has_no_grad = any(_no_grad(n) for n in nodes)
+            has_grad    = any(not _no_grad(n) for n in nodes)
+
+            worker_legend = ax_l.legend(
+                handles=worker_patches, ncol=min(4, len(worker_patches)), loc='center',
+                frameon=False, fontsize=8, handlelength=1.2, handleheight=0.9,
+                columnspacing=1.2, handletextpad=0.5,
+                title='Compute Resources', title_fontsize=8,
+            )
+            worker_legend.get_title().set_fontweight('bold')
+
+            if has_no_grad and has_grad:
+                grad_patches = [
+                    mpatches.Patch(facecolor='white', edgecolor='black',
+                                   linewidth=1, linestyle='solid', label='grad'),
+                    mpatches.Patch(facecolor='white', edgecolor='black',
+                                   linewidth=1, linestyle='dashed', label='no grad'),
+                ]
+                ax_l.add_artist(worker_legend)
+                ax_l.legend(
+                    handles=grad_patches, ncol=1, loc='center right',
+                    frameon=False, fontsize=8, handlelength=1.2, handleheight=0.9,
+                    columnspacing=1.2, handletextpad=0.5,
+                )
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format=out_format, bbox_inches='tight', dpi=dpi)
+            plt.close(fig)
+            buf.seek(0)
+            return buf.read()
+
         fmt = format
         if filename:
             base, ext = os.path.splitext(filename)
             if ext:
-                filename = base
-                fmt = ext.lstrip('.')
+                filename, fmt = base, ext.lstrip('.')
+
         dot = Digraph(format=fmt)
         dot.attr(rankdir='LR')
+        dot.attr('node', fontsize='10')
+        dot.attr('edge', arrowsize='0.6')
 
-        def res_key(n):
-            res = getattr(n, 'resources', None)
-            return 'default' if res is None else f"mem={res.memory}, cpu={res.job_cpu}, gpu={res.gpu_resources}"
+        nodes = set(self._representation.nodes())
+        keys, color_map = _build_color_map(nodes)
+        _color = lambda n: color_map.get(_res_key(n), '#d3d3d3')
+        _dep_group_key = _build_dep_group_key(nodes)
+        levels = task_levels(self._representation)
 
-        nodes = list(self._representation.nodes())
-        keys = []
-        groups = {}
+        rep_entry: dict = {}
+        rep_exit:  dict = {}
+        hidden_nodes: set = set()
+
+        level_groups: dict[int, list] = {}
         for n in nodes:
-            k = res_key(n)
-            groups.setdefault(k, []).append(n)
-            if k not in keys:
-                keys.append(k)
+            level_groups.setdefault(levels.get(n, 0), []).append(n)
 
-        cmap = matplotlib.colormaps['Set3']
-        color_map = {k: mcolors.to_hex(cmap(i % cmap.N)) for i, k in enumerate(keys)}
-
-        rep_entry = {}
-        rep_exit = {}
-
-        for n in nodes:
-            color = color_map.get(res_key(n), '#d3d3d3')
-            if isinstance(n, FusedModule):
-                cluster_name = f"cluster_{id(n)}"
-                sub_ids = []
-                with dot.subgraph(name=cluster_name) as c:
-                    c.attr(label='', rank='same', style="dashed")
-                    for i, sub in enumerate(n.modules):
-                        sid = f"{id(n)}_sub_{i}"
-                        c.node(sid, label=_node_label(sub), style='filled', fillcolor=color, shape='box', color='black', penwidth='1')
-                        sub_ids.append(sid)
-                    for a, b in zip(sub_ids, sub_ids[1:]):
-                        c.edge(a, b)
-                if sub_ids:
-                    rep_entry[n], rep_exit[n] = sub_ids[0], sub_ids[-1]
-                else:
-                    rep_entry[n] = rep_exit[n] = str(id(n))
-            else:
-                nid = str(id(n))
-                dot.node(nid, label=_node_label(n), style='filled', fillcolor=color, shape='box', fontcolor='black')
-                rep_entry[n] = rep_exit[n] = nid
+        for lvl, group in sorted(level_groups.items()):
+            group.sort(key=lambda n: (
+                getattr(n, 'i', None) if isinstance(getattr(n, 'i', None), int) else float('inf'),
+                n.name if hasattr(n, 'name') else '',
+            ))
+            with dot.subgraph(name=f"rank_{lvl}") as sg:
+                sg.attr(rank='same')
+                for (kind, _), pg in groupby(group, key=_dep_group_key):
+                    pg = list(pg)
+                    if kind == 'dg' and len(pg) > 2:
+                        hidden_nodes.update(pg[1:-1])
+                        _add_replica_group(sg, pg[0], pg[-1], len(pg))
+                    else:
+                        for n in pg:
+                            _add_node(sg, n)
 
         for u, v in self._representation.edges():
-            src = rep_exit.get(u, str(id(u)))
-            dst = rep_entry.get(v, str(id(v)))
-            dot.edge(src, dst)
+            if u in hidden_nodes or v in hidden_nodes:
+                continue
+            dot.edge(rep_exit.get(u, str(id(u))), rep_entry.get(v, str(id(v))))
 
-        if keys:
-            rows = ''.join([f"<TR><TD BGCOLOR='{color_map[k]}' FIXEDSIZE='TRUE' WIDTH='20' HEIGHT='14'></TD><TD ALIGN='LEFT'>&nbsp;{k}</TD></TR>" for k in keys])
-            table = f"<TABLE BORDER='0' CELLBORDER='0' CELLSPACING='4'>{rows}</TABLE>"
-            dot.node('legend', label=f'<{table}>', shape='none')
-
+      
         if filename is not None:
-            return dot.render(filename, cleanup=True)
-        img = dot.pipe(format=format)
-        display(Image(img))
+            out_path = f"{filename}.{fmt}"
+            with open(out_path, 'wb') as f:
+                f.write(_render_with_legend(fmt))
+            return out_path
+        display(Image(_render_with_legend(format)))
 
 
     @property
@@ -324,3 +660,25 @@ def optimize(workflow: Workflow) -> Workflow:
     return update_task_graph(workflow, mergeable_components(workflow))
 
 
+def validate_workflow_dependencies(workflow: Workflow, on_error: str = "warn"):
+    #TODO: change default on_error from "warn" to "raise" once the implementation is stable
+    assert on_error in ["raise", "warn", "ignore"]
+
+    G = workflow._representation
+    outputs = set()
+
+    def handle_on_error(node, input):
+        msg = f"Node {node} requires {input} but it is not available"
+
+        match on_error:
+            case "raise":  raise Exception(msg)
+            case "warn":   warnings.warn(msg)
+            case "ignore": pass
+
+    for node in nx.topological_sort(G):
+        if G.in_degree(node) != 0:
+            for input in node.registered_inputs:
+                if input not in outputs:
+                    handle_on_error(node, input)
+
+        outputs.update(node.registered_outputs)

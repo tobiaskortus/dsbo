@@ -1,17 +1,20 @@
+import os
+import json
+import torch
+import pickle
+import numpy as np
+import pandas as pd
 from enum import unique
-from dsbo.modules.simulation import SimulationContainerWrapperBase
-from dsbo.transforms import SimulationTransform, load_df_by_extension
-from dsbo.minipandas import MiniFrame, concat
-from dsbo.container import python_script_args
 from typing import Optional
 from filelock import FileLock
-import pandas as pd
-import numpy as np
-import pickle
-import json
-import os
+from torch.nn import functional as F
 
+from dsbo.container import python_script_args
+from dsbo.minipandas import MiniFrame, concat
 from dsbo.utils.io import DefaultPaths, Workdir
+from dsbo.modules.simulation import SimulationContainerWrapperBase
+from dsbo.transforms import SimulationTransform, load_df_by_extension
+
 
 #TODO: move this into dsbo to make it reusable
 def to_serializable(obj):
@@ -96,3 +99,38 @@ class G4CaloSimToReco(SimulationTransform):
 
         with open(self.output_path(), "wb") as f:
             pickle.dump(reco_dict, f)   
+
+
+class G4CaloSimToImg(SimulationTransform):
+    def __init__(self, w_target: int = 25, h_target: int = 25, log: bool = True):
+        super().__init__()
+        self.w_target = w_target
+        self.h_target = h_target
+        self.log = log
+
+        self.simulation_path = Workdir.register_file(DefaultPaths.SIMULATION, "output_df.npy", unique_filename=True)
+        self.image_path = Workdir.register_file(DefaultPaths.SIMULATION, "simulation_img.npy", unique_filename=True)
+
+    def transform(self, design: dict):
+
+        data = np.load(self.simulation_path(), allow_pickle=True)
+        l  = torch.tensor(data['sensor_layer']).int()
+        E  = torch.tensor(data['sensor_energy']).float()
+        y = torch.tensor(data["contains:e+"]).long()
+
+        _, c = l.unique(return_counts=True, dim=-1)
+        w, h = self.w_target, self.h_target
+
+        def reshape_interpolate(E_l, w_target, h_target):
+            w = h = int(E_l.shape[-1] ** 0.5)
+            E_l = E_l.reshape(-1, 1, w, h)
+            E_l = F.interpolate(E_l, size=(w_target, h_target), mode='bilinear')
+            return E_l
+
+        y = F.one_hot(y, 2)
+        E  = torch.cat([reshape_interpolate(E_l, w, h) for E_l in E.split(c.tolist(), dim=-1)], dim=1)
+        
+        if self.log:
+            E = torch.log1p(E)
+
+        np.save(self.image_path(), {"img": E.numpy(), "target": y.numpy()})

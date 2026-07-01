@@ -1,51 +1,86 @@
 from __future__ import annotations
 
+import inspect
+import types
+import weakref
 from abc import ABC
-from contextlib import nullcontext
-from typing import Optional
+from contextlib import nullcontext, suppress
 from functools import wraps
+from typing import Optional, Callable
+from dsbo.utils.io import Output, Input
+from dsbo.autograd import autograd_context
 from dsbo.utils.io import Workdir, get_workdir
-from dsbo.modules.compile import dryrunnable, is_dry_run
-from dsbo.modules.dsl import ModuleDslMixin  # noqa: F401
+from dsbo.utils.compile import dryrunnable, is_dry_run
+from dsbo.modules.dsl import ModuleDslMixin
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import AbstractFilePath, with_remote_workdir
-from dsbo.worker.config import SlurmWorkerConfig
+from dsbo.worker.config import WorkerSpec
+
+
+def ensure_dict_return(fn):
+    @wraps(fn)
+    def _inner(*args, **kwargs):
+        res = fn(*args, **kwargs)
+        return {} if res is None else res
+    return _inner
+
+
+def auto_wrap(cls, method_name, *decorators):
+    raw = cls.__dict__.get(method_name)
+    if raw is None or getattr(raw, "_dsbo_wrapped", False):
+        return
+    wrapped = raw
+    for decorator in decorators:
+        wrapped = decorator(wrapped)
+    setattr(wrapped, "_dsbo_wrapped", True)
+    setattr(cls, method_name, wrapped)
 
 
 class Module(ModuleDslMixin, ABC):
 
     def __init__(self):
-        self._registered_files = {}
+        self._registered_files: dict[str, AbstractFilePath] = {}
+        self._registered_inputs: list[AbstractFilePath] = []
+        self._registered_outputs: list[AbstractFilePath] = []
+
+        self._alias: str | None = None
+        self._seed: int | None = None
+        self._no_grad_op: bool = False
+
         self.i: int | None = None
-        self.resources = None
+        self.resources: WorkerSpec | None = None
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        raw = cls.__dict__.get("__call__")
-        if raw is None or getattr(raw, "_dsbo_wrapped", False):
-            return
-
-        def ensure_dict_return(fn):
-            @wraps(fn)
-            def _inner(*args, **kwargs):
-                res = fn(*args, **kwargs)
-                return {} if res is None else res
-            return _inner
-
-        wrapped = dryrunnable(raw)
-        wrapped = ensure_dict_return(wrapped)
-        setattr(wrapped, "_dsbo_wrapped", True)
-        setattr(cls, "__call__", wrapped)
+        auto_wrap(cls, "__call__", dryrunnable, ensure_dict_return)
+        auto_wrap(cls, "backward", with_remote_workdir)
 
     @dryrunnable
     def __call__(self, design: dict, **kwargs) -> Optional[dict[str, float]]:
         pass
 
     def __setattr__(self, name, value):
+        if not hasattr(self, "_registered_files") and name != "_registered_files":
+            raise RuntimeError(
+                "Subclasses of Module must call super().__init__() in their __init__ before setting attributes."
+            )
+
         super().__setattr__(name, value)
 
+        #TODO: define a clear policy when Inputs and Outputs should be registered
+        # and when AbstractFilePath should be alloweds -> important to keep track of files 
+        # in e.g. MergeTransforms.
         if isinstance(value, AbstractFilePath):
             self._registered_files[name] = value
+
+        if isinstance(value, (Input, Output)):
+            self._registered_files[name] = value.path
+
+            if isinstance(value, Input):
+                self._registered_inputs += [value.path]
+            else:
+                self._registered_outputs += [value.path]
+
 
     def __repr__(self):
         return self.name
@@ -53,16 +88,39 @@ class Module(ModuleDslMixin, ABC):
     @property
     def name(self) -> str:
         suffix = f"[{self.i}]" if self.i is not None else ""
-        return f"{type(self).__name__}{suffix}"
+        name = type(self).__name__ if self._alias is None else self._alias
+        return f"{name}{suffix}"
 
+    
+    @autograd_context
     @with_remote_workdir
     def run(self, design: dict, **kwargs):
         with nullcontext() if (is_dry_run() or get_workdir() is None) else WorkflowTaskLogger(self):
             with Workdir.use_file_suffix(str(self.i)) if self.i is not None else nullcontext():
-                return self(design=design)
+                return self(design=design, **kwargs)
 
-    def to(self, resource: SlurmWorkerConfig):
+    @with_remote_workdir
+    def run_backward(self, design: dict, grad_output: dict | None = None) -> None:
+        with Workdir.use_file_suffix(str(self.i)) if self.i is not None else nullcontext():
+            self.backward(design, grad_output)
+
+    def backward(self, design: dict, grad_output: dict | None = None) -> None:
+        pass
+
+    def to(self, resource: WorkerSpec) -> Module:
         self.resources = resource
+        return self
+    
+    def set_alias(self, alias: str) -> Module:
+        self._alias = alias
+        return self
+
+    def set_seed(self, seed: int) -> Module:
+        self._seed = seed
+        return self
+    
+    def op_propagates_grad_(self, propagate_grads: bool = True) -> Module:
+        self._no_grad_op = not propagate_grads
         return self
 
     @property
@@ -70,31 +128,102 @@ class Module(ModuleDslMixin, ABC):
         return self._registered_files
 
 
-class dynamic_submodule:
-    def __init__(self, wrapped_fn):
-        self.wrapped_fn = wrapped_fn
+def dynamic_submodule(wrapped_fn):
+    class DynamicSubmodule:
+        def __init__(self, wrapped_fn: Callable):
+            self._wrapped_fn = wrapped_fn
+            self._wrapped_backward = None
+            self._submodule_cache = weakref.WeakKeyDictionary()
 
-    def __get__(self, obj, *args, **kwargs):
-        if obj is None:
-            try:
-                return self.wrapped_fn
-            except Exception as e:
-                # Skip the frame of the wrapper function in the traceback
-                # Avoid mislearding stacktrace when the wrapper function is called directly
-                tb = e.__traceback__
-                if tb is not None:
-                    tb = tb.tb_next
-                raise e.with_traceback(tb)
 
-        class Submodule(Module):
-            def __init__(self, fn):
-                super().__init__()
-                self.fn = fn
+        def backward(self,func: Callable):
+            self._assert_valid_backward_signature(func)
+            self._assert_backward_is_none()
+
+            self._wrapped_backward = func
+            
+
+        def _assert_backward_is_none(self):
+            assert self._wrapped_backward == None, \
+                    f"The backward function for {self._wrapped_fn.__name__} is " +\
+                    f"already defined as {self._wrapped_backward.__name__}"
+
+        def _assert_valid_backward_signature(self, func: Callable):
+            args = inspect.getfullargspec(func).args
+            with suppress(ValueError, AttributeError):
+                args.remove("self")
+                args.remove("args")
+                args.remove("kwargs")
+
+            assert args == ["design", "grad_output"], \
+                    f"Invalid backward arguments. Got {args} but backwards " +\
+                    f"requires [design, grad_output]"
+
+        def __getstate__(self):
+            return {"_wrapped_fn": self._wrapped_fn, "_wrapped_backward": self._wrapped_backward}
+
+        def __setstate__(self, state):
+            self._wrapped_fn = state["_wrapped_fn"]
+            self._wrapped_backward = state["_wrapped_backward"]
+            self._submodule_cache = weakref.WeakKeyDictionary()
+
+        def __get__(self, obj, *args, **kwargs):
+            if obj is None:
+                return self._wrapped_fn
+            
+            if not isinstance(obj, Module):
+                raise TypeError(
+                    f"@dynamic_submodule must be accessed on a `Module` instance; got {type(obj).__name__}."
+                )
+
+            class Submodule(Module):
+                def __init__(self, parent: Module, func: Callable, backward: Callable):
+                    object.__setattr__(self, "_parent", parent)
+                    object.__setattr__(self, "_func", func)        
+                    object.__setattr__(self, "_backward", backward)
+
+                    if backward is not None:
+                        def backward_fn(design, grad_outputs=None):
+                            backward(self, design, grad_outputs)
+
+                        object.__setattr__(self, "backward", backward_fn)
+
+                def __setattr__(self, name, value):
+                    if name in ("_parent", "fn", "i", "resources") or name.startswith("_"):
+                        object.__setattr__(self, name, value)
+                    else:
+                        setattr(self._parent, name, value)
 
                 def __call__(self, design, **kwargs):
-                    return self.fn(obj, design, **kwargs)
+                    try:
+                        return self._func(self._parent, design, **kwargs)
+                    except Exception as e:
+                        tb = e.__traceback__
+                        if tb is not None:
+                            tb = tb.tb_next
+                        raise e.with_traceback(tb)
 
-            def __getattr__(self, name):
-                return getattr(obj, name)
+                def __getattr__(self, name):
+                    return getattr(self._parent, name)
 
-        return Submodule(self.wrapped_fn)
+                def __reduce__(self):
+                    return (getattr, (self._parent, self._func.__name__))
+            
+                
+                @property
+                def name(self) -> str:
+                    suffix = f"[{self.i}]" if self.i is not None else ""
+                    return f"{type(self._parent).__name__}.{self._func.__name__}{suffix}"
+
+            submodule = self._submodule_cache.get(obj)
+
+            if submodule is not None:
+                return submodule
+        
+            submodule = Submodule(obj, self._wrapped_fn, self._wrapped_backward)
+            self._submodule_cache[obj] = submodule
+
+            return submodule
+        
+
+    return DynamicSubmodule(wrapped_fn)
