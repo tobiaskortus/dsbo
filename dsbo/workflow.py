@@ -163,7 +163,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                 with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
                     try:
                         results = {}
-                        for batch in workflow.iterate_dependent_task_groups():
+                        for batch in workflow._iterate_dependent_task_groups():
                             for task in batch:
                                 result = task.run(
                                     design=candidate.values,
@@ -193,7 +193,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                     subdir = get_subdir()
                     exec_id = os.path.join(wdir, subdir) if (wdir and subdir) else wdir
                     exec_ids.append(exec_id)
-                    for depth, batch in enumerate(workflow.iterate_dependent_task_groups()):
+                    for depth, batch in enumerate(workflow._iterate_dependent_task_groups()):
                         for task in batch:
                             dependencies = [delayed_map[p] for p in workflow.task_graph.predecessors(task)]
                             task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
@@ -335,7 +335,7 @@ class RunBatchAutogradFn(torch.autograd.Function):
 
         candidates = candidates_from_tensor(design_tensors, space)
 
-        cache = workflow.get_cache()
+        cache = workflow._get_cache()
         use_cache = cache.config.should_cache(workflow.task_graph_mode) if cache else False
 
         if use_cache and cache.has_all(candidates):
@@ -406,45 +406,109 @@ class Workflow:
         if isinstance(dependencies, Module):
             dependencies = DependencyDict({dependencies: []})
 
-        self._task_graph = None
         self._dependencies = dependencies
         self._dependency_groups = dependencies.groups
+
+        self._mode: GraphMode | None = GraphMode.DEFAULT
+        self._surrogate: WorkflowSurrogate | None = None
+        self._default_task_graph: nx.DiGraph | None = None
 
         assert_no_self_loops(self.task_graph)
         assert_no_duplicate_nodes(self.task_graph)
 
+    def patch(self, surrogate: WorkflowSurrogate):
+        self._surrogate = surrogate
+
+    @contextmanager
+    def mode(self, mode: GraphMode):
+        old = self._mode
+        self._mode = mode
+        try: yield
+        finally: self._mode = old
+
+    def task_graph_for(self, mode: GraphMode) -> nx.DiGraph:
+        if mode == GraphMode.MODULE_SURROGATE_EVAL:
+            return build_module_surrogate_eval_graph(self)
+        if mode == GraphMode.MODULE_SURROGATE_TRAIN:
+            return build_module_surrogate_train_graph(self)
+        if mode == GraphMode.WORKFLOW_SURROGATE:
+            return nx.DiGraph({self._surrogate: []})
+
+        if self._default_task_graph is None:
+            self._default_task_graph = nx.DiGraph(self._dependencies)
+        return self._default_task_graph
+
+    @property
+    def module_surrogates(self) -> dict[Module, WorkflowSurrogate]:
+        with self.mode(GraphMode.DEFAULT):
+            has_module_surrogate = lambda module: hasattr(module, "surrogate") and module.surrogate is not None
+            return {module: module.surrogate for module in self.task_graph.nodes if has_module_surrogate(module)}
+
+    @property
+    def uses_module_surrogates(self) -> bool:
+        return len(self.module_surrogates) > 0
+
 
     def run(self, design: Candidate, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
-        return self.run_batch([design], catch=catch)[0]
+        self._ensure_surrogates_trained(design, catch)
+        return self.run_batch([design], catch)[0]
 
-    def get_cache(self) -> WorkflowExecutionCache | None:
+    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()):
+        if self._surrogate is not None and self._surrogate._is_pretrained:
+            if len(candidates) > 1:
+                raise NotImplementedError("Batch execution for workflow surrogates is not supported yet.")
+            return ResultsBatch([self._surrogate(c) for c in candidates])
+        
+        if self.uses_module_surrogates:
+            if len(candidates) > 1:
+                raise NotImplementedError("Batch execution for module surrogates is not supported yet.")
+            with self.mode(GraphMode.MODULE_SURROGATE_EVAL):
+                return self._execute_batch(candidates, catch)
+            
+        return self._execute_batch(candidates, catch)
+    
+    def _ensure_surrogates_trained(self, candidate: Candidate, catch: tuple[Exception, ...] = ()):
+        if self._surrogate is not None:
+            if not self._surrogate.is_in_trust_region(candidate) or self._surrogate.surrogate is None:
+                with self.mode(GraphMode.DEFAULT):
+                    self._surrogate.fit(candidate, workflow_callback=self._execute_batch)
+            return
+
+        if self.uses_module_surrogates:
+            with Workdir.create_subdir("module_surrogate_training"):
+                for _, surrogate in self.module_surrogates.items():
+                    if not surrogate.is_in_trust_region(candidate):
+                        with self.mode(GraphMode.MODULE_SURROGATE_TRAIN):
+                            from dsbo.utils.io.sharded import ShardedNumpyStorage
+                            with config.use(file_backend=ShardedNumpyStorage):
+                                surrogate.fit(candidate, workflow_callback=self._execute_batch)
+
+    def _get_cache(self) -> WorkflowExecutionCache | None:
         cache_config = config.get("cache_config")
         if cache_config is None:
             return None
         
         workdir = get_workdir()
-
         return WorkflowExecutionCache(
             workflow=self,
             config=cache_config,
             workdir_root=workdir.root,
         )
 
-    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()):
-        cache = self.get_cache()
+    def _execute_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()):
+        cache = self._get_cache()
         use_cache = cache.config.should_cache(self.task_graph_mode) if cache else False
 
         if fw._current_level > -1 or not torch.is_grad_enabled():
             with torch.no_grad():
                 if use_cache and cache.has_all(candidates):
-                    return ResultsBatch(cache.load_all(candidates))
+                    return cache.load_all(candidates)
 
-                results = ResultsBatch(run_batch(self, candidates, catch))
+                results = run_batch(self, candidates, catch)
                 if use_cache:
                     cache.save_all(candidates, results)
 
                 return results
-
 
         design_tensors = torch.stack([c.tensor for c in candidates])
         space = candidates[0].space
@@ -460,7 +524,7 @@ class Workflow:
         ])
 
 
-    def iterate_dependent_task_groups(self):
+    def _iterate_dependent_task_groups(self):
         for batch in get_dependent_task_groups(self.task_graph):
             yield batch
 
@@ -639,15 +703,16 @@ class Workflow:
         display(Image(_render_with_legend(format)))
 
     @property
-    def task_graph(self) -> nx.DiGraph:
-        if self._task_graph == None:
-            self._task_graph = nx.DiGraph(self._dependencies) 
-
-        return self._task_graph
+    def task_graph(self):
+        return self.task_graph_for(self.task_graph_mode)
     
     @property
     def task_graph_mode(self) -> GraphMode:
-        return GraphMode.DEFAULT
+        return self._mode or (
+            GraphMode.WORKFLOW_SURROGATE
+            if self._surrogate is not None and self._surrogate._is_pretrained
+            else GraphMode.DEFAULT
+        )
 
     @property
     def levels(self):
@@ -658,101 +723,12 @@ class Workflow:
         return max(self.levels.values()) + 1 if self.levels else 0
 
 
-class PatchableWorkflow(Workflow):
-    def __init__(self, dependencies: dict[Module, Iterable[Module]] | Module) -> None:
-        self.surrogate: WorkflowSurrogate | None = None
-        self._mode: GraphMode | None = None
-        self._default_task_graph: nx.DiGraph | None = None
-        super().__init__(dependencies)
-
-    def patch(self, surrogate: WorkflowSurrogate):
-        self.surrogate = surrogate
-
-    @contextmanager
-    def mode(self, mode: GraphMode):
-        old = self._mode
-        self._mode = mode
-        try: yield 
-        finally: self._mode = old
-
-
-    def task_graph_for(self, mode: GraphMode) -> nx.DiGraph:
-        if mode == GraphMode.MODULE_SURROGATE_EVAL:
-            return build_module_surrogate_eval_graph(self)
-        if mode == GraphMode.MODULE_SURROGATE_TRAIN:
-            return build_module_surrogate_train_graph(self)
-        if mode == GraphMode.WORKFLOW_SURROGATE:
-            return nx.DiGraph({self.surrogate: []})
-
-        if self._default_task_graph is None:
-            self._default_task_graph = nx.DiGraph(self._dependencies)
-        return self._default_task_graph
-
-
-    def run_batch(self,candidates: list[Candidate],catch: tuple[Exception, ...] = ()) -> ResultsBatch:
-        if self.surrogate is not None and self.surrogate._is_pretrained:
-            return ResultsBatch([self.surrogate(c) for c in candidates])
-        return super().run_batch(candidates, catch)
-
-    def run(self, candidate: Candidate, catch: tuple[Exception, ...] = (), use_surrogate: bool = True) -> dict[str, float]:
-        if self.surrogate and use_surrogate:
-            if not self.surrogate.is_in_trust_region(candidate) or self.surrogate.surrogate is None:
-                with self.mode(GraphMode.DEFAULT):
-                    self.surrogate.fit(candidate, workflow_callback=super(PatchableWorkflow, self).run_batch)
-
-        if self.uses_module_surrogates:
-            with Workdir.create_subdir("module_surrogate_training"):
-                for _, surrogate in self.module_surrogates.items():
-                    if not surrogate.is_in_trust_region(candidate):
-                        with self.mode(GraphMode.MODULE_SURROGATE_TRAIN):
-                            from dsbo.utils.io.sharded import ShardedNumpyStorage
-                            with config.use(file_backend=ShardedNumpyStorage):
-                                surrogate.fit(candidate, workflow_callback=super(PatchableWorkflow, self).run_batch)
-
-        with self.mode(GraphMode.DEFAULT):
-            return super(PatchableWorkflow, self).run(candidate, catch)
-
-    @property
-    def task_graph_mode(self) -> GraphMode:
-        return self._mode or (
-            GraphMode.WORKFLOW_SURROGATE
-            if self.surrogate is not None and self.surrogate._is_pretrained
-            else GraphMode.DEFAULT
-        )
-    
-    @property
-    def task_graph(self):
-        return self.task_graph_for(self.task_graph_mode or (
-            GraphMode.WORKFLOW_SURROGATE
-            if self.surrogate is not None and self.surrogate._is_pretrained
-            else GraphMode.DEFAULT
-        ))
-    
-    @property
-    def module_surrogates(self) -> dict[Module, WorkflowSurrogate]:
-        with self.mode(GraphMode.DEFAULT):
-            has_module_surrogate = lambda module: hasattr(module, "surrogate") and module.surrogate is not None
-            return {module: module.surrogate for module in self.task_graph.nodes if has_module_surrogate(module)}
-
-    @property
-    def uses_module_surrogates(self) -> bool:
-        return len(self.module_surrogates) > 0
-
-    @property
-    def task_graph_mode(self) -> GraphMode:
-        return self._mode or (
-            GraphMode.WORKFLOW_SURROGATE
-            if self.surrogate is not None and self.surrogate._is_pretrained
-            else GraphMode.DEFAULT
-        )
-
-
-def assert_no_mixed_surrogate_usage(workflow: PatchableWorkflow) -> None:
-    if workflow.surrogate is not None and workflow.uses_module_surrogates:
+def assert_no_mixed_surrogate_usage(workflow: Workflow) -> None:
+    if workflow._surrogate is not None and workflow.uses_module_surrogates:
         raise ValueError("Workflow cannot use both a workflow surrogate and module surrogates simultaneously.")
 
 
-def assert_leaf_surrogates(workflow: PatchableWorkflow) -> None:
+def assert_leaf_surrogates(workflow: Workflow) -> None:
     for module in workflow.task_graph.nodes:
         if hasattr(module, "surrogate") and module.surrogate is not None:
             if len(list(workflow.task_graph.successors(module))) > 0:
@@ -780,28 +756,6 @@ def mergeable_components(task_graph: Workflow, attr="resources") -> List[List[Mo
         if len(comp) > 1
     ]
 
-
-def update_task_graph(task_graph: Workflow, groups: list[list[Module]]) -> Workflow:
-    G = task_graph.task_graph.copy()
-    for group in groups:
-        merged = FusedModule(*group)
-        preds = set().union(*(G.predecessors(t) for t in group)) - set(group)
-        succs = set().union(*(G.successors(t) for t in group)) - set(group)
-
-        G.remove_nodes_from(group)
-        G.add_node(merged)
-
-        for p in preds: G.add_edge(p, merged)
-        for s in succs: G.add_edge(merged, s)
-
-    updated_task_graph= deepcopy(task_graph)
-    updated_task_graph.task_graph = G
-
-    return updated_task_graph
-
-
-def optimize(workflow: Workflow) -> Workflow:
-    return update_task_graph(workflow, mergeable_components(workflow))
 
 
 def validate_workflow_dependencies(workflow: Workflow, on_error: str = "warn"):
