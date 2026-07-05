@@ -82,3 +82,16 @@ class Trial(SQLModel, table=True):
     def design_vector(self) -> np.ndarray:
         import numpy as np
         return np.frombuffer(self.design, dtype=np.float32).copy()
+
+
+class ArtifactEntry(SQLModel, table=True):
+    id:           str           = Field(default_factory=_new_id, primary_key=True)
+    name:         str           = Field(index=True)
+    type:         str
+    version:      int
+    step:         int | None    = Field(default=None)
+    stage:        str | None    = Field(default=None)
+    meta:         dict          = Field(sa_column=Column("metadata", JSON, default=dict))
+    created_at:   float         = Field(sa_column=Column(Double), default_factory=time.time)
+    artifact_dir: str
+    filepath:     str | None    = Field(default=None)

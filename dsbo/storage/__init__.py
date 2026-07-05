@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from typing import Callable, Dict, Generator, List, Mapping, Optional, TYPE_CHECKING
 
 from dsbo.utils.functools import auto_wrap
-from dsbo.storage.artifacts import LocalModelRegistry
+from dsbo.storage.artifact import Artifact
 
 if TYPE_CHECKING:
     from dsbo.storage.taskstream import TaskStreamPlugin
@@ -198,15 +198,7 @@ class StudyStorageBase:
 
 class ArtifactStorageBase(ABC):
     def __init__(self, storage_name: str):
-        self.model_registry = LocalModelRegistry(f"{storage_name}.artifacts")
-
-    def write_to_model_registry(self, artifact: torch.nn.Module, tag: str, step: int) -> None:
-        fpath = self.model_registry.save(artifact, tag, step)
-        self.write_artifact_metadata(tag, step, {"artifact_type": type(artifact).__name__})
-
-    def load_from_model_registry(self, tag: str, step: int | None = None) -> Mapping[str, torch.Tensor]:
-        metadata = self.load_artifact_metadata(tag, step)
-        return self.model_registry.load(tag, step)
+        pass
 
     @abstractmethod
     def write_artifact_metadata(self, tag: str, step: int, metadata: dict) -> None:
@@ -214,4 +206,25 @@ class ArtifactStorageBase(ABC):
 
     @abstractmethod
     def load_artifact_metadata(self, tag: str, step: int | None = None) -> Optional[dict]:
+        pass
+
+    @abstractmethod
+    def create_artifact(self, name: str, type: str, metadata: dict | None = None) -> "Artifact":
+        pass
+
+    @abstractmethod
+    def save_artifact(self, artifact: "Artifact", stage: str | None = None, step: int | None = None) -> "Artifact":
+        pass
+
+    @abstractmethod
+    def load_artifact(self, name: str, version: int | None = None, stage: str | None = None) -> "Artifact":
+        pass
+
+    @abstractmethod
+    def latest_version(self, name: str, stage: str | None = None,
+                       subdir: str | None = None) -> int | None:
+        pass
+
+    @abstractmethod
+    def list_artifacts(self, type: str | None = None) -> list[dict]:
         pass

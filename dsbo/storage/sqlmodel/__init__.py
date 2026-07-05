@@ -13,8 +13,9 @@ from sqlalchemy import Engine, event as sa_event, inspect
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, case, create_engine, select
 
-from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase, ArtifactStorageBase
-from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow
+from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase, ArtifactStorageBase, Artifact
+from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow, ArtifactEntry
+from dsbo.utils.io.workdir import Workdir
 
 
 DUCKDB_VECTOR_METRICS = {
@@ -455,15 +456,120 @@ class TrialStorage(TrialStorageBase):
 
 
 class ArtifactStorage(ArtifactStorageBase):
+    def __init__(self, storage_name: str, engine: Engine):
+        super().__init__(storage_name)
+        self._engine = engine
+
     def write_artifact_metadata(self, tag: str, step: int, metadata: dict) -> None:
         pass
 
     def load_artifact_metadata(self, tag: str, step: int | None = None) -> Optional[dict]:
         pass
 
+    def create_artifact(self, name: str, type: str, metadata: dict | None = None) -> Artifact:
+        return Artifact(name, type, metadata)
+
+    def save_artifact(self, artifact: Artifact, stage: str | None = None,
+                      step: int | None = None) -> Artifact:
+        current_dir = Workdir.get_current_dir()
+       
+        prefix = Path(current_dir).as_posix() + "/artifacts/" + artifact.name + "/v"
+        with Session(self._engine) as session:
+            latest = session.exec(
+                select(ArtifactEntry)
+                .where(ArtifactEntry.name == artifact.name)
+                .where(ArtifactEntry.artifact_dir.startswith(prefix))
+                .order_by(ArtifactEntry.version.desc())
+            ).first()
+            version = (latest.version + 1) if latest is not None else 1
+
+        artifact_dir = Path(current_dir) / "artifacts" / artifact.name / f"v{version}"
+        artifact._version = version
+        artifact._stage = stage
+        artifact._step = step
+        artifact._save_to_dir(artifact_dir)
+
+        with Session(self._engine) as session:
+            entry = ArtifactEntry(
+                name=artifact.name,
+                type=artifact.type,
+                version=version,
+                step=step,
+                stage=stage,
+                meta=artifact._metadata,
+                artifact_dir=str(artifact_dir),
+                filepath=str(artifact_dir / "artifact.json"),
+            )
+            session.add(entry)
+            session.commit()
+
+        return artifact
+
+    def load_artifact(self, name: str, version: int | None = None,
+                      stage: str | None = None) -> Artifact:
+        with Session(self._engine) as session:
+            query = select(ArtifactEntry).where(ArtifactEntry.name == name)
+            if version is not None:
+                query = query.where(ArtifactEntry.version == version)
+            if stage is not None:
+                query = query.where(ArtifactEntry.stage == stage)
+            query = query.order_by(ArtifactEntry.version.desc())
+            entry = session.exec(query).first()
+
+            if entry is None:
+                raise FileNotFoundError(
+                    f"No artifact found for '{name}'"
+                    + (f" (version={version})" if version else "")
+                    + (f" (stage={stage})" if stage else "")
+                )
+
+        return Artifact._load_from_dir(
+            Path(entry.artifact_dir),
+            entry.name,
+            entry.type,
+            entry.version,
+            entry.stage,
+            entry.step,
+            dict(entry.meta),
+        )
+
+    def latest_version(self, name: str, stage: str | None = None,
+                       subdir: str | None = None) -> int | None:
+        with Session(self._engine) as session:
+            query = select(ArtifactEntry).where(ArtifactEntry.name == name)
+            if stage is not None:
+                query = query.where(ArtifactEntry.stage == stage)
+            if subdir is not None:
+                prefix = subdir + "/artifacts/" + name + "/v"
+                query = query.where(ArtifactEntry.artifact_dir.startswith(prefix))
+            query = query.order_by(ArtifactEntry.version.desc())
+            latest = session.exec(query).first()
+            return latest.version if latest is not None else None
+
+    def list_artifacts(self, type: str | None = None) -> list[dict]:
+        with Session(self._engine) as session:
+            query = select(ArtifactEntry).order_by(ArtifactEntry.name, ArtifactEntry.version)
+            if type is not None:
+                query = query.where(ArtifactEntry.type == type)
+            entries = session.exec(query).all()
+
+        return [
+            {
+                "name": e.name,
+                "type": e.type,
+                "version": e.version,
+                "stage": e.stage,
+                "step": e.step,
+                "metadata": dict(e.meta),
+                "created_at": e.created_at,
+            }
+            for e in entries
+        ]
+
 class StudyStorage(StudyStorageBase):
 
-    def __init__(self, engine: Engine, *, readonly: bool = False, vector_dim: int | None = None, backend: str = "duckdb"):
+    def __init__(self, engine: Engine, *, readonly: bool = False, vector_dim: int | None = None,
+                 backend: str = "duckdb"):
         super().__init__(db_path="")
         self._engine = engine
         self._readonly = readonly
@@ -474,20 +580,19 @@ class StudyStorage(StudyStorageBase):
         self._trial_storage = TrialStorage(engine, readonly, vector_dim=vector_dim, backend=backend)
         self._workflow_storage = WorkflowStorage(engine, readonly)
         self._intermediates_storage = IntermediatesStorage(engine, readonly)
-        self._artifact_storage = ArtifactStorage("artifacts") #TODO: use the correct name
+        self._artifact_storage = ArtifactStorage("artifacts", engine)
 
 
     @classmethod
-    def create(cls, db_path: Path | str, *, readonly: bool = False, backend: str = "duckdb", 
+    def create(cls, db_path: Path | str, *, readonly: bool = False, backend: str = "duckdb",
                vector_dim: int | None = None) -> "StudyStorage":
-        
         match backend:
             case "duckdb":
                 engine = create_engine(f"duckdb:///{db_path}", poolclass=NullPool)
                 if vector_dim is not None:
                     _configure_duckdb_vss(engine, vector_dim)
             case "sqlite":
-                engine = create_engine( f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+                engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
                 if vector_dim is not None:
                     _configure_sqlite_vec(engine, vector_dim)
             case _:
