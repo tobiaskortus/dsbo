@@ -14,7 +14,7 @@ from dsbo.utils.functools import auto_wrap
 from dsbo.storage.artifact import Artifact
 
 if TYPE_CHECKING:
-    from dsbo.storage.taskstream import TaskStreamPlugin
+    from dsbo.utils.plugins import TaskStreamPlugin
     from dsbo.storage.models import Batch, Execution, JobStatus, JobTrace, Workflow, Trial
 
 
@@ -93,7 +93,7 @@ class WorkflowStorageBase(ABC):
         pass
 
     def create_task_stream_plugin(self, task_map: Dict[str, str] | None = None, name_map: Dict[str, str] | None = None) -> TaskStreamPlugin:
-        from dsbo.storage.taskstream import TaskStreamPlugin
+        from dsbo.utils.plugins import TaskStreamPlugin
         if self._readonly:
             raise RuntimeError("Cannot create TaskStreamPlugin from readonly StudyStorage.")
         return TaskStreamPlugin(writer=self._make_transition_writer(), task_map=task_map, name_map=name_map)

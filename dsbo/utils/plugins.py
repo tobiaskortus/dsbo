@@ -1,9 +1,21 @@
 import time
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 from distributed.diagnostics.plugin import SchedulerPlugin
 
 from dsbo.storage.models import JobStatus
 from dsbo.storage import TransitionWriter
+
+
+class ProgressBarPlugin(SchedulerPlugin):
+    def __init__(self, progress_callback: Callable[[], None]) -> None:
+        super().__init__()
+        self.progress_callback = progress_callback
+
+    def transition(self, key, start, finish, *args, **kwargs):
+        match (start, finish):
+            case (_, "memory") | (_, "erred"):
+                self.progress_callback()
+
 
 class TaskStreamPlugin(SchedulerPlugin):
     def __init__(
@@ -34,10 +46,10 @@ class TaskStreamPlugin(SchedulerPlugin):
                     worker = None
                     if ts is not None and ts.processing_on is not None:
                         worker = ts.processing_on
-    
+
                     exec_id = self.task_map[key]
                     name    = self.name_map[key]
-                    if status == JobStatus.RUNNING:  
+                    if status == JobStatus.RUNNING:
                         approx_start = time.time()
                     self.writer(key, name, worker.name if worker != None else "unknown", approx_start, -1, exec_id, "", status)
                     return
@@ -60,7 +72,7 @@ class TaskStreamPlugin(SchedulerPlugin):
                 trigger_on_transition(status=JobStatus.QUEUED)
             case (_, "memory"):
                 trigger_on_transition(status=JobStatus.SUCCESS)
-            case (_, "erred"): 
+            case (_, "erred"):
                 trigger_on_transition(status=JobStatus.FAILED)
             case (_, _):
                 pass

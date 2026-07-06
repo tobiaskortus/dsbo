@@ -1,16 +1,26 @@
 from __future__ import annotations
 
-import random
 import torch
+import random
+import numpy as np
 from typing import TYPE_CHECKING, Sequence, overload
 
 if TYPE_CHECKING:
     from dsbo.modules import Module
     from dsbo.workflow import Workflow
 
+
+
+def seed_all(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    ModuleRandomEngine.seed_random_engine(seed)
+
 def get_random_engine():
     return ModuleRandomEngine.get_current_random_engine()
-
 
 def seed_random_engine(seed: int | None = None):
     return ModuleRandomEngine.seed_random_engine(seed)

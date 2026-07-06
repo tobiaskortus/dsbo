@@ -1,4 +1,6 @@
 from __future__ import annotations
+import logging
+from dataclasses import dataclass
 
 import numpy as np
 from typing import Any, Callable
@@ -100,7 +102,7 @@ class ModuleSurrogateContract:
         )
 
 
-class DiffusionModelWrapper(nn.Module):
+class StatefulModuleSurrogateWrapper(nn.Module):
     def __init__(
         self,
         diffusion_model: MlpDiffusion1D,
@@ -152,11 +154,17 @@ class ModuleSurrogate(SurrogateBase):
     def train(self, candidate: Candidate, workflow_callback: Callable):
         pass
 
+    def state_dict(self):
+        pass
+
+    def load_state_dict():
+        pass
+
 
 class DiffusersModuleSurrogate(ModuleSurrogate):
     def __init__(self, strategy: SurrogateStrategy):
         super().__init__(surrogate=None, strategy=strategy)
-        self._diffusion_model: DiffusionModelWrapper | None = None
+        self._diffusion_model: StatefulModuleSurrogateWrapper | None = None
         self._noise_scheduler: DDPMScheduler | None = None
         self._sample_scheduler: DDIMScheduler | None = None
         self.training_metrics: dict[str, Any] | None = None
@@ -165,6 +173,7 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
         self._num_infer_timesteps = 100
 
 
+    @requires_diffusion_model
     def __call__(self, design: dict, **kwargs) -> dict[str, torch.Tensor]:
         cond = self.contract.output_conditional_fn(design) \
             if self.contract.output_conditional_fn is not None \
@@ -198,7 +207,6 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
 
 
     def train(self, candidate: Candidate, workflow_callback: Callable):
-
         candidates = self.strategy.generate_candidates(candidate, candidate.space)
         workflow_callback(candidates)
 
@@ -218,7 +226,7 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
             dropout=0.1,
         )
 
-        self._diffusion_model = DiffusionModelWrapper(
+        self._diffusion_model = StatefulModuleSurrogateWrapper(
             model,
             loader.dataset.mean_x, loader.dataset.std_x,
             loader.dataset.mean_c, loader.dataset.std_c,
@@ -246,6 +254,8 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
             model_tag=type(self).__name__.lower(),
         ).fit(n_epochs=200, dataloader=loader, show_progress=False)
 
+        self.surrogate = self._diffusion_model
+
         self.training_metrics = {
             "n_samples": len(loader.dataset),
             "n_candidates": len(candidates),
@@ -256,3 +266,42 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
         }
 
         return self._diffusion_model
+    
+
+    def state_dict(self):
+        return self._diffusion_model.state_dict()
+
+    def load_state_dict(self, state_dict):
+        # TODO: this is a bit weird, rework state_dict and load_state_dict 
+        # functionality to handle scheduler, optimizer and other states.
+        model = MlpDiffusion1D(
+            objective_dim=self.contract.output_dim,
+            parameter_dim=self.contract.conditional_dim,
+            emb_dim=256,
+            hidden_dim=256,
+            n_layers=12,
+            dropout=0.1,
+        )
+        wrapper = StatefulModuleSurrogateWrapper(
+            model,
+            X_mean=torch.zeros(self.contract.output_dim[-1:]),
+            X_std=torch.ones(self.contract.output_dim[-1:]),
+            C_mean=torch.zeros(self.contract.conditional_dim[-1:]),
+            C_std=torch.ones(self.contract.conditional_dim[-1:]),
+        )
+        wrapper.load_state_dict(state_dict)
+        self._diffusion_model = wrapper
+        self.surrogate = wrapper
+
+        self._noise_scheduler = DDPMScheduler(
+            clip_sample=False,
+            num_train_timesteps=self._num_train_timesteps,
+            prediction_type="v_prediction",
+            beta_schedule="squaredcos_cap_v2",
+        )
+        self._sample_scheduler = DDIMScheduler(
+            clip_sample=False,
+            num_train_timesteps=self._num_train_timesteps,
+            prediction_type="v_prediction",
+            beta_schedule="squaredcos_cap_v2",
+        )

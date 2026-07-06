@@ -1,10 +1,15 @@
 import torch
+import logging
 from abc import abstractmethod
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 
+import dsbo
 from dsbo.modules import Module
 from dsbo.storage import get_current_storage
 from dsbo.parameters import ParameterSpace, Candidate, CandidateBatch
+
+if TYPE_CHECKING:
+    from dsbo.utils.cache import CacheConfig
 
 def implements(self, method_name: str) -> bool:
     for cls in type(self).__mro__:
@@ -32,16 +37,19 @@ class SurrogateBase(Module):
         self.surrogate = surrogate
         self.strategy = strategy
 
-        self._is_pretrained = False
-        self._is_finetuned = False
+    def load_from_registry(self, stage: str | None = None) -> Mapping[str, torch.Tensor]:
+        storage = get_current_storage()
+        name = type(self).__name__.lower()
+        artifact = storage.artifacts.load_artifact(name, stage=stage)
+        state_dict = artifact.get_model("model")
+        return state_dict
 
-    def load_from_registry(self) -> Mapping[str, torch.Tensor]:
-        # Load latest surrogate model from registry based on the candidate
-        # TODO: implement option for alternative strategies (e.g. first, best, most similar, etc.)
-        return get_current_storage().artifacts.load_from_model_registry(type(self).__name__.lower(), step=None)
-        
-    def write_to_registry(self, surrogate: Any) -> None:
-       get_current_storage().artifacts.write_to_model_registry(surrogate, type(self).__name__.lower(), step=0)
+    def write_to_registry(self, surrogate: Any, stage: str | None = None) -> None:
+        storage = get_current_storage()
+        name = type(self).__name__.lower()
+        artifact = storage.artifacts.create_artifact(name, "model")
+        artifact.add_model(surrogate, "model")
+        storage.artifacts.save_artifact(artifact, stage=stage)
 
     @property
     def implements_train(self) -> bool:
@@ -59,6 +67,30 @@ class SurrogateBase(Module):
     def implements_pretrain_and_finetune(self) -> bool:
         return self.implements_pretrain and self.implements_finetune
 
+    @property
+    def _is_pretrained(self) -> bool:
+        storage = get_current_storage()
+        if storage is None:
+            return False
+        name = type(self).__name__.lower()
+        # Accept any of the trained stages — "pretrained", "trained", "finetuned"
+        # Models saved via the single-phase train() path use stage="trained",
+        # which is functionally equivalent to being pretrained. However usually this shouldnt happen
+        # since train and pretrain/finetune require individual implementaitons.
+        return (storage.artifacts.latest_version(name, stage="pretrained") is not None or
+                storage.artifacts.latest_version(name, stage="trained") is not None)
+
+    @property
+    def _is_finetuned(self) -> bool:
+        # NOTE: _is_finetuned only returns if there exists any finetuned version of the model,
+        # the surrogate strategy decides if this is still usable
+        storage = get_current_storage()
+        if storage is None:
+            return False
+        name = type(self).__name__.lower()
+        return (storage.artifacts.latest_version(name, stage="finetuned") is not None or
+                storage.artifacts.latest_version(name, stage="trained") is not None)
+
     def train(self, candidate: Candidate, workflow_callback: Any):
         pass
 
@@ -69,36 +101,68 @@ class SurrogateBase(Module):
         pass
 
     def fit(self, candidate: Candidate, workflow_callback: Any):
+        use_cache = self._use_cached_models()
+        name = type(self).__name__.lower()
+
         if self.implements_train:
-            #Surrogate model is retrained from scratch in every iteration
+            if use_cache:
+                try:
+                    state_dict = self.load_from_registry()
+                    self.load_state_dict(state_dict)
+                    return
+                except Exception as exc:
+                    pass
+
             self.surrogate = self.train(candidate, workflow_callback)
-            self._is_pretrained = True
+            self.write_to_registry(self.surrogate, stage="pretrained")
+    
 
         elif self.implements_pretrain_and_finetune:
-            # A base surrogate model is pretrained once and then finetuned in every iteration
-
-            if not self._is_pretrained:
-                self.surrogate = self.pretrain(candidate, workflow_callback)
-                self.write_to_registry(self.surrogate)
-                self._is_pretrained = True
-                requires_finetune = False
+            if use_cache:
+                if self._is_pretrained:
+                    state_dict = self.load_from_registry()
+                    self.surrogate.load_state_dict(state_dict)
+                    self.surrogate = self.finetune(candidate, workflow_callback)
+                    self.write_to_registry(self.surrogate, stage="finetuned")
+                else:
+                    self.surrogate = self.pretrain(candidate, workflow_callback)
+                    self.write_to_registry(self.surrogate, stage="pretrained")
             else:
-                self.surrogate.load_state_dict(self.load_from_registry())
-                self._is_pretrained = True
-                requires_finetune = True
-
-            if requires_finetune:
+                self.surrogate = self.pretrain(candidate, workflow_callback)
                 self.surrogate = self.finetune(candidate, workflow_callback)
-                self.surrogate = self.write_to_registry(self.surrogate)
-                self._is_finetuned = True
         else:
             raise NotImplementedError("Surrogate must implement either 'train' or both 'pretrain' and 'finetune' methods.")
 
-
     def is_in_trust_region(self, candidate: Candidate) -> bool:
-        if not self._is_pretrained and not self._is_finetuned:
-            # If the surrogate has not been trained at all, 
-            # all candidates are outside the trust region
+        pretrained = self._is_pretrained
+        finetuned  = self._is_finetuned
+        if not pretrained and not finetuned:
+            return False
+
+        result = self.strategy.is_in_trust_region(candidate)
+        return result
+
+    def _use_cached_models(self) -> bool:
+        from dsbo.utils.cache import CachePolicy
+        from dsbo.surrogates.graph_transformations import GraphMode
+
+        cache_config: CacheConfig = dsbo.config.get("cache_config")
+        if cache_config is None:
+            return False
+
+        if cache_config.cache_policy == CachePolicy.RETRAIN_SURROGATES:
+            return False
+
+        result = cache_config.should_cache(GraphMode.DEFAULT)
+        return result
+    
+    @property
+    def is_available(self):
+        from dsbo.utils.cache import CachePolicy
+        cache_config: CacheConfig = dsbo.config.get("cache_config")
+        exceptions = (CachePolicy.RETRAIN_SURROGATES, CachePolicy.ALWAYS_EXECUTE)
+        if cache_config.cache_policy in exceptions:
             return False
         
-        return self.strategy.is_in_trust_region(candidate)
+        return self._is_pretrained or self._is_finetuned
+    

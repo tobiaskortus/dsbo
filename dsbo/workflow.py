@@ -5,30 +5,25 @@ import torch
 import warnings
 import logging
 import networkx as nx
-
-from copy import deepcopy
+from tqdm import tqdm
 from itertools import chain
 from itertools import groupby
-import matplotlib.pyplot as plt
 from contextlib import nullcontext
-import matplotlib.colors as mcolors
 from contextlib import contextmanager
-import matplotlib.patches as mpatches
 import torch.autograd.forward_ad as fw
 from typing import Any, Iterable, List, Sequence, TYPE_CHECKING, overload
 
+from dsbo.config import config
 from dsbo.modules import Module
 from dsbo.modules.dsl import DependencyDict
 from dsbo.storage import get_current_storage
-from dsbo.config import get_active_file_backend, config
-from dsbo.parameters import Candidate
+from dsbo.utils.cache import WorkflowExecutionCache
 from dsbo.parameters import Candidate, ParameterSpace
-from dsbo.backends.aido.surrogate import LocalSurrogate
 from dsbo.utils.io import Workdir, get_subdir, get_workdir
+from dsbo.utils.random import get_random_engine
 from dsbo.surrogates.graph_transformations import (GraphMode,
-                                                    build_module_surrogate_eval_graph,
-                                                    build_module_surrogate_train_graph)
-from dsbo.utils.cache import WorkflowExecutionCache, CachePolicy
+                                                     build_module_surrogate_eval_graph,
+                                                     build_module_surrogate_train_graph)
 
 if TYPE_CHECKING:
     from dsbo.worker.spec import WorkerSpec
@@ -157,9 +152,14 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
         is_forward_ad = fw._current_level > -1
         is_grad_enabled = torch.is_grad_enabled()
 
+        pbar = tqdm(total=len(candidates) * workflow.num_tasks)
+
         if worker is None:
             batch_results = []
             for i, candidate in enumerate(candidates):
+                rng = get_random_engine()
+                rng.seed_all(workflow)
+                
                 with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
                     try:
                         results = {}
@@ -173,10 +173,12 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                                 )
                                 results.update(result)
                         batch_results.append(results)
+                        pbar.update()
                     except Exception as e:
                         batch_results.append({})
                         if not isinstance(e, catch):
                             raise
+
             return batch_results
         else:
             batch_delays = []
@@ -185,7 +187,12 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
             name_map: dict[str, str] = {}
             exec_ids = []
             batch_path = getattr(get_workdir(), "root", None)
+            
+
             for i, candidate in enumerate(candidates):
+                rng = get_random_engine()
+                rng.seed_all(workflow)
+
                 with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
                     delayed_map = {}
                     task_ids = []
@@ -211,6 +218,10 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                 plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
                 worker.client.register_plugin(plugin, name="dsbo_task_stream")
 
+            from dsbo.utils.plugins import ProgressBarPlugin
+            progress_plugin = ProgressBarPlugin(pbar.update)
+            worker.client.register_plugin(progress_plugin, name="dsbo_progress_bar")
+
             futures_computed = worker.compute(batch_delays)
             results_flat = worker.gather(futures_computed, catch=catch)
             lookup = {task_id: result for task_id, result in results_flat}
@@ -230,6 +241,8 @@ def run_batch_reverse_autograd(
 
     G = workflow.task_graph
     tasks_rev = list(reversed(list(nx.topological_sort(G))))
+
+    pbar = tqdm(total=len(candidates) * len(tasks_rev))
 
     if worker is None:
         gradients = []
@@ -296,6 +309,10 @@ def run_batch_reverse_autograd(
             storage.workflow.add_runs(wf_record, exec_ids, batch_path)
             plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
             worker.client.register_plugin(plugin, name="dsbo_task_stream_bwd")
+
+        from dsbo.storage.progress import ProgressBarPlugin
+        progress_plugin = ProgressBarPlugin(pbar.update)
+        worker.client.register_plugin(progress_plugin, name="dsbo_progress_bar_bwd")
 
         futures_computed = worker.compute(batch_delays)
         results_flat = worker.gather(futures_computed, catch=catch)
@@ -472,12 +489,13 @@ class Workflow:
             if not self._surrogate.is_in_trust_region(candidate) or self._surrogate.surrogate is None:
                 with self.mode(GraphMode.DEFAULT):
                     self._surrogate.fit(candidate, workflow_callback=self._execute_batch)
+
             return
 
         if self.uses_module_surrogates:
             with Workdir.create_subdir("module_surrogate_training"):
                 for _, surrogate in self.module_surrogates.items():
-                    if not surrogate.is_in_trust_region(candidate):
+                    if not surrogate.is_in_trust_region(candidate) or not surrogate.is_available:
                         with self.mode(GraphMode.MODULE_SURROGATE_TRAIN):
                             from dsbo.utils.io.sharded import ShardedNumpyStorage
                             with config.use(file_backend=ShardedNumpyStorage):
@@ -489,6 +507,7 @@ class Workflow:
             return None
         
         workdir = get_workdir()
+
         return WorkflowExecutionCache(
             workflow=self,
             config=cache_config,
@@ -721,6 +740,10 @@ class Workflow:
     @property
     def max_depth(self):
         return max(self.levels.values()) + 1 if self.levels else 0
+    
+    @property
+    def num_tasks(self):
+        return self.task_graph.number_of_nodes()
 
 
 def assert_no_mixed_surrogate_usage(workflow: Workflow) -> None:

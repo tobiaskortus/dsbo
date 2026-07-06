@@ -5,6 +5,7 @@ import json
 import torch
 import hashlib
 import inspect
+import logging
 import marshal
 import numpy as np
 from enum import Enum
@@ -15,10 +16,10 @@ import torch.autograd.forward_ad as fw
 
 from dsbo.modules import Module
 from dsbo.surrogates.graph_transformations import GraphMode
+from dsbo.parameters import Candidate, CandidateBatch
 
 if TYPE_CHECKING:
-    from dsbo.workflow import Workflow
-    from dsbo.parameters import Candidate, CandidateBatch
+    from dsbo.workflow import Workflow, ResultsBatch
 
 
 CACHE_DIR = ".dsbo_cache"
@@ -46,17 +47,35 @@ class CacheConfig:
         if self.cache_policy == CachePolicy.CACHE_EVERYTHING:
             return True
         if self.cache_policy == CachePolicy.RETRAIN_SURROGATES:
-            return mode == GraphMode.DEFAULT
+            result = (mode == GraphMode.DEFAULT) | (mode == GraphMode.MODULE_SURROGATE_TRAIN)
+            return result
         return False
     
 
-def module_code(node: Module) -> str:
+def code_hash(code_obj):
+    #TODO: replace this simplified heuristic with an improved code checking
+    #to ensure that the output is the same when using the cache.
+    h = hashlib.sha256()
+    h.update(code_obj.co_code)
+    h.update(str(code_obj.co_argcount).encode())
+    h.update(str(code_obj.co_nlocals).encode())
+    h.update(str(code_obj.co_stacksize).encode())
+    h.update(str(code_obj.co_flags).encode())
+    h.update(marshal.dumps(code_obj.co_names))
+    h.update(marshal.dumps(code_obj.co_varnames))
+    h.update(marshal.dumps(code_obj.co_consts))
+    h.update(marshal.dumps(code_obj.co_cellvars))
+    h.update(marshal.dumps(code_obj.co_freevars))
+    return h.digest()  # Return bytes, not hex string
+
+
+def module_code(node: Module, include_seed: bool = True) -> str:
     cls = type(node)
     identity = f"{cls.__module__}.{cls.__qualname__}"
-    state = f"seed={node._seed},no_grad={node._no_grad_op}"
+    state = f"seed={node._seed},no_grad={node._no_grad_op}" if include_seed else f"no_grad={node._no_grad_op}"
     code_digest = hashlib.sha256()
     for _, m in inspect.getmembers(cls, predicate=inspect.isfunction):
-        code_digest.update(marshal.dumps(m.__code__))
+        code_digest.update(code_hash(m.__code__))
     return f"{identity}:{code_digest.hexdigest()}:{state}"
 
 
@@ -64,9 +83,8 @@ def compute_workflow_hash(workflow: Workflow) -> str:
     G = workflow.task_graph.copy()
     for node in G.nodes():
         if isinstance(node, Module):
-            G.nodes[node]["_dsbo_code"] = module_code(node)
+            G.nodes[node]["_dsbo_code"] = module_code(node, include_seed=True)
         else:
-            #This shouldn't happen; just to be safe.
             G.nodes[node]["_dsbo_code"] = str(type(node).__name__)
     return nx.weisfeiler_lehman_graph_hash(G, node_attr="_dsbo_code")
 
@@ -78,29 +96,9 @@ def compute_candidate_hash(candidate: Candidate) -> str:
     return h.hexdigest()
 
 
-def collect_output_sizes(dir_path: str) -> dict[str, int]:
-    if not os.path.isdir(dir_path):
-        return {}
-    return {
-        entry.name: entry.stat().st_size
-        for entry in os.scandir(dir_path)
-        if entry.is_file()
-    }
-
-
-def check_output_sizes(dir_path: str, expected: dict[str, int]) -> bool:
-    for name, expected_size in expected.items():
-        try:
-            actual = os.path.getsize(os.path.join(dir_path, name))
-        except OSError:
-            return False
-        if actual != expected_size:
-            return False
-    return True
-
-
 def entry_dir(base_dir: str, wf_hash: str, cand_hash: str) -> str:
-    return os.path.join(base_dir, CACHE_DIR, wf_hash, cand_hash)
+    combined_hash = hashlib.sha256(wf_hash.encode() + cand_hash.encode()).hexdigest()
+    return os.path.join(base_dir, CACHE_DIR, combined_hash)
 
 
 def write_npz(cache_entry_path: str, results: dict[str, Any]) -> list[str]:
@@ -150,7 +148,6 @@ def save_cache_entry(base_dir: str, workflow_hash: str, candidate_hash: str,
         "result_keys": list(results.keys()),
         "tangent_keys": tangent_keys,
         "workdir_root": base_dir,
-        "output_sizes": collect_output_sizes(base_dir) if base_dir else {},
     }
 
     with open(os.path.join(cache_entry_path, MANIFEST_NAME), "w") as f:
@@ -167,11 +164,6 @@ def load_cache_entry(base_dir: str, workflow_hash: str, candidate_hash: str) -> 
     with open(manifest_fp) as f:
         manifest = json.load(f)
 
-    wd_root = manifest.get("workdir_root")
-    if wd_root and os.path.isdir(wd_root):
-        if not check_output_sizes(wd_root, manifest.get("output_sizes", {})):
-            return None
-
     result = load_npz(cache_entry_path, manifest)
     return result
 
@@ -180,19 +172,11 @@ def check_cache_entry(base_dir: str, workflow_hash: str, candidate_hash: str) ->
     cache_entry_path = entry_dir(base_dir, workflow_hash, candidate_hash)
     manifest_fp = os.path.join(cache_entry_path, MANIFEST_NAME)
     results_fp = os.path.join(cache_entry_path, RESULTS_NAME)
-    if not os.path.isfile(manifest_fp) or not os.path.isfile(results_fp):
-        return False
+    hit = os.path.isfile(manifest_fp) and os.path.isfile(results_fp)
+    return hit
 
-    with open(manifest_fp) as f:
-        manifest = json.load(f)
 
-    wd_root = manifest.get("workdir_root")
-    if wd_root and os.path.isdir(wd_root):
-        if not check_output_sizes(wd_root, manifest.get("output_sizes", {})):
-            return False
-
-    return True
-
+type Candidates = Sequence[Candidate] | CandidateBatch
 
 class WorkflowExecutionCache:
     def __init__(
@@ -201,36 +185,56 @@ class WorkflowExecutionCache:
         config: CacheConfig | None = None,
         workdir_root: str | None = None,
     ):
-        self.workdir_root = workdir_root 
-        self.config = config or CacheConfig(base_dir=workdir_root)
+        self._effective_base = (
+            config.base_dir
+            if config is not None and config.base_dir is not None
+            else workdir_root
+        )
+        self.config = config or CacheConfig(base_dir=self._effective_base)
         self.workflow_hash = compute_workflow_hash(workflow)
 
     def has(self, candidate: Candidate) -> bool:
         return check_cache_entry(
-            self.workdir_root,
+            self._effective_base,
             self.workflow_hash,
             compute_candidate_hash(candidate),
         )
 
     def load(self, candidate: Candidate) -> dict[str, Any] | None:
         return load_cache_entry(
-            self.workdir_root,
+            self._effective_base,
             self.workflow_hash,
             compute_candidate_hash(candidate),
         )
 
     def save(self, candidate: Candidate, results: dict[str, Any]) -> None:
         save_cache_entry(
-            self.workdir_root,
+            self._effective_base,
             self.workflow_hash,
             compute_candidate_hash(candidate),
             results,
         )
 
-    def has_all(self, candidates: Sequence[Candidate] | CandidateBatch) -> bool:
+    def has_all(self, candidates: Candidates) -> bool:
         return all(self.has(c) for c in candidates)
+    
+    def match_partial(self, candidates: Candidates) -> tuple:
+        from dsbo.workflow import ResultsBatch
+        from dsbo.parameters import CandidateBatch
 
-    def load_all(self, candidates: Sequence[Candidate]) -> list[dict[str, Any]]:
+        misses = CandidateBatch()
+        results = ResultsBatch()
+
+        for c in candidates:
+            if self.has(c):
+                results.append(self.load(c))
+                continue
+
+            misses.append(c)
+
+        return results, misses
+
+    def load_all(self, candidates: Candidates) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for c in candidates:
             r = self.load(c)
@@ -240,8 +244,9 @@ class WorkflowExecutionCache:
                     f"{compute_candidate_hash(c)[:12]}..."
                 )
             results.append(r)
+
         return results
 
-    def save_all(self, candidates: Sequence[Candidate], batch_results: list[dict[str, Any]]) -> None:
+    def save_all(self, candidates: Candidates, batch_results: list[dict[str, Any]]):
         for c, r in zip(candidates, batch_results):
             self.save(c, r)
