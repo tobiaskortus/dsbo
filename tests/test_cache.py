@@ -9,6 +9,7 @@ import numpy as np
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from dsbo.workflow import Workflow
 from dsbo.utils.random import seed_all, get_random_engine
 from dsbo.utils.cache import (
     CachePolicy,
@@ -140,33 +141,23 @@ def test_no_grad_changes_code():
     assert module_code(m1) != module_code(m2)
 
 def test_same_graph_same_hash():
-    from dsbo.modules.dsl import DependencyDict
     m1 = SimpleModule()
     m2 = AnotherModule()
-    deps = DependencyDict({m1: [m2]})
-    from dsbo.workflow import Workflow
-    wf_a = Workflow(deps)
-    wf_b = Workflow(deps)
+    wf_a = Workflow(m1 >> m2)
+    wf_b = Workflow(m1 >> m2)
     assert compute_workflow_hash(wf_a) == compute_workflow_hash(wf_b)
 
 def test_different_graph_different_hash():
-    from dsbo.modules.dsl import DependencyDict
-    from dsbo.workflow import Workflow
     m1 = SimpleModule()
     m2 = AnotherModule()
-    deps_a = DependencyDict({m1: [m2]})
-    deps_b = DependencyDict({m2: [m1]})
-    h_a = compute_workflow_hash(Workflow(deps_a))
-    h_b = compute_workflow_hash(Workflow(deps_b))
+    h_a = compute_workflow_hash(Workflow(m1 >> m2))
+    h_b = compute_workflow_hash(Workflow(m2 >> m1))
     assert h_a != h_b
 
 def test_hash_is_deterministic():
-    from dsbo.modules.dsl import DependencyDict
-    from dsbo.workflow import Workflow
     m1 = SimpleModule()
     m2 = AnotherModule()
-    deps = DependencyDict({m1: [m2]})
-    wf = Workflow(deps)
+    wf = Workflow(m1 >> m2)
     h1 = compute_workflow_hash(wf)
     h2 = compute_workflow_hash(wf)
     assert h1 == h2
@@ -253,74 +244,106 @@ def test_unrelated_files_in_workdir_do_not_break_check(temp_dir, results, candid
 
     assert check_cache_entry(str(temp_dir), wf_hash, cand_hash)
 
-def test_match_partial(temp_dir, candidate_batch, simple_space):
-    from dsbo.modules.dsl import DependencyDict
-    from dsbo.workflow import Workflow
-    m = SimpleModule()
-    wf = Workflow(DependencyDict({m: []}))
+def test_match_partial_all_hits(temp_dir, simple_space):
+    wf = Workflow(SimpleModule())
+
+    cand_a = Candidate(simple_space, torch.tensor([1.0]))
+    cand_b = Candidate(simple_space, torch.tensor([2.0]))
+    batch = CandidateBatch([cand_a, cand_b])
+
+    cfg = CacheConfig(base_dir=str(temp_dir))
+    cache = WorkflowExecutionCache(wf, config=cfg, workdir_root=str(temp_dir))
+    cache.save(cand_a, {"out": torch.tensor(10.0)})
+    cache.save(cand_b, {"out": torch.tensor(20.0)})
+
+    results, misses, indices = cache.match_partial(batch)
+    assert len(results) == 2
+    assert len(misses) == 0
+    assert len(indices) == 0
+    assert results[0] is not None
+    assert results[1] is not None
+    assert torch.allclose(results[0]["out"], torch.tensor(10.0))
+    assert torch.allclose(results[1]["out"], torch.tensor(20.0))
+
+def test_match_partial_all_misses(temp_dir, simple_space):
+    wf = Workflow(SimpleModule())
 
     cand_a = Candidate(simple_space, torch.tensor([1.0]))
     cand_b = Candidate(simple_space, torch.tensor([2.0]))
     cand_c = Candidate(simple_space, torch.tensor([3.0]))
     batch = CandidateBatch([cand_a, cand_b, cand_c])
 
-    cache = WorkflowExecutionCache(wf, config=CacheConfig(), workdir_root=str(temp_dir))
+    cfg = CacheConfig(base_dir=str(temp_dir))
+    cache = WorkflowExecutionCache(wf, config=cfg, workdir_root=str(temp_dir))
+    results, misses, indices = cache.match_partial(batch)
+    assert len(results) == 3
+    assert len(misses) == 3
+    assert len(indices) == 3
+    assert results[0] is None
+    assert results[1] is None
+    assert results[2] is None
+    assert indices == [0, 1, 2]
+
+def test_match_partial(temp_dir, candidate_batch, simple_space):
+    wf = Workflow(SimpleModule())
+
+    cand_a = Candidate(simple_space, torch.tensor([1.0]))
+    cand_b = Candidate(simple_space, torch.tensor([2.0]))
+    cand_c = Candidate(simple_space, torch.tensor([3.0]))
+    batch = CandidateBatch([cand_a, cand_b, cand_c])
+
+    cfg = CacheConfig(base_dir=str(temp_dir))
+    cache = WorkflowExecutionCache(wf, config=cfg, workdir_root=str(temp_dir))
     cache.save(cand_a, {"out": torch.tensor(10.0)})
     cache.save(cand_b, {"out": torch.tensor(20.0)})
 
-    hits, misses, indices = cache.match_partial(batch)
+    results, misses, indices = cache.match_partial(batch)
     
-    assert len(hits) == 2
+    assert len(results) == 3
     assert len(misses) == 1
     assert len(indices) == 1
 
-    assert torch.allclose(hits[0]["out"], torch.tensor(10.0))
-    assert torch.allclose(hits[1]["out"], torch.tensor(20.0))
+    assert torch.allclose(results[0]["out"], torch.tensor(10.0))
+    assert torch.allclose(results[1]["out"], torch.tensor(20.0))
+    assert results[2] is None
     assert misses[0].tensor.item() == 3.0
     assert indices == [2]
 
 def test_cache_persists_across_cache_instances(temp_dir, candidate, results):
-    from dsbo.modules.dsl import DependencyDict
-    from dsbo.workflow import Workflow
-    m = SimpleModule()
-    wf = Workflow(DependencyDict({m: []}))
+    wf = Workflow(SimpleModule())
 
-    cache1 = WorkflowExecutionCache(wf, config=CacheConfig(), workdir_root=str(temp_dir))
+    cfg = CacheConfig(base_dir=str(temp_dir))
+    cache1 = WorkflowExecutionCache(wf, config=cfg, workdir_root=str(temp_dir))
     cache1.save(candidate, results)
 
-    wf2 = Workflow(DependencyDict({SimpleModule(): []}))
-    cache2 = WorkflowExecutionCache(wf2, config=CacheConfig(), workdir_root=str(temp_dir))
+    wf2 = Workflow(SimpleModule())
+    cache2 = WorkflowExecutionCache(wf2, config=cfg, workdir_root=str(temp_dir))
     assert cache2.has(candidate)
 
 def test_cache_misses_on_different_candidate(temp_dir, simple_space):
-    from dsbo.modules.dsl import DependencyDict
-    from dsbo.workflow import Workflow
-    m = SimpleModule()
-    wf = Workflow(DependencyDict({m: []}))
+    wf = Workflow(SimpleModule())
 
     cand_a = Candidate(simple_space, torch.tensor([5.0]))
     cand_b = Candidate(simple_space, torch.tensor([7.0]))
 
-    cache = WorkflowExecutionCache(wf, config=CacheConfig(), workdir_root=str(temp_dir))
+    cfg = CacheConfig(base_dir=str(temp_dir))
+    cache = WorkflowExecutionCache(wf, config=cfg, workdir_root=str(temp_dir))
     cache.save(cand_a, {"out": torch.tensor(1.0)})
     assert cache.has(cand_a)
     assert not cache.has(cand_b)
 
 def test_workflow_hash_stable_with_seeding():
-    from dsbo.modules.dsl import DependencyDict
-    from dsbo.workflow import Workflow
-
     seed_all(42)
     m1_a = SimpleModule()
     m2_a = AnotherModule()
-    wf_a = Workflow(DependencyDict({m1_a: [m2_a]}))
+    wf_a = Workflow(m1_a >> m2_a)
     rng = get_random_engine()
     rng.seed_all(wf_a)
 
     seed_all(42)
     m1_b = SimpleModule()
     m2_b = AnotherModule()
-    wf_b = Workflow(DependencyDict({m1_b: [m2_b]}))
+    wf_b = Workflow(m1_b >> m2_b)
     rng = get_random_engine()
     rng.seed_all(wf_b)
 

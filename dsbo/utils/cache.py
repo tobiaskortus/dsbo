@@ -231,24 +231,18 @@ class WorkflowExecutionCache:
     def has_all(self, candidates: Candidates) -> bool:
         return all(self.has(c) for c in candidates)
     
-    def match_partial(self, candidates: Candidates) -> tuple:
-        from dsbo.workflow import ResultsBatch
-        from dsbo.parameters import CandidateBatch
-
-        misses = []
-        results = []
+    def match_partial(self, candidates: Candidates) -> tuple[list[dict | None], list[Candidate] , list[int]]:
+        results = [None] * len(candidates)
+        misses  = []
         indices = []
 
         for i, c in enumerate(candidates):
             if self.has(c):
-                results.append(self.load(c))
+                results[i] =  self.load(c)
                 continue
             
-            indices += [i]
+            indices.append(i)
             misses.append(c)
-
-        if len(misses) > 0: misses = CandidateBatch(misses)
-        if len(results) > 0: results = ResultsBatch(results)
 
         return results, misses, indices
 
