@@ -178,13 +178,26 @@ def check_cache_entry(base_dir: str, workflow_hash: str, candidate_hash: str) ->
 
 type Candidates = Sequence[Candidate] | CandidateBatch
 
+
+class TaskExecutionCache:
+    # TODO: This probably requires a custom scheduler implementation to support 
+    # caching when workers with results are lost and require re-computing.
+    def __init__(self, workflow: Workflow, config: CacheConfig | None = None, workdir_root: str | None = None):
+        self.workflow_hash = compute_workflow_hash(workflow)
+
+    def has(self, task_id: str) -> bool:
+        return False
+    
+    def load(self, task_id: str) -> bool:
+        return {}
+    
+    def save(self, task_id, results: dict[str, Any]) -> None:
+        return {}
+
+
+
 class WorkflowExecutionCache:
-    def __init__(
-        self,
-        workflow: Workflow,
-        config: CacheConfig | None = None,
-        workdir_root: str | None = None,
-    ):
+    def __init__(self, workflow: Workflow, config: CacheConfig | None = None, workdir_root: str | None = None,):
         self._effective_base = (
             config.base_dir
             if config is not None and config.base_dir is not None
@@ -222,17 +235,22 @@ class WorkflowExecutionCache:
         from dsbo.workflow import ResultsBatch
         from dsbo.parameters import CandidateBatch
 
-        misses = CandidateBatch()
-        results = ResultsBatch()
+        misses = []
+        results = []
+        indices = []
 
-        for c in candidates:
+        for i, c in enumerate(candidates):
             if self.has(c):
                 results.append(self.load(c))
                 continue
-
+            
+            indices += [i]
             misses.append(c)
 
-        return results, misses
+        if len(misses) > 0: misses = CandidateBatch(misses)
+        if len(results) > 0: results = ResultsBatch(results)
+
+        return results, misses, indices
 
     def load_all(self, candidates: Candidates) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
