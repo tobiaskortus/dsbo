@@ -141,6 +141,14 @@ class Module(ModuleDslMixin, ABC):
     def registered_files(self) -> dict[str, AbstractFilePath]:
         return self._registered_files
 
+    @property
+    def registered_inputs(self) -> list[AbstractFilePath]:
+        return list(self._registered_inputs)
+
+    @property
+    def registered_outputs(self) -> list[AbstractFilePath]:
+        return list(self._registered_outputs)
+
 
 def dynamic_submodule(wrapped_fn):
     class DynamicSubmodule:
