@@ -1,4 +1,5 @@
 import torch
+import logging
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, TensorDataset
@@ -17,6 +18,9 @@ class LocalSurrogate(nn.Module):
 
     def trust_region(self, candidate: Candidate) -> bool:
         return self._strategy.trust_region(candidate)
+
+    def is_in_trust_region(self, candidate: Candidate) -> bool:
+        return self.trust_region(candidate)
     
     def fit(self, design: Candidate, workflow_callback: Callable[[dict], dict[str, float]]):
         pass
