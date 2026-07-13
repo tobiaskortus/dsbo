@@ -9,6 +9,10 @@ from dsbo.workflow import (
 )
 from dsbo.modules import Module
 from dsbo.modules.dsl import DependencyDict
+from dsbo.container import (
+    ContainerWrapperBase, ImageRef, DockerImageProvider,
+    warm_container_dependencies,
+)
 from tests.workflow.conftest import (
     SimpleModule, BackwardModule, NoGradModule, FailingModule,
     FailingBackwardModule,
@@ -102,6 +106,27 @@ class TestRunBatchLocal:
         cand = Candidate(simple_space, torch.tensor([3.0]))
         with pytest.raises(ValueError, match="simulated failure"):
             run_batch(wf, [cand, cand], catch=(RuntimeError,))
+
+    def test_invokes_warm_container_dependencies(self, simple_space):
+        ref = ImageRef(uri="ubuntu:22.04")
+
+        class ContainerModule(Module, ContainerWrapperBase):
+            def __init__(self):
+                Module.__init__(self)
+                ContainerWrapperBase.__init__(self, ref)
+            def run(self, **kwargs):
+                return {"out": torch.tensor(0.0)}
+
+        wf = Workflow(ContainerModule())
+        cand = Candidate(simple_space, torch.tensor([3.0]))
+
+        with patch("dsbo.workflow.warm_container_dependencies") as mock_warm, \
+             patch("dsbo.container.discover_container_environments",
+                   return_value={"docker": True, "apptainer": False, "singularity": False}), \
+             patch.object(DockerImageProvider, "prepare_image", return_value="ubuntu:22.04"):
+            run_batch(wf, [cand])
+
+        mock_warm.assert_called_once_with(wf)
 
 
 class TestRunBatchReverseAutograd:

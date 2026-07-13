@@ -7,11 +7,14 @@ from pathlib import Path
 from enum import Enum
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Type, Union
+from typing import Dict, List, Optional, Type, Union, TYPE_CHECKING
 
 from dsbo.config import config
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.process import subprocess_run
+
+if TYPE_CHECKING:
+    from dsbo.workflow import Workflow
 
 
 @dataclass(frozen=True)
@@ -20,6 +23,9 @@ class ImageRef:
     Can be pulled directly by Docker, or converted to a .sif file by Apptainer/Singularity.
     """
     uri: str
+
+    def __hash__(self) -> int:
+        return hash(self.uri)
 
     def _normalize_uri(self, uri: str) -> str:
         for prefix in ("https://", "http://", "docker://"):
@@ -44,7 +50,14 @@ class ImageRef:
 @dataclass(frozen=True)
 class ImageFile:
     """A local .sif container image file, used with Apptainer/Singularity."""
-    path: Union[str, Path]
+    path: str | Path
+
+    def __post_init__(self) -> None:
+        if isinstance(self.path, str):
+            object.__setattr__(self, "path", Path(self.path))
+
+    def __hash__(self) -> int:
+        return hash(self.path.resolve())
 
 
 @dataclass(frozen=True)
@@ -52,8 +65,15 @@ class DefinitionFile:
     """A container definition file (Dockerfile or Singularity .def) 
     that builds the container image on first use.
     """
-    path: Union[str, Path]
+    path: str | Path
     container_name: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.path, str):
+            object.__setattr__(self, "path", Path(self.path))
+
+    def __hash__(self) -> int:
+        return hash((self.path.resolve(), self.container_name))
 
     def _def_type(self) -> str:
         p = str(self.path).lower()
@@ -186,7 +206,7 @@ class DockerImageProvider(ImageProvider):
 
     def pull(self, image: str) -> bool:
         cmd = [self._get_executable(), "pull", image]
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         return result.returncode == 0
 
     def resolve_path(self, image: str) -> str:
@@ -195,14 +215,17 @@ class DockerImageProvider(ImageProvider):
     def build(self, def_file: DefinitionFile, output_dir: str = "") -> str:
         def_path = Path(str(def_file.path))
         tag = def_file.container_name or f"dsbo_{_normalize_path_tag(str(def_path))}"
+        if self.exists(tag):
+            return tag
         context_dir = str(def_path.parent)
         if not shutil.which("docker"):
             raise RuntimeError("Docker executable not found for building Dockerfile.")
         cmd = ["docker", "build", "-t", tag, context_dir]
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(
-                f"Failed to build Dockerfile {def_path} (exit code {result.returncode})"
+                f"Failed to build Dockerfile {def_path} (exit code {result.returncode})\n"
+                f"{result.stderr.strip()}"
             )
         return tag
 
@@ -247,7 +270,7 @@ class SingularityImageProvider(ImageProvider):
         path = self._image_path(image)
         path.parent.mkdir(parents=True, exist_ok=True)
         cmd = [self._get_executable(), "pull", str(path), image]
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         return result.returncode == 0
 
     def resolve_path(self, image: str) -> str:
@@ -272,11 +295,12 @@ class SingularityImageProvider(ImageProvider):
             raise RuntimeError("No Apptainer/Singularity executable found for building .def file.")
 
         cmd = [executable, "build", str(output_sif), str(def_path)]
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(
                 f"Failed to build .def file {def_path} to {output_sif} "
-                f"(exit code {result.returncode})"
+                f"(exit code {result.returncode})\n"
+                f"{result.stderr.strip()}"
             )
         return str(output_sif)
 
@@ -305,11 +329,12 @@ class SingularityImageProvider(ImageProvider):
 
         pull_uri = self._ensure_docker_scheme(image_ref.uri)
         cmd = [self._get_executable(), "pull", str(sif_path), pull_uri]
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(
                 f"Failed to pull {image_ref.uri} to {sif_path} "
-                f"(exit code {result.returncode})"
+                f"(exit code {result.returncode})\n"
+                f"{result.stderr.strip()}"
             )
         return str(sif_path)
 
@@ -477,6 +502,22 @@ def get_runtime_for_type(container_type: ContainerType, image: str,
 
 
 
+
+def warm_container_dependencies(workflow: "Workflow", verbose: bool = True) -> dict[ImageRef | ImageFile | DefinitionFile, str]:
+    from tqdm import tqdm
+
+    result = dict.fromkeys(
+        n._image_def for n in workflow.task_graph.nodes
+        if isinstance(n, ContainerWrapperBase)
+    )
+
+    for d in tqdm(result, desc="Warming containers", unit="container", disable=not verbose):
+        env = select_compatible_environment(image_type_required(d), discover_container_environments())
+        check_mismatch(d, env)
+        img_dir = config.get("container.path", os.getcwd()) if env != ContainerType.DOCKER else None
+        result[d] = make_provider(env, img_dir).prepare_image(d, img_dir or "")
+
+    return result
 
 
 class ContainerWrapperBase:

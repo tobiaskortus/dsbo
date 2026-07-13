@@ -23,8 +23,9 @@ from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.utils.io import Workdir, get_subdir, get_workdir
 from dsbo.utils.random import get_random_engine
 from dsbo.surrogates.graph_transformations import (GraphMode,
-                                                     build_module_surrogate_eval_graph,
-                                                     build_module_surrogate_train_graph)
+                                                      build_module_surrogate_eval_graph,
+                                                      build_module_surrogate_train_graph)
+from dsbo.container import warm_container_dependencies
 
 if TYPE_CHECKING:
     from dsbo.worker.spec import WorkerSpec
@@ -170,7 +171,11 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
         is_forward_ad = fw._current_level > -1
         is_grad_enabled = torch.is_grad_enabled()
 
-        pbar = tqdm(total=len(candidates) * workflow.num_tasks)
+        warm_container_dependencies(workflow)
+
+        pbar = tqdm(total=len(candidates) * workflow.num_tasks, 
+                    desc=f"Running workflow for {len(candidates)} candidate{"s" if len(candidates) > 1 else ""}",
+                    unit="tasks")
 
         if worker is None:
             batch_results = []
@@ -190,8 +195,10 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                                     unpack_design=True,
                                 )
                                 results.update(result)
+                                pbar.update()
+
                         batch_results.append(results)
-                        pbar.update()
+
                     except Exception as e:
                         batch_results.append({})
                         if not isinstance(e, catch):
@@ -581,6 +588,9 @@ class Workflow:
     def visualize(self, filename=None, format='png'):
         from dsbo.utils.visualize import visualize_workflow
         return visualize_workflow(self, filename=filename, format=format)
+
+    def warm_containers(self, verbose: bool = True) -> dict:
+        return warm_container_dependencies(self, verbose=verbose)
 
     @property
     def task_graph(self):

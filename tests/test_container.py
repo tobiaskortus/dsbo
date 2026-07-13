@@ -3,6 +3,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from dsbo.workflow import Workflow
+from dsbo.modules import Module
+from dsbo.modules.dsl import DependencyDict
 
 from dsbo.container import (
     ContainerConfig,
@@ -25,6 +28,7 @@ from dsbo.container import (
     get_runtime_for_type,
     select_compatible_environment,
     discover_container_environments,
+    warm_container_dependencies,
 
     subprocess_run,
 )
@@ -178,7 +182,7 @@ class TestDockerImageProvider:
         mock_run.return_value = MagicMock(returncode=0)
         provider = DockerImageProvider()
         assert provider.pull("ubuntu:22.04") is True
-        mock_run.assert_called_with(["docker", "pull", "ubuntu:22.04"])
+        mock_run.assert_called_with(["docker", "pull", "ubuntu:22.04"], capture_output=True, text=True)
 
     @patch("shutil.which", return_value="/usr/bin/docker")
     @patch("subprocess.run")
@@ -201,7 +205,8 @@ class TestDockerImageProvider:
         result = provider.build(def_file, "")
         assert result == "dsbo_dockerfile"
         mock_run.assert_called_with(
-            ["docker", "build", "-t", "dsbo_dockerfile", "/path/to"]
+            ["docker", "build", "-t", "dsbo_dockerfile", "/path/to"],
+            capture_output=True, text=True,
         )
 
     @patch("shutil.which", return_value="/usr/bin/docker")
@@ -213,7 +218,8 @@ class TestDockerImageProvider:
         result = provider.build(def_file, "")
         assert result == "my-image"
         mock_run.assert_called_with(
-            ["docker", "build", "-t", "my-image", "/path/to"]
+            ["docker", "build", "-t", "my-image", "/path/to"],
+            capture_output=True, text=True,
         )
 
     @patch("shutil.which", return_value="/usr/bin/docker")
@@ -278,7 +284,8 @@ class TestSingularityImageProvider:
         provider = SingularityImageProvider(image_dir="/path/to/images")
         assert provider.pull("myimage.sif") is True
         mock_run.assert_called_with(
-            ["singularity", "pull", "/path/to/images/myimage.sif", "myimage.sif"]
+            ["singularity", "pull", "/path/to/images/myimage.sif", "myimage.sif"],
+            capture_output=True, text=True,
         )
 
     @patch("shutil.which", return_value="/usr/bin/singularity")
@@ -311,7 +318,8 @@ class TestSingularityImageProvider:
         expected_path = "/path/to/images/container.sif"
         assert result == expected_path
         mock_run.assert_called_with(
-            ["apptainer", "build", expected_path, "/path/to/container.def"]
+            ["apptainer", "build", expected_path, "/path/to/container.def"],
+            capture_output=True, text=True,
         )
 
     @patch("shutil.which", side_effect=lambda x: "/usr/bin/" + x if x == "apptainer" else None)
@@ -328,7 +336,8 @@ class TestSingularityImageProvider:
         expected_path = "/path/to/images/my-custom.sif"
         assert result == expected_path
         mock_run.assert_called_with(
-            ["apptainer", "build", expected_path, "/path/to/container.def"]
+            ["apptainer", "build", expected_path, "/path/to/container.def"],
+            capture_output=True, text=True,
         )
 
     @patch("shutil.which", side_effect=lambda x: "/usr/bin/" + x if x == "apptainer" else None)
@@ -345,7 +354,8 @@ class TestSingularityImageProvider:
         expected_path = "/path/to/images/my-custom.sif"
         assert result == expected_path
         mock_run.assert_called_with(
-            ["apptainer", "build", expected_path, "/path/to/container.def"]
+            ["apptainer", "build", expected_path, "/path/to/container.def"],
+            capture_output=True, text=True,
         )
 
     @patch("shutil.which", side_effect=[None, "/usr/bin/apptainer"])
@@ -706,7 +716,8 @@ class TestPullImageRefToSif:
         expected = "/path/to/images/ubuntu_22.04.sif"
         assert result == expected
         mock_run.assert_called_with(
-            ["singularity", "pull", expected, "docker://ubuntu:22.04"]
+            ["singularity", "pull", expected, "docker://ubuntu:22.04"],
+            capture_output=True, text=True,
         )
 
     @patch("shutil.which", side_effect=[None, "/usr/bin/singularity"])
@@ -721,7 +732,8 @@ class TestPullImageRefToSif:
         expected = "/path/to/images/ubuntu_22.04.sif"
         assert result == expected
         mock_run.assert_called_with(
-            ["apptainer", "pull", expected, "docker://ubuntu:22.04"]
+            ["apptainer", "pull", expected, "docker://ubuntu:22.04"],
+            capture_output=True, text=True,
         )
 
     @patch("shutil.which", return_value=None)
@@ -765,7 +777,8 @@ class TestPullImageRefToSif:
         expected = "/path/to/images/ubuntu_22.04.sif"
         assert result == expected
         mock_run.assert_called_with(
-            ["singularity", "pull", expected, "docker://ubuntu:22.04"]
+            ["singularity", "pull", expected, "docker://ubuntu:22.04"],
+            capture_output=True, text=True,
         )
 
     @patch("shutil.which", side_effect=[None, "/usr/bin/singularity"])
@@ -781,7 +794,8 @@ class TestPullImageRefToSif:
         expected = "/path/to/images/ubuntu_22.04.sif"
         assert result == expected
         mock_run.assert_called_with(
-            ["apptainer", "pull", expected, "docker://ubuntu:22.04"]
+            ["apptainer", "pull", expected, "docker://ubuntu:22.04"],
+            capture_output=True, text=True,
         )
 
     def test_ensure_docker_scheme_preserves_docker_prefix(self):
@@ -937,3 +951,86 @@ class TestSubprocessRun:
         assert rc == 0
         assert stdout_lines == ["line1\n", "line2\n"]
         assert stderr_lines == ["err1\n"]
+
+
+def make_container_module(ref):
+    class ContainerModule(Module, ContainerWrapperBase):
+        def __init__(self):
+            Module.__init__(self)
+            ContainerWrapperBase.__init__(self, ref)
+    return ContainerModule()
+
+
+class TestWarmContainerDependencies:
+    def test_empty_workflow_returns_empty_dict(self):
+        wf = Workflow(Module())
+        result = warm_container_dependencies(wf, verbose=False)
+        assert result == {}
+
+    def test_deduplicates_identical_image_defs(self):
+        ref = ImageRef(uri="ubuntu:22.04")
+        a = make_container_module(ref)
+        b = make_container_module(ref)
+        wf = Workflow(DependencyDict({a: [], b: []}))
+
+        with patch("dsbo.container.discover_container_environments",
+                   return_value={"docker": True, "apptainer": False, "singularity": False}), \
+             patch.object(DockerImageProvider, "prepare_image", return_value="ubuntu:22.04") as mock_prep:
+            result = warm_container_dependencies(wf, verbose=False)
+
+        mock_prep.assert_called_once()
+        assert result == {ref: "ubuntu:22.04"}
+
+    def test_raises_on_prepare_image_failure(self):
+        ref = ImageRef(uri="nonexistent:tag")
+        a = make_container_module(ref)
+        wf = Workflow(a)
+
+        with patch("dsbo.container.discover_container_environments",
+                   return_value={"docker": True, "apptainer": False, "singularity": False}), \
+             patch.object(DockerImageProvider, "prepare_image",
+                          side_effect=RuntimeError("pull failed")):
+            with pytest.raises(RuntimeError, match="pull failed"):
+                warm_container_dependencies(wf, verbose=False)
+
+    def test_warms_mixed_image_types(self):
+        img_ref = ImageRef(uri="ubuntu:22.04")
+        img_file = ImageFile(path="/path/to/existing.sif")
+        def_file = DefinitionFile(path="/path/to/Dockerfile")
+
+        a = make_container_module(img_ref)
+        b = make_container_module(img_file)
+        c = make_container_module(def_file)
+        wf = Workflow(DependencyDict({a: [], b: [], c: []}))
+
+        with patch("dsbo.container.discover_container_environments",
+                   return_value={"docker": True, "apptainer": True, "singularity": False}), \
+             patch.object(DockerImageProvider, "prepare_image", return_value="ubuntu:22.04"), \
+             patch.object(SingularityImageProvider, "prepare_image") as mock_sing_prep:
+            mock_sing_prep.side_effect = lambda idef, od: (
+                str(idef.path) if isinstance(idef, ImageFile) else "built-image"
+            )
+            result = warm_container_dependencies(wf, verbose=False)
+
+        assert len(result) == 3
+        assert img_ref in result
+        assert img_file in result
+        assert def_file in result
+
+    def test_shows_progress_bar_when_verbose(self, capsys):
+        ref_a = ImageRef(uri="ubuntu:22.04")
+        ref_b = ImageRef(uri="python:3.11")
+
+        a = make_container_module(ref_a)
+        b = make_container_module(ref_b)
+        wf = Workflow(DependencyDict({a: [], b: []}))
+
+        with patch("dsbo.container.discover_container_environments",
+                   return_value={"docker": True, "apptainer": False, "singularity": False}), \
+             patch.object(DockerImageProvider, "prepare_image",
+                          side_effect=lambda idef, od: idef.uri):
+            result = warm_container_dependencies(wf, verbose=True)
+
+        captured = capsys.readouterr()
+        assert "Warming containers" in captured.err
+        assert len(result) == 2
