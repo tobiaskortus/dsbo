@@ -160,7 +160,6 @@ class HeterogeneousDaskWorker(DaskWorkerBase):
             #TODO: enable constant scaling of workers + combinations of adapt and scale
             adapt_config[spec.spec_key] = (spec.min_worker, spec.max_worker)
 
-        print(adapt_config)
         self.cluster = HybridCluster(spec=cluster_spec, log_directory=logdir)
         self.cluster.adapt(adapt_config)
         super().__init__(self.cluster)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 import multiprocessing as mp
 from dataclasses import dataclass, replace
 from abc import ABC, abstractmethod
@@ -33,23 +32,23 @@ def get_extra_args(spec: WorkerSpec) -> tuple[list[str], list[str]]:
                 [f"--gres={spec.gpu_resources}"])
 
 
+def sanitize(name: str) -> str:
+    tok = re.sub(r"[^A-Za-z0-9]", "_", name)
+    tok = re.sub(r"_+", "_", tok).strip("_")
+    if not tok or not tok[0].isalpha():
+        tok = f"r_{tok}"
+    return tok
+
+
 class WorkerSpec(ABC):
     @property
     @abstractmethod
     def spec_key(self) -> str:
-        """Unique string that encodes all resource dimensions."""
         pass
 
     @property
     def resource_key(self) -> str:
-        """Sanitised Dask-safe resource-tag derived from :attr:`spec_key`."""
-        raw = self.spec_key
-        tok = re.sub(r"[^A-Za-z0-9]", "_", raw)
-        tok = re.sub(r"_+", "_", tok)
-        tok = tok.strip("_")
-        if not tok or not tok[0].isalpha():
-            tok = f"r_{tok}"
-        return tok
+        return self.spec_key
 
     @property
     def resources(self) -> dict[str, int]:
@@ -86,7 +85,7 @@ class LocalWorkerSpec(WorkerSpec):
 
     @property
     def spec_key(self) -> str:
-        return f"local_{self.cores}c_{self.processes}p_{self.memory}"
+        return sanitize(f"local_{self.cores}c_{self.processes}p_{self.memory}")
     
 
     def get_spec_dict(self) -> dict[str, any]:
@@ -114,7 +113,7 @@ class SLURMWorkerSpec(WorkerSpec):
 
     @property
     def spec_key(self) -> str:
-        name = "_".join([
+        raw = "_".join([
             self.partition or "",
             self.walltime,
             self.memory,
@@ -122,7 +121,7 @@ class SLURMWorkerSpec(WorkerSpec):
             str(self.cores),
             str(self.gpu_resources or ""),
         ])
-        return name
+        return sanitize(raw)
     
     def get_spec_dict(self) -> dict[str, any]:
         return {self.spec_key: {
@@ -138,4 +137,3 @@ class SLURMWorkerSpec(WorkerSpec):
             "resources": self.resources,
         }}
 
-        
