@@ -295,7 +295,7 @@ class SingularityImageProvider(ImageProvider):
             raise RuntimeError("No Apptainer/Singularity executable found for building .def file.")
 
         cmd = [executable, "build", str(output_sif), str(def_path)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(def_path.parent))
         if result.returncode != 0:
             raise RuntimeError(
                 f"Failed to build .def file {def_path} to {output_sif} "
