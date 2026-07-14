@@ -319,7 +319,7 @@ class TestSingularityImageProvider:
         assert result == expected_path
         mock_run.assert_called_with(
             ["apptainer", "build", expected_path, "/path/to/container.def"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, cwd=str(Path("/path/to").resolve()),
         )
 
     @patch("shutil.which", side_effect=lambda x: "/usr/bin/" + x if x == "apptainer" else None)
@@ -337,7 +337,7 @@ class TestSingularityImageProvider:
         assert result == expected_path
         mock_run.assert_called_with(
             ["apptainer", "build", expected_path, "/path/to/container.def"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, cwd=str(Path("/path/to").resolve()),
         )
 
     @patch("shutil.which", side_effect=lambda x: "/usr/bin/" + x if x == "apptainer" else None)
@@ -355,7 +355,7 @@ class TestSingularityImageProvider:
         assert result == expected_path
         mock_run.assert_called_with(
             ["apptainer", "build", expected_path, "/path/to/container.def"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, cwd=str(Path("/path/to").resolve()),
         )
 
     @patch("shutil.which", side_effect=[None, "/usr/bin/apptainer"])
@@ -373,6 +373,7 @@ class TestSingularityImageProvider:
     @patch("pathlib.Path.mkdir")
     def test_build_failure(self, mock_mkdir, mock_exists, mock_run, mock_which):
         mock_run.return_value.returncode = 1
+        mock_run.return_value.stderr = "some error"
         provider = SingularityImageProvider("/path/to/images")
         def_file = DefinitionFile(path="/path/to/container.def")
         with pytest.raises(RuntimeError, match="Failed to build"):
