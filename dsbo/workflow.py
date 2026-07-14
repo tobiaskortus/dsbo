@@ -174,7 +174,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
         warm_container_dependencies(workflow)
 
         pbar = tqdm(total=len(candidates) * workflow.num_tasks, 
-                    desc=f"Running workflow for {len(candidates)} candidate{"s" if len(candidates) > 1 else ""}",
+                    desc=f"Running workflow for {len(candidates)} candidate{'s' if len(candidates) > 1 else ''}",
                     unit="tasks")
 
         if worker is None:
