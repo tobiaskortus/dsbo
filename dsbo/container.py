@@ -66,7 +66,8 @@ class DefinitionFile:
     that builds the container image on first use.
     """
     path: str | Path
-    container_name: Optional[str] = None
+    container_name: str | None = None
+    build_flags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.path, str):
@@ -220,7 +221,7 @@ class DockerImageProvider(ImageProvider):
         context_dir = str(def_path.parent)
         if not shutil.which("docker"):
             raise RuntimeError("Docker executable not found for building Dockerfile.")
-        cmd = ["docker", "build", "-t", tag, context_dir]
+        cmd = ["docker", "build", "-t", tag, *def_file.build_flags, context_dir]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(
@@ -295,7 +296,7 @@ class SingularityImageProvider(ImageProvider):
             raise RuntimeError("No Apptainer/Singularity executable found for building .def file.")
 
         def_path = def_path.resolve()
-        cmd = [executable, "build", str(output_sif), str(def_path)]
+        cmd = [executable, "build", *def_file.build_flags, str(output_sif), str(def_path)]
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(def_path.parent))
         if result.returncode != 0:
             raise RuntimeError(

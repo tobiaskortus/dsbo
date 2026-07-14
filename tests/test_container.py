@@ -387,6 +387,25 @@ class TestSingularityImageProvider:
         with pytest.raises(RuntimeError, match="No Apptainer/Singularity executable found"):
             provider.build(def_file, "/path/to/images")
 
+    @patch("shutil.which", side_effect=lambda x: "/usr/bin/" + x if x == "apptainer" else None)
+    @patch("subprocess.run")
+    @patch("pathlib.Path.exists", return_value=False)
+    @patch("pathlib.Path.mkdir")
+    def test_build_with_build_flags(self, mock_mkdir, mock_exists, mock_run, mock_which):
+        mock_run.return_value.returncode = 0
+        provider = SingularityImageProvider("/path/to/images")
+        def_file = DefinitionFile(
+            path="/path/to/container.def",
+            build_flags=("--ignore-fakeroot-command",),
+        )
+        result = provider.build(def_file, "/path/to/images")
+        expected_path = "/path/to/images/container.sif"
+        assert result == expected_path
+        mock_run.assert_called_with(
+            ["apptainer", "build", "--ignore-fakeroot-command",
+             expected_path, "/path/to/container.def"],
+            capture_output=True, text=True, cwd=str(Path("/path/to").resolve()),
+        )
 
 
 class MockImageProvider(ImageProvider):
@@ -867,6 +886,17 @@ class TestImageDefinitionFile:
     def test_container_name_custom(self):
         f = DefinitionFile(path="/path/to/Dockerfile", container_name="my-custom-image")
         assert f.container_name == "my-custom-image"
+
+    def test_build_flags_defaults_to_empty(self):
+        f = DefinitionFile(path="/path/to/Dockerfile")
+        assert f.build_flags == ()
+
+    def test_build_flags_custom(self):
+        f = DefinitionFile(
+            path="/path/to/Singularity.def",
+            build_flags=("--ignore-fakeroot-command", "--force"),
+        )
+        assert f.build_flags == ("--ignore-fakeroot-command", "--force")
 
 
 class TestNormalizePathTag:
