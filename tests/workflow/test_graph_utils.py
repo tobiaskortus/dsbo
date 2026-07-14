@@ -7,7 +7,6 @@ from dsbo.workflow import (
     task_levels,
     is_output_task,
     get_dependent_task_groups,
-    DaskTqdmProgressBar,
 )
 from tests.workflow.conftest import SimpleModule
 
@@ -109,26 +108,3 @@ class TestGetDependentTaskGroups:
         assert groups[0] == ["a"]
         assert groups[1] == ["b", "c"]
         assert groups[2] == ["d"]
-
-
-class TestDaskTqdmProgressBar:
-    def test_start_state_counts_nodes(self):
-        bar = DaskTqdmProgressBar()
-        dsk = {}
-        state = {"ready": {"a": 1}, "waiting": {"b": 1}, "running": {"c": 1}, "finished": {"d": 1}}
-        bar._start_state(dsk, state)
-        assert bar._tqdm.total == 4
-
-    def test_posttask_updates(self):
-        bar = DaskTqdmProgressBar()
-        dsk = {}
-        state = {"ready": {}, "waiting": {}, "running": {}, "finished": {}}
-        bar._start_state(dsk, state)
-        prev = bar._tqdm.n
-        bar._posttask("key", None, dsk, state, "worker")
-        assert bar._tqdm.n == prev + 1
-
-    def test_finish_does_nothing(self):
-        bar = DaskTqdmProgressBar()
-        bar._finish({}, None, None)
-        assert True  # just verify no exception

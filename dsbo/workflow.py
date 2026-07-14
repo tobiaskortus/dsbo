@@ -15,7 +15,6 @@ from typing import Any, Iterable, List, Sequence, TYPE_CHECKING, overload
 
 from dsbo.config import config
 from dsbo.modules import Module
-from dask.callbacks import Callback
 from dsbo.modules.dsl import DependencyDict
 from dsbo.storage import get_current_storage
 from dsbo.utils.cache import WorkflowExecutionCache
@@ -32,19 +31,6 @@ if TYPE_CHECKING:
     from dsbo.parameters import ParameterSpace
     from dsbo.surrogates.workflow_surrogate import WorkflowSurrogate
 
-
-class DaskTqdmProgressBar(Callback):
-    def __init__(self, start=None, start_state=None, pretask=None, posttask=None, finish=None):
-        super().__init__(start, start_state, pretask, posttask, finish)
-
-    def _start_state(self, dsk, state):
-        self._tqdm = tqdm(total=sum(len(state[k]) for k in ['ready', 'waiting', 'running', 'finished']))
-
-    def _posttask(self, key, result, dsk, state, worker_id):
-        self._tqdm.update(1)
-
-    def _finish(self, dsk, state, errored):
-        pass
 
 
 
@@ -243,12 +229,13 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                 plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
                 worker.client.register_plugin(plugin, name="dsbo_task_stream")
 
-            with DaskTqdmProgressBar():
-                futures_computed = worker.compute(batch_delays)
-                results_flat = worker.gather(futures_computed, catch=catch)
-                lookup = {task_id: result for task_id, result in results_flat}
-                return [dict(chain.from_iterable(lookup.get(tid, {}).items() for tid in tids))
-                        for tids in batch_task_ids]
+            futures_computed = worker.compute(batch_delays)
+            for f in futures_computed:
+                f.add_done_callback(lambda _: pbar.update())
+            results_flat = worker.gather(futures_computed, catch=catch)
+            lookup = {task_id: result for task_id, result in results_flat}
+            return [dict(chain.from_iterable(lookup.get(tid, {}).items() for tid in tids))
+                    for tids in batch_task_ids]
 
 
 def run_batch_reverse_autograd(
@@ -333,20 +320,20 @@ def run_batch_reverse_autograd(
             worker.client.register_plugin(plugin, name="dsbo_task_stream_bwd")
 
     
-        with DaskTqdmProgressBar():
-            futures_computed = worker.compute(batch_delays)
+        futures_computed = worker.compute(batch_delays)
+        for f in futures_computed:
+            f.add_done_callback(lambda _: pbar.update())
+        results_flat = worker.gather(futures_computed, catch=catch)
+        lookup = {tid: grad for tid, grad in results_flat if grad is not None}
 
-            results_flat = worker.gather(futures_computed, catch=catch)
-            lookup = {tid: grad for tid, grad in results_flat if grad is not None}
-
-            gradients = []
-            for candidate, task_ids in zip(candidates, batch_task_ids):
-                combined = sum(
-                    (lookup[tid] for tid in task_ids if tid in lookup),
-                    start=torch.zeros_like(candidate.tensor),
-                )
-                gradients.append(combined)
-            return gradients
+        gradients = []
+        for candidate, task_ids in zip(candidates, batch_task_ids):
+            combined = sum(
+                (lookup[tid] for tid in task_ids if tid in lookup),
+                start=torch.zeros_like(candidate.tensor),
+            )
+            gradients.append(combined)
+        return gradients
 
 
 def candidates_from_tensor(tensor: torch.Tensor, space: ParameterSpace) -> List[Candidate]:
