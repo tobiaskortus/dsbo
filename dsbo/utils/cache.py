@@ -176,7 +176,7 @@ def check_cache_entry(base_dir: str, workflow_hash: str, candidate_hash: str) ->
     return hit
 
 
-type Candidates = Sequence[Candidate] | CandidateBatch
+Candidates = Sequence[Candidate] | CandidateBatch
 
 
 class TaskExecutionCache:
