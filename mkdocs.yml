@@ -1,0 +1,39 @@
+site_name: DSBO - Distributed Surrogate-Based Optimization
+site_description: Distributed Surrogate-Based Optimization framework for particle detector design
+site_author: Tobias Kortus
+repo_url: https://github.com/tobiaskortus/dsbo
+repo_name: tobiaskortus/dsbo
+copyright: "&copy; 2024 Tobias Kortus"
+markdown_extensions:
+  - admonition
+theme:
+  name: readthedocs
+  highlightjs: true
+  hljs_languages:
+    - python
+    - yaml
+    - bash
+nav:
+  - Home: index.md
+  - Core Concepts:
+    - Overview: core/overview.md
+    - Modules: core/modules.md
+    - Workflows: core/workflow.md
+    - Surrogates: core/surrogates.md
+  - Guide:
+    - Writing Modules: guide/modules.md
+    - I/O and Autograd: guide/io.md
+    - Building Workflows: guide/workflows.md
+    - Using Surrogates: guide/surrogates.md
+  - API Reference:
+    - dsbo.modules: reference/modules.md
+    - dsbo.workflow: reference/workflow.md
+    - dsbo.surrogates: reference/surrogates.md
+    - dsbo.autograd: reference/autograd.md
+    - dsbo.objectives: reference/objectives.md
+    - dsbo.utils.io: reference/io.md
+    - dsbo.utils.compile: reference/compile.md
+  - Examples:
+    - HepEmShow: examples/hepemshow.md
+  - Troubleshooting: troubleshooting.md
+  - Contributing: contributing.md
