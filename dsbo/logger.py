@@ -4,7 +4,7 @@ import threading
 import traceback
 from time import time
 from dask.distributed import get_worker
-from dsbo.utils.io import Workdir
+from dsbo.utils.io import DefaultPaths, Workdir
 from contextvars import ContextVar
 
 
@@ -25,7 +25,7 @@ class WorkflowTaskLogger:
 
         if workflow_task is not None:
             self.task_name = workflow_task.name.lower()
-            self.log_file = Workdir.register_file(None, f"{self.task_name}.log")
+            self.log_file = Workdir.register_file(DefaultPaths.LOGS, f"{self.task_name}.log")
         else:
             self.task_name = "stdout"
             self.log_file = None
