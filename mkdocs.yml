@@ -22,8 +22,9 @@ nav:
     - Surrogates: core/surrogates.md
   - Guide:
     - Writing Modules: guide/modules.md
-    - I/O and Autograd: guide/io.md
     - Building Workflows: guide/workflows.md
+    - I/O and Autograd: guide/io.md
+    - Parallelization with Dask: guide/parallelization.md
     - Using Surrogates: guide/surrogates.md
   - API Reference:
     - dsbo.modules: reference/modules.md
