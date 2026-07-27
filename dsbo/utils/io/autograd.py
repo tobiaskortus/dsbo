@@ -249,6 +249,8 @@ class HDF5File(AutogradFileInterface):
     def _collect_metadata(cls, sources: list[str]) -> list[dict[str, tuple[tuple[int, ...], str]]]:
         metadata = []
         for source in sources:
+            if not os.path.isfile(source):
+                raise FileNotFoundError(f"Missing registered batch input: {source}")
             ext = os.path.splitext(source)[1].lower()
             if ext not in cls.reducible_extensions():
                 raise TypeError(
