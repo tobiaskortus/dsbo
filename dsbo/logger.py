@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import threading
 import traceback
@@ -6,6 +7,23 @@ from time import time
 from dask.distributed import get_worker
 from dsbo.utils.io import DefaultPaths, Workdir
 from contextvars import ContextVar
+
+
+class LoggerWriter:
+    def __init__(self, logger, log_type: int):
+        self._logger = logger
+        self._log_type = log_type
+
+    def write(self, message: str):
+        line = message.rstrip("\r\n")
+        if line:
+            self._logger.log(line, self._log_type)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
 
 
 class WorkflowTaskLogger:
@@ -77,6 +95,11 @@ class WorkflowTaskLogger:
                     self.log(line, log_type)
 
     def _start_stdio_capture(self):
+        self._old_stdout = sys.stdout
+        self._old_stderr = sys.stderr
+        sys.stdout = LoggerWriter(self, logging.INFO)
+        sys.stderr = LoggerWriter(self, logging.ERROR)
+
         self._saved_stdout, self._saved_stderr = os.dup(1), os.dup(2)
         stdout_r, stdout_w = os.pipe()
         stderr_r, stderr_w = os.pipe()
@@ -91,6 +114,10 @@ class WorkflowTaskLogger:
     def _stop_stdio_capture(self):
         os.dup2(self._saved_stdout, 1); os.close(self._saved_stdout)
         os.dup2(self._saved_stderr, 2); os.close(self._saved_stderr)
+
+        sys.stdout = self._old_stdout
+        sys.stderr = self._old_stderr
+
         self._stdout_thread.join()
         self._stderr_thread.join()
 
