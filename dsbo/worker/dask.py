@@ -73,7 +73,14 @@ class DaskWorkerBase:
                 raise
         return results
 
-    def schedule(self, module: Module, design: dict, dependencies: Iterable = (), priority: int | None = None) -> tuple[uuid.UUID, Delayed]:
+    def schedule(
+        self,
+        module: Module,
+        design: dict,
+        dependencies: Iterable = (),
+        priority: int | None = None,
+        file_overlays=None,
+    ) -> tuple[uuid.UUID, Delayed]:
         suffix = get_file_suffix()
         subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
@@ -94,6 +101,7 @@ class DaskWorkerBase:
                 workdir=workdir,
                 suffix=suffix,
                 subdir=subdir,
+                file_overlays=file_overlays,
                 is_forward_ad=is_forward_ad,
                 is_grad_enabled=is_grad_enabled,
                 pack_result=is_forward_ad,
@@ -102,7 +110,9 @@ class DaskWorkerBase:
             return task_id, packed_result
 
         with dask.annotate(resources=(resources or {}), priority=priority):
-            delayed_obj = delayed(_module_wrapper, name=module.name)(module, packed_design, *dependencies)
+            delayed_obj = delayed(_module_wrapper, name=module.name)(
+                module, packed_design, *dependencies
+            )
 
         return task_id, delayed_obj
 

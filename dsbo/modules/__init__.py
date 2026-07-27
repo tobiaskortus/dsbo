@@ -73,8 +73,7 @@ class Module(ModuleDslMixin, ABC):
         super().__setattr__(name, value)
 
         #TODO: define a clear policy when Inputs and Outputs should be registered
-        # and when AbstractFilePath should be alloweds -> important to keep track of files 
-        # in e.g. MergeTransforms.
+        #TODO: and when AbstractFilePath should be allowed
         if isinstance(value, AbstractFilePath):
             self._registered_files[name] = value
 
@@ -237,6 +236,14 @@ def dynamic_submodule(wrapped_fn):
                     suffix = f"[{self.i}]" if self.i is not None else ""
                     return f"{type(self._parent).__name__}.{self._func.__name__}{suffix}"
 
+                @property
+                def registered_inputs(self) -> list[AbstractFilePath]:
+                    return self._parent.registered_inputs
+
+                @property
+                def registered_outputs(self) -> list[AbstractFilePath]:
+                    return self._parent.registered_outputs
+
             submodule = self._submodule_cache.get(obj)
 
             if submodule is not None:
@@ -249,3 +256,7 @@ def dynamic_submodule(wrapped_fn):
         
 
     return DynamicSubmodule(wrapped_fn)
+
+
+from dsbo.modules.dsl import with_no_grad
+from dsbo.modules.fused import BatchFusedModule, FusedModule, batch_fuse

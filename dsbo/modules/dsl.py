@@ -252,6 +252,17 @@ class DependencyDict(dict):
         return _make_depdict(result)
 
 
+def with_no_grad(dep: ModuleDslMixin | DependencyDict) -> DependencyDict:
+    if isinstance(dep, ModuleDslMixin):
+        dep.op_propagates_grad_(False)
+        return dep
+
+    for module in dep.nodes:
+        module.op_propagates_grad_(False)
+
+    return dep
+
+
 class Dynamic:
     def __init__(self):
         self.module: ModuleDslMixin | None = None

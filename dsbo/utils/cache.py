@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence, TYPE_CHECKING
 import torch.autograd.forward_ad as fw
 
-from dsbo.modules import Module
+from dsbo.modules import Module, BatchFusedModule
 from dsbo.surrogates.graph_transformations import GraphMode
 from dsbo.parameters import Candidate, CandidateBatch
 
@@ -70,6 +70,9 @@ def code_hash(code_obj):
 
 
 def module_code(node: Module, include_seed: bool = True) -> str:
+    if isinstance(node, BatchFusedModule):
+        return f"batch_fuse:{module_code(node.inner, include_seed=include_seed)}"
+    
     cls = type(node)
     identity = f"{cls.__module__}.{cls.__qualname__}"
     state = f"seed={node._seed},no_grad={node._no_grad_op}" if include_seed else f"no_grad={node._no_grad_op}"

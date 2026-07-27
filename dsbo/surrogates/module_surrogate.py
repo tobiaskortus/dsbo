@@ -2,7 +2,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-import numpy as np
 from typing import Any, Callable
 
 import torch
@@ -14,7 +13,7 @@ from diffusers.schedulers import DDPMScheduler, DDIMScheduler
 from dsbo.modules import Module
 from dsbo.parameters import Candidate
 from dsbo.config import get_active_file_backend
-from dsbo.utils.io.autograd import AutogradFileInterface, AutogradFileInterface, AutogradFileStorage
+from dsbo.utils.io.autograd import AutogradFileInterface, AutogradFileStorage
 from dsbo.utils.io.workdir import AbstractFilePath
 from dsbo.surrogates import SurrogateBase, SurrogateStrategy
 from dsbo.surrogates.diffusion import MlpDiffusion1D, Trainer
@@ -40,8 +39,8 @@ class LazyShape(tuple):
                 f"Cannot resolve shape: no shard files found for "
                 f"'{self._fpath.filename}'. The module must be run first."
             )
-        arr = np.load(shards[0], mmap_mode="r")
-        self._resolved = arr.shape[1:]
+        
+        self._resolved = Storage.shape_from_path(shards[0])[1:]
 
     def __getitem__(self, idx):  # type: ignore[override]
         self._resolve()

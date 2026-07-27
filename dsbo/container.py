@@ -507,10 +507,11 @@ def get_runtime_for_type(container_type: ContainerType, image: str,
 
 def warm_container_dependencies(workflow: "Workflow", verbose: bool = True) -> dict[ImageRef | ImageFile | DefinitionFile, str]:
     from tqdm import tqdm
+    from dsbo.modules.fused import inner_module
 
     result = dict.fromkeys(
-        n._image_def for n in workflow.task_graph.nodes
-        if isinstance(n, ContainerWrapperBase)
+        inner_module(node)._image_def for node in workflow.task_graph.nodes
+        if isinstance(inner_module(node), ContainerWrapperBase)
     )
 
     for d in tqdm(result, desc="Warming containers", unit="container", disable=not verbose):

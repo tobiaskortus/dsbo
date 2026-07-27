@@ -172,7 +172,7 @@ class WorkflowStorage(WorkflowStorageBase):
             G_s.nodes[i]["name"] = node.name
             G_s.nodes[i]["type"] = type(node).__name__
             if node.resources is not None:
-                G_s.nodes[i]["resources"] = node.resources._asdict()
+                G_s.nodes[i]["resources"] = dataclasses.asdict(node.resources)
         graph_json = json.dumps(nx.node_link_data(G_s, edges="edges"))
         wf = Workflow(graph=graph_json, num_tasks=repr.number_of_nodes())
         with Session(self._engine) as session:

@@ -92,7 +92,7 @@ class WorkflowStorageBase(ABC):
     def get_job_traces(self, exec_id: str, after_trace_id: Optional[int] = None) -> List[JobTrace]:
         pass
 
-    def create_task_stream_plugin(self, task_map: Dict[str, str] | None = None, name_map: Dict[str, str] | None = None) -> TaskStreamPlugin:
+    def create_task_stream_plugin(self, task_map: Dict[str, str | tuple[str, ...]] | None = None, name_map: Dict[str, str] | None = None) -> TaskStreamPlugin:
         from dsbo.utils.plugins import TaskStreamPlugin
         if self._readonly:
             raise RuntimeError("Cannot create TaskStreamPlugin from readonly StudyStorage.")

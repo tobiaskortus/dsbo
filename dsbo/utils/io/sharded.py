@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import glob
 import os
@@ -7,10 +8,11 @@ import numpy as np
 from pathlib import Path
 from typing import Optional
 
+import h5py
 import torch
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import Dataset, DataLoader
 
-from dsbo.utils.io.autograd import AutogradFileStorage, AutogradFileInterface
+from dsbo.utils.io.autograd import AutogradFileStorage
 from dsbo.utils.io.workdir import AbstractFilePath, Workdir
 
 
@@ -86,8 +88,8 @@ class ShardedDataset(Dataset):
     def _ensure_loaded(self):
         if hasattr(self, "_data_arrays"):
             return
-        self._data_arrays = [np.load(p, mmap_mode="r") for p in self._data_paths]
-        self._cond_arrays = [np.load(p, mmap_mode="r") for p in self._cond_paths]
+        self._data_arrays = [_load_single_h5(p) for p in self._data_paths]
+        self._cond_arrays = [_load_single_h5(p) for p in self._cond_paths]
         self._shard_lengths = [a.shape[0] for a in self._data_arrays]
         self._len = sum(self._shard_lengths)
 
@@ -105,14 +107,14 @@ class ShardedDataset(Dataset):
     @property
     def output_dim(self) -> int:
         if self._data_paths:
-            arr = np.load(self._data_paths[0], mmap_mode="r")
+            arr = _load_single_h5(self._data_paths[0])
             return arr.shape[1] if arr.ndim > 1 else 1
         raise RuntimeError("No data shards available")
 
     @property
     def cond_dim(self) -> int:
         if self._cond_paths:
-            arr = np.load(self._cond_paths[0], mmap_mode="r")
+            arr = _load_single_h5(self._cond_paths[0])
             return arr.shape[1] if arr.ndim > 1 else 1
         raise RuntimeError("No cond shards available")
 
@@ -163,17 +165,32 @@ class ShardedDataset(Dataset):
         return self._len
 
 
-class ShardedNumpyStorage(AutogradFileStorage):
+class ShardedStorageBase(AutogradFileStorage, ABC):
     max_rows_per_shard: int = 10_000
 
     @classmethod
-    def _npy_path(cls, fpath: str) -> str:
+    @abstractmethod
+    def _storage_ext(cls) -> str:
+        pass
+
+    @classmethod
+    @abstractmethod
+    def _load_array(cls, path: str) -> np.ndarray:
+        pass
+
+    @classmethod
+    @abstractmethod
+    def _save_array(cls, path: str, arr: np.ndarray):
+        pass
+
+    @classmethod
+    def _storage_path(cls, fpath: str) -> str:
         base, _ = os.path.splitext(fpath)
-        return base + ".npy"
+        return base + cls._storage_ext()
 
     @classmethod
     def _discover_shards(cls, stem: str) -> list[str]:
-        pattern = f"{stem}.*.npy"
+        pattern = f"{stem}.*{cls._storage_ext()}"
         return sorted(glob.glob(pattern))
 
     @classmethod
@@ -190,15 +207,15 @@ class ShardedNumpyStorage(AutogradFileStorage):
         name = file_path.filename
         stem, _ = os.path.splitext(name)
         rel = file_path.pathname
-
+        ext = cls._storage_ext()
 
         #TODO: this is a bit hacky as it includes additional 
         # files in the workdir that matches the pattern. 
         patterns = [
-            f"**/{rel}/{stem}.*.npy",
-            f"**/{rel}/{stem}.npy",
-            f"**/batch_*/{rel}/{stem}.*.npy",
-            f"**/batch_*/{rel}/{stem}.npy",
+            f"**/{rel}/{stem}.*{ext}",
+            f"**/{rel}/{stem}{ext}",
+            f"**/batch_*/{rel}/{stem}.*{ext}",
+            f"**/batch_*/{rel}/{stem}{ext}",
         ]
 
         matches: set[str] = set()
@@ -210,70 +227,56 @@ class ShardedNumpyStorage(AutogradFileStorage):
         return sorted(matches)
 
 
-    @classmethod
-    def _load_npy(cls, npy_path: str) -> np.ndarray:
-        if os.path.exists(npy_path):
-            return np.load(npy_path)
-        stem, _ = os.path.splitext(npy_path)
-        shards = cls._discover_shards(stem)
-        if not shards:
-            raise FileNotFoundError(f"No shard files found for {npy_path}")
-        return np.concatenate([np.load(s) for s in shards], axis=0)
-
-    @classmethod
-    def _save_npy(cls, npy_path: str, arr: np.ndarray):
-        stem, _ = os.path.splitext(npy_path)
-        n = arr.shape[0]
-        if n <= cls.max_rows_per_shard:
-            np.save(npy_path, arr)
-        else:
-            n_shards = (n + cls.max_rows_per_shard - 1) // cls.max_rows_per_shard
-            for i in range(n_shards):
-                start = i * cls.max_rows_per_shard
-                end = min(start + cls.max_rows_per_shard, n)
-                np.save(f"{stem}.{i}.npy", arr[start:end])
 
     @classmethod
     def open_primal(cls, fpath: str) -> np.ndarray:
-        return cls._load_npy(cls._npy_path(fpath))
+        return cls._load_array(cls._storage_path(fpath))
 
     @classmethod
     def open_primal_tangent(cls, fpath: str) -> tuple[np.ndarray, Optional[np.ndarray]]:
-        primal_path = cls._npy_path(fpath)
-        tangent_path = primal_path.replace(".npy", "_tangent.npy")
-        primal = cls._load_npy(primal_path)
+        storage_path = cls._storage_path(fpath)
+        tangent_path = cls._tangent_path(storage_path)
+        primal = cls._load_array(storage_path)
         try:
-            tangent = cls._load_npy(tangent_path)
+            tangent = cls._load_array(tangent_path)
         except FileNotFoundError:
             tangent = None
         return primal, tangent
 
     @classmethod
     def write_primal(cls, fpath: str, primal: np.ndarray):
-        cls._save_npy(cls._npy_path(fpath), primal)
+        cls._save_array(cls._storage_path(fpath), primal)
 
     @classmethod
     def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray):
-        cls._save_npy(cls._npy_path(fpath), primal)
-        cls._save_npy(cls._npy_path(fpath).replace(".npy", "_tangent.npy"), tangent)
+        storage_path = cls._storage_path(fpath)
+        cls._save_array(storage_path, primal)
+        cls._save_array(cls._tangent_path(storage_path), tangent)
 
     @classmethod
     def _save_gradient(cls, grad_path: str, gradient: np.ndarray):
-        cls._save_npy(cls._npy_path(grad_path), gradient)
+        cls._save_array(cls._storage_path(grad_path), gradient)
 
     @classmethod
     def _load_gradient(cls, grad_path: str) -> np.ndarray:
-        return cls._load_npy(cls._npy_path(grad_path))
+        return cls._load_array(cls._storage_path(grad_path))
 
     @classmethod
     def read_backward_gradient(cls, fpath: str) -> torch.Tensor:
-        return torch.from_numpy(cls._load_npy(cls._npy_path(cls._gradient_path(fpath)))).float()
-    
+        return torch.from_numpy(cls._load_array(cls._storage_path(cls._gradient_path(fpath)))).float()
 
     @classmethod
     def reset(cls):
         cls.reset_gradient_state()
-        
+
+    @classmethod
+    def _tangent_path(cls, storage_path: str) -> str:
+        ext = cls._storage_ext()
+        return storage_path.replace(ext, f"_tangent{ext}")
+
+    @classmethod
+    def shape_from_path(cls, path: str) -> tuple[int, ...]:
+        return cls._load_array(path).shape
 
     @classmethod
     def to_data_loader(
@@ -282,8 +285,8 @@ class ShardedNumpyStorage(AutogradFileStorage):
         cond_fpath_abstract: AbstractFilePath,
         batch_size: int = 64,
         shuffle: bool = True,
-        num_workers: int = 0
-        ) -> DataLoader:
+        num_workers: int = 0,
+    ) -> DataLoader:
         data_shards = cls._discover_shards_from_abstract(data_fpath_abstract)
         cond_shards = cls._discover_shards_from_abstract(cond_fpath_abstract)
 
@@ -295,3 +298,48 @@ class ShardedNumpyStorage(AutogradFileStorage):
 
         dataset = ShardedDataset(data_shards, cond_shards)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+
+
+def _load_single_h5(path: str) -> np.ndarray:
+    with h5py.File(path, "r") as f:
+        return f["primal"][:]
+
+
+class ShardedHDF5Storage(ShardedStorageBase):
+    @classmethod
+    def _storage_ext(cls) -> str:
+        return ".h5"
+
+    @classmethod
+    def _load_array(cls, path: str) -> np.ndarray:
+        if os.path.exists(path):
+            with h5py.File(path, "r") as f:
+                return f["primal"][:]
+        stem, _ = os.path.splitext(path)
+        shards = cls._discover_shards(stem)
+        if not shards:
+            raise FileNotFoundError(f"No shard files found for {path}")
+        return np.concatenate(
+            [_load_single_h5(s) for s in shards], axis=0
+        )
+
+    @classmethod
+    def _save_array(cls, path: str, arr: np.ndarray):
+        stem, _ = os.path.splitext(path)
+        n = arr.shape[0]
+        if n <= cls.max_rows_per_shard:
+            with h5py.File(path, "w") as f:
+                f.create_dataset("primal", data=arr, compression="gzip")
+        else:
+            n_shards = (n + cls.max_rows_per_shard - 1) // cls.max_rows_per_shard
+            for i in range(n_shards):
+                start = i * cls.max_rows_per_shard
+                end = min(start + cls.max_rows_per_shard, n)
+                shard_path = f"{stem}.{i}.h5"
+                with h5py.File(shard_path, "w") as f:
+                    f.create_dataset("primal", data=arr[start:end], compression="gzip")
+
+    @classmethod
+    def reduce(cls, sources: list[str], destination: str) -> None:
+        from dsbo.utils.io.autograd import HDF5File
+        HDF5File.reduce(sources, destination)

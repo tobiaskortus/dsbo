@@ -6,8 +6,7 @@ import warnings
 import logging
 import networkx as nx
 from tqdm import tqdm
-from itertools import chain
-from itertools import groupby
+from itertools import chain, groupby
 from contextlib import nullcontext
 from contextlib import contextmanager
 import torch.autograd.forward_ad as fw
@@ -21,6 +20,7 @@ from dsbo.utils.cache import WorkflowExecutionCache
 from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.utils.io import Workdir, get_subdir, get_workdir
 from dsbo.utils.random import get_random_engine
+from dsbo.modules.fused import file_overlays, is_batch_fused, create_candidate_symlinks
 from dsbo.surrogates.graph_transformations import (GraphMode,
                                                       build_module_surrogate_eval_graph,
                                                       build_module_surrogate_train_graph)
@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from dsbo.worker.spec import WorkerSpec
     from dsbo.parameters import ParameterSpace
     from dsbo.surrogates.workflow_surrogate import WorkflowSurrogate
-
 
 
 
@@ -80,42 +79,6 @@ class ResultsBatch(list):
         return torch.stack([torch.tensor(list(item.values())) for item in self])
 
 
-class FusedModule(Module):
-    """A group of modules with identical resources, fused into a single graph node."""
-
-    def __init__(self, *modules: Module):
-        super().__init__()
-        self.modules = modules
-        for m in modules:
-            assert self.modules[0].resources == m.resources, \
-                    "All modules in a FusedModule must have the same resources."
-
-    def __call__(self, design: dict, **kwargs) -> dict:
-        results = {}
-        for m in self.modules:
-            results.update(m(design=design))
-        return results
-
-    def run(self, design: dict, **kwargs) -> dict:
-        results = {}
-        for m in self.modules:
-            results.update(m.run(design=design, **{k: v for k, v in kwargs.items()}))
-        return results
-
-    @property
-    def resources(self):
-        return self.modules[0].resources
-
-    @resources.setter
-    def resources(self, value):
-        pass  # derived from child modules; ignore assignment from super().__init__()
-
-    @property
-    def name(self):
-        return "[" + ",".join(m.name for m in self.modules) + "]"
-
-    
-    
 def assert_no_self_loops(G: nx.DiGraph) -> None:
     assert nx.number_of_selfloops(G) == 0, "The specified task graph cannot be executed due to self-loops."
 
@@ -150,107 +113,151 @@ def get_dependent_task_groups(G: nx.DiGraph):
     ]
 
 
-def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()) -> List[dict]:
+def candidate_subdirs(count: int):
+    return tuple(f"batch_{index}" if count > 1 else None for index in range(count))
+
+
+def num_tasks_for_batch(workflow: Workflow, num_candidates: int) -> int:
+    count = 0
+    for group in get_dependent_task_groups(workflow.task_graph):
+        for task in group:
+            count += 1 if is_batch_fused(task) else num_candidates
+    return count
+
+
+def register_task_stream(worker, graph, exec_ids, batch_path, task_map, name_map, name):
+    storage = get_current_storage()
+    if storage is None:
+        return
+    workflow_record = storage.workflow.add_workflow(graph)
+    storage.workflow.add_runs(workflow_record, exec_ids, batch_path)
+    plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
+    worker.client.register_plugin(plugin, name=name)
+
+
+def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[type[Exception], ...] = ()) -> List[dict]:
     with torch.no_grad():
         from dsbo.worker.dask import WorkerContext
+
         worker = WorkerContext.get_current_worker()
-        is_forward_ad = fw._current_level > -1
-        is_grad_enabled = torch.is_grad_enabled()
-
         warm_container_dependencies(workflow)
+        if not candidates:
+            return []
 
-        pbar = tqdm(total=len(candidates) * workflow.num_tasks, 
-                    desc=f"Running workflow for {len(candidates)} candidate{'s' if len(candidates) > 1 else ''}",
-                    unit="tasks")
+        count = len(candidates)
+        task_graph = workflow.task_graph
+        subdirs = candidate_subdirs(count)
+
+        task_groups = list(get_dependent_task_groups(task_graph))
+        progress = tqdm(total=num_tasks_for_batch(workflow, count), desc="Running workflow", unit="tasks")
+        get_random_engine().seed_all(workflow)
+
+        def execution_plan():
+            for depth, group in enumerate(task_groups):
+                for task in group:
+                    for index in (None,) if is_batch_fused(task) else range(count):
+                        targets = tuple(range(count)) if index is None else (index,)
+                        yield depth, task, index, targets
 
         if worker is None:
-            batch_results = []
-            for i, candidate in enumerate(candidates):
-                rng = get_random_engine()
-                rng.seed_all(workflow)
-                
-                with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
-                    try:
-                        results = {}
-                        for batch in workflow._iterate_dependent_task_groups():
-                            for task in batch:
-                                result = task.run(
-                                    design=candidate.values,
-                                    is_forward_ad=is_forward_ad,
-                                    is_grad_enabled=is_grad_enabled,
-                                    unpack_design=True,
-                                )
-                                results.update(result)
-                                pbar.update()
+            batch_results = [[] for _ in candidates]
 
-                        batch_results.append(results)
+            for _, task, index, targets in execution_plan():
+                try:
+                    result = task.run(
+                        design=candidates[0 if index is None else index].values,
+                        subdir="batch_reduce" if index is None else subdirs[index],
+                        file_overlays=file_overlays(task_graph, task, index, subdirs),
+                        is_forward_ad=fw._current_level > -1,
+                        is_grad_enabled=torch.is_grad_enabled(),
+                        unpack_design=True,
+                    )
+                    if is_batch_fused(task):
+                        #Create symlinks for visual inspection. NOTE: The framework uses overlays to resolve
+                        #the original file and is not dependent on this functionality.
+                        create_candidate_symlinks(task, subdirs)
+                    else:
+                        #Batch fused modules cannot return a dictionary result therefore it is ignored here.
+                        #targets is therefore (index, )
+                        batch_results[targets[0]].append(dict(result))
+                except catch:
+                    for t in targets:
+                        batch_results[t].append(None)
+                progress.update()
 
-                    except Exception as e:
-                        batch_results.append({})
-                        if not isinstance(e, catch):
-                            raise
+            return [dict(chain.from_iterable(r.items() for r in results if r))
+                    for results in batch_results]
 
-            return batch_results
-        else:
-            batch_delays = []
-            batch_task_ids = []
-            task_map: dict[str, str] = {}
-            name_map: dict[str, str] = {}
-            exec_ids = []
-            batch_path = getattr(get_workdir(), "root", None)
-            
+        #Create exec_ids for task stream plugin
+        batch_path = Workdir.get_current_dir()
+        exec_ids = [os.path.join(batch_path, s) if s else batch_path for s in subdirs]
 
-            for i, candidate in enumerate(candidates):
-                rng = get_random_engine()
-                rng.seed_all(workflow)
+        batch_task_ids = [[] for _ in candidates]
+        scheduled_tasks = []
+        delayed_map, task_map, name_map = {}, {}, {}
 
-                with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
-                    delayed_map = {}
-                    task_ids = []
-                    wdir = getattr(get_workdir(), "root", None)
-                    subdir = get_subdir()
-                    exec_id = os.path.join(wdir, subdir) if (wdir and subdir) else wdir
-                    exec_ids.append(exec_id)
-                    for depth, batch in enumerate(workflow._iterate_dependent_task_groups()):
-                        for task in batch:
-                            dependencies = [delayed_map[p] for p in workflow.task_graph.predecessors(task)]
-                            task_id, delayed_obj = worker.schedule(task, candidate.values, dependencies, priority=depth)
-                            delayed_map[task] = delayed_obj
-                            task_ids.append(task_id)
-                            batch_delays.append(delayed_obj)
-                            task_map[delayed_obj.key] = exec_id
-                            name_map[delayed_obj.key] = task.name
-                    batch_task_ids.append(task_ids)
+        for depth, task, index, targets in execution_plan():
+            dependencies = [delayed_map[p] for p in task_graph.predecessors(task)]
+            subdir = "batch_reduce" if index is None else subdirs[index]
+            overlays = file_overlays(task_graph, task, index, subdirs)
 
-            storage = get_current_storage()
-            if storage is not None:
-                wf_record = storage.workflow.add_workflow(workflow.task_graph)
-                storage.workflow.add_runs(wf_record, exec_ids, batch_path)
-                plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
-                worker.client.register_plugin(plugin, name="dsbo_task_stream")
+            with Workdir.create_subdir(subdir) if subdir else nullcontext():
+                task_id, delayed = worker.schedule(
+                    task,
+                    #TODO: this is still hacky as hell. There should be some better strategy 
+                    #TODO: how to handle  candidates for batch_fuse modules.
+                    candidates[0 if index is None else index].values,
+                    dependencies,
+                    priority=depth,
+                    file_overlays=overlays,
+                )
 
-            futures_computed = worker.compute(batch_delays)
-            for f in futures_computed:
-                f.add_done_callback(lambda _: pbar.update())
-            results_flat = worker.gather(futures_computed, catch=catch)
-            lookup = {task_id: result for task_id, result in results_flat}
-            return [dict(chain.from_iterable(lookup.get(tid, {}).items() for tid in tids))
-                    for tids in batch_task_ids]
+            delayed_map[task] = delayed
+            scheduled_tasks.append((task_id, task, delayed))
+            if not is_batch_fused(task):
+                for t in targets:
+                    # Ignore batch_task_ids for fused modules to avoid aggregating   
+                    # fused results in the return statement
+                    batch_task_ids[t].append(task_id)
+
+            eids = tuple(exec_ids[t] for t in targets)
+            task_map[delayed.key] = eids[0] if len(eids) == 1 else eids
+            name_map[delayed.key] = task.name
+
+        register_task_stream(worker, task_graph, exec_ids, batch_path, task_map, name_map, "dsbo_task_stream")
+
+        futures = worker.compute([d for *_, d in scheduled_tasks])
+
+        #Register progress bar update on future done callbacks.
+        for f in futures:
+            f.add_done_callback(lambda _: progress.update())
+
+        results_flat = worker.gather(futures, catch=catch)
+        lookup = {task_id: result for task_id, result in results_flat}
+
+        #Create symlinks for visual inspection. NOTE: The framework uses overlays to resolve
+        #the original file and is not dependent on this functionality.
+        for task_id, task, _ in scheduled_tasks:
+            if task_id in lookup and is_batch_fused(task):
+                create_candidate_symlinks(task, subdirs)
+
+        return [dict(chain.from_iterable(lookup.get(tid, {}).items() for tid in tids))
+                for tids in batch_task_ids]
 
 
 def run_batch_reverse_autograd(
     workflow: Workflow,
     candidates: Sequence[Candidate],
     grad_outputs: List[dict],
-    catch: tuple[Exception, ...] = (),
+    catch: tuple[type[Exception], ...] = (),
 ) -> List[torch.Tensor]:
     from dsbo.worker.dask import WorkerContext
     from dsbo.config import get_active_file_backend
+
     worker = WorkerContext.get_current_worker()
 
     G = workflow.task_graph
     tasks_rev = list(reversed(list(nx.topological_sort(G))))
-
     pbar = tqdm(total=len(candidates) * len(tasks_rev))
 
     if worker is None:
@@ -312,14 +319,11 @@ def run_batch_reverse_autograd(
                     name_map[delayed_obj.key] = task.name
                 batch_task_ids.append(task_ids)
 
-        storage = get_current_storage()
-        if storage is not None:
-            wf_record = storage.workflow.add_workflow(G)
-            storage.workflow.add_runs(wf_record, exec_ids, batch_path)
-            plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
-            worker.client.register_plugin(plugin, name="dsbo_task_stream_bwd")
+        register_task_stream(
+            worker, G, exec_ids, batch_path,
+            task_map, name_map, "dsbo_task_stream_bwd",
+        )
 
-    
         futures_computed = worker.compute(batch_delays)
         for f in futures_computed:
             f.add_done_callback(lambda _: pbar.update())
@@ -353,7 +357,7 @@ def to_1d_tensor(v: Any, dtype: torch.dtype) -> torch.Tensor:
 
 class RunBatchAutogradFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, workflow, design_tensors: torch.Tensor, space: ParameterSpace, catch: tuple[Exception, ...]):
+    def forward(ctx, workflow, design_tensors: torch.Tensor, space: ParameterSpace, catch: tuple[type[Exception], ...]):
         ctx.workflow = workflow
         ctx.space = space
         ctx.save_for_backward(design_tensors)
@@ -361,7 +365,11 @@ class RunBatchAutogradFn(torch.autograd.Function):
         candidates = candidates_from_tensor(design_tensors, space)
 
         cache = workflow._get_cache()
-        use_cache = cache.config.should_cache(workflow.task_graph_mode) if cache else False
+        use_cache = (
+            cache.config.should_cache(workflow.task_graph_mode)
+            if cache and not any(is_batch_fused(task) for task in workflow.task_graph)
+            else False
+        )
 
         if use_cache:
             results, misses, indices = cache.match_partial(candidates)
@@ -477,11 +485,11 @@ class Workflow:
         return len(self.module_surrogates) > 0
 
 
-    def run(self, design: Candidate, catch: tuple[Exception, ...] = ()) -> dict[str, float]:
+    def run(self, design: Candidate, catch: tuple[type[Exception], ...] = ()) -> dict[str, float]:
         self._ensure_surrogates_trained(design, catch)
         return self.run_batch([design], catch)[0]
 
-    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()):
+    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[type[Exception], ...] = ()):
         if self._surrogate is not None and self._surrogate._is_pretrained:
             if len(candidates) > 1:
                 raise NotImplementedError("Batch execution for workflow surrogates is not supported yet.")
@@ -495,7 +503,7 @@ class Workflow:
             
         return self._execute_batch(candidates, catch)
     
-    def _ensure_surrogates_trained(self, candidate: Candidate, catch: tuple[Exception, ...] = ()):
+    def _ensure_surrogates_trained(self, candidate: Candidate, catch: tuple[type[Exception], ...] = ()):
         if self._surrogate is not None:
             if not self._surrogate.is_in_trust_region(candidate) or self._surrogate.surrogate is None:
                 with self.mode(GraphMode.DEFAULT):
@@ -508,8 +516,8 @@ class Workflow:
                 for _, surrogate in self.module_surrogates.items():
                     if not surrogate.is_in_trust_region(candidate) or not surrogate.is_available:
                         with self.mode(GraphMode.MODULE_SURROGATE_TRAIN):
-                            from dsbo.utils.io.sharded import ShardedNumpyStorage
-                            with config.use(file_backend=ShardedNumpyStorage):
+                            from dsbo.utils.io.sharded import ShardedHDF5Storage
+                            with config.use(file_backend=ShardedHDF5Storage):
                                 surrogate.fit(candidate, workflow_callback=self._execute_batch)
 
     def _get_cache(self) -> WorkflowExecutionCache | None:
@@ -525,9 +533,16 @@ class Workflow:
             workdir_root=workdir.root,
         )
 
-    def _execute_batch(self, candidates: Sequence[Candidate], catch: tuple[Exception, ...] = ()):
+    def _execute_batch(self, candidates: Sequence[Candidate], catch: tuple[type[Exception], ...] = ()):
+        if not candidates:
+            return ResultsBatch([])
+
         cache = self._get_cache()
-        use_cache = cache.config.should_cache(self.task_graph_mode) if cache else False
+        use_cache = (
+            cache.config.should_cache(self.task_graph_mode)
+            if cache and not any(is_batch_fused(task) for task in self.task_graph)
+            else False
+        )
 
         if fw._current_level > -1 or not torch.is_grad_enabled():
             with torch.no_grad():

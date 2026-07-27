@@ -21,12 +21,12 @@ class TaskStreamPlugin(SchedulerPlugin):
     def __init__(
         self,
         writer: TransitionWriter,
-        task_map: Dict[str, str],
+        task_map: Dict[str, str | tuple[str, ...]],
         name_map: Dict[str, str],
     ) -> None:
         super().__init__()
         self.writer = writer
-        self.task_map: Dict[str, str] = task_map
+        self.task_map: Dict[str, str | tuple[str, ...]] = task_map
         self.name_map: Dict[str, str] = name_map
         self.log_buffer: Dict[str, list] = {}
 
@@ -47,21 +47,27 @@ class TaskStreamPlugin(SchedulerPlugin):
                     if ts is not None and ts.processing_on is not None:
                         worker = ts.processing_on
 
-                    exec_id = self.task_map[key]
                     name    = self.name_map[key]
                     if status == JobStatus.RUNNING:
                         approx_start = time.time()
-                    self.writer(key, name, worker.name if worker != None else "unknown", approx_start, -1, exec_id, "", status)
+                    exec_ids = self.task_map[key]
+                    if isinstance(exec_ids, str):
+                        exec_ids = (exec_ids,)
+                    for exec_id in exec_ids:
+                        self.writer(key, name, worker.name if worker != None else "unknown", approx_start, -1, exec_id, "", status)
                     return
 
                 worker = self.scheduler.workers[kwargs["worker"]]
                 startstop = kwargs["startstops"][0]
-                exec_id = self.task_map[key]
                 name    = self.name_map[key]
                 messages = self.log_buffer.pop(key, [])
                 log = "\n".join(messages)
 
-                self.writer(key, name, worker.name, startstop["start"], startstop["stop"], exec_id, log, status)
+                exec_ids = self.task_map[key]
+                if isinstance(exec_ids, str):
+                    exec_ids = (exec_ids,)
+                for exec_id in exec_ids:
+                    self.writer(key, name, worker.name, startstop["start"], startstop["stop"], exec_id, log, status)
             except Exception as e:
                 print(f"[TaskStreamPlugin] transition error: {e}")
 
