@@ -1,17 +1,23 @@
 import pytest
+import os
 import torch
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 from dsbo.parameters import ParameterSpace, Continuous, Candidate
-from dsbo.modules import Module
-from dsbo.workflow import run_batch, run_batch_reverse_autograd, Workflow
+from dsbo.modules import Module, batch_fuse
+from dsbo.workflow import (
+    run_batch, run_batch_reverse_autograd, Workflow,
+)
 from dsbo.worker.dask import WorkerContext
+from dsbo.utils.io import Workdir
 from tests.workflow.conftest import (
     MockDaskWorker, LocalDaskWorker, make_mock_worker,
     SimpleModule, BackwardModule, NoGradModule, FailingModule,
-    FailingBackwardModule,
+    FailingBackwardModule, DataProducer, FileTrainer, DataConsumer,
 )
+from dsbo.modules.fused import BatchFusedModule
+
 
 class TestDistributedRunBatch:
     def test_correct_delayed_dependencies(self):
@@ -29,8 +35,11 @@ class TestDistributedRunBatch:
         schedule_calls: list[tuple[Module, list, int, MagicMock]] = []
 
         original_schedule = worker.schedule
-        def tracking_schedule(module, design, dependencies=(), priority=None):
-            tid, delayed = original_schedule(module, design, dependencies, priority)
+        def tracking_schedule(module, design, dependencies=(), priority=None,
+                              file_overlays=None):
+            tid, delayed = original_schedule(
+                module, design, dependencies, priority, file_overlays,
+            )
             schedule_calls.append((module, list(dependencies), priority, delayed))
             return tid, delayed
         worker.schedule = tracking_schedule
@@ -42,33 +51,48 @@ class TestDistributedRunBatch:
         # 2 candidates × 3 modules = 6 scheduled tasks
         assert len(schedule_calls) == 6
 
-        # Tasks are ordered: candidate0 m1, m2, m3, then candidate1 m1, m2, m3
-        # Candidate 0
+        # Tasks are ordered by workflow depth, then candidate.
         assert schedule_calls[0][2] == 0                     # m1 at depth 0
         assert schedule_calls[0][1] == []                    # m1 has no dependencies
-        assert schedule_calls[1][2] == 1                     # m2 at depth 1
-        assert len(schedule_calls[1][1]) == 1                # m2 depends on 1 predecessor
-        # m2's dependency is the delayed obj returned from scheduling m1 (same candidate)
-        assert schedule_calls[1][1][0] is schedule_calls[0][3]
+        assert schedule_calls[1][2] == 0                     # candidate 1 m1
+        assert schedule_calls[1][1] == []
 
-        assert schedule_calls[2][2] == 2                     # m3 at depth 2
+        assert schedule_calls[2][2] == 1                     # candidate 0 m2
         assert len(schedule_calls[2][1]) == 1
-        assert schedule_calls[2][1][0] is schedule_calls[1][3]
+        assert schedule_calls[2][1][0] is schedule_calls[0][3]
+        assert schedule_calls[3][2] == 1                     # candidate 1 m2
+        assert schedule_calls[3][1][0] is schedule_calls[1][3]
 
-        # Candidate 1 — verify same structure but isolated from candidate 0
-        assert schedule_calls[3][2] == 0                     # m1 at depth 0
-        assert schedule_calls[3][1] == []                    # no cross-candidate deps
-        assert schedule_calls[4][2] == 1                     # m2 at depth 1
+        assert schedule_calls[4][2] == 2                     # candidate 0 m3
         assert len(schedule_calls[4][1]) == 1
-
-        # candidate1's m2 depends on candidate1's m1, NOT candidate0's m1 delayed obj
-        assert schedule_calls[4][1][0] is schedule_calls[3][3]
-        assert schedule_calls[4][1][0] is not schedule_calls[0][3]
-
-        assert schedule_calls[5][2] == 2                     # m3 at depth 2
+        assert schedule_calls[4][1][0] is schedule_calls[2][3]
+        assert schedule_calls[5][2] == 2                     # candidate 1 m3
         assert len(schedule_calls[5][1]) == 1
-        assert schedule_calls[5][1][0] is schedule_calls[4][3]
-        assert schedule_calls[5][1][0] is not schedule_calls[1][3]
+        assert schedule_calls[5][1][0] is schedule_calls[3][3]
+
+    def test_batch_fuse_depends_on_all_candidate_producers(self):
+        workflow = Workflow(DataProducer() * 2 >> batch_fuse(DataConsumer()))
+        candidates = [
+            Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([1.0])),
+            Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([2.0])),
+        ]
+        worker = MockDaskWorker()
+
+        schedule_calls: list[tuple[Module, list]] = []
+        original_schedule = worker.schedule
+        def tracking_schedule(module, design, dependencies=(), priority=None,
+                              file_overlays=None):
+            tid, delayed = original_schedule(module, design, dependencies, priority, file_overlays,)
+            schedule_calls.append((module, list(dependencies)))
+            return tid, delayed
+        
+        worker.schedule = tracking_schedule
+
+        with WorkerContext.use_worker(worker):
+            run_batch(workflow, candidates)
+
+        _, dependencies = schedule_calls[-1]
+        assert len(dependencies) == 2 * len(candidates)
 
     def test_catches_exceptions_in_distributed(self):
         wf = Workflow(SimpleModule())
@@ -99,6 +123,18 @@ class TestDistributedRunBatch:
         mock_storage.workflow.add_runs.assert_called_once()
         mock_storage.workflow.create_task_stream_plugin.assert_called_once()
         worker.client.register_plugin.assert_called_once_with("plugin", name="dsbo_task_stream")
+
+    def test_batch_fused_module_warns_on_non_empty_result(self):
+
+        class RetModule(Module):
+            def __call__(self, design, **kwargs):
+                return {"out": torch.tensor(2.0)}
+
+        fused = BatchFusedModule(RetModule())
+        with pytest.warns(UserWarning, match="returned a non-empty dict"):
+            fused({"x": torch.tensor([1.0])})
+        result = fused({"x": torch.tensor([1.0])})
+        assert result == {}
 
 
 class TestDistributedRunBatchReverseAutograd:
@@ -141,25 +177,17 @@ class TestDistributedRunBatchReverseAutograd:
         assert scheduled_order[:2] == ["B", "C"] or scheduled_order[:2] == ["C", "B"]
         assert scheduled_order[2:] == ["A"]
 
-  
     def test_skips_no_grad_tasks(self):
         wf = Workflow(NoGradModule())
         cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
         grad_outputs = [{"out": torch.tensor(1.0)}]
 
         worker = MockDaskWorker()
-        called = False
-        original_schedule = worker.schedule_backward
-        def track_schedule(*args, **kwargs):
-            nonlocal called
-            called = True
-            return original_schedule(*args, **kwargs)
-        worker.schedule_backward = track_schedule
 
         with WorkerContext.use_worker(worker):
             grads = run_batch_reverse_autograd(wf, [cand], grad_outputs)
 
-        assert not called, "schedule_backward should not be called for no-grad modules"
+        assert len(worker.backward_scheduled) == 0
         assert len(grads) == 1
         assert torch.allclose(grads[0], torch.zeros(1))
 
@@ -172,25 +200,14 @@ class TestDistributedRunBatchReverseAutograd:
         cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
         grad_outputs = [{"out": torch.tensor(1.0)}]
 
-        scheduled = []
         worker = MockDaskWorker()
-
-        def tracking_schedule(module, candidate, grad_output=None,
-                              dependencies=(), priority=None):
-            scheduled.append(module.name)
-            tid = UUID(int=len(scheduled), version=4)
-            delayed = MagicMock()
-            delayed.key = f"mock-bwd-{module.name}"
-            return tid, delayed
-        
-        worker.schedule_backward = tracking_schedule
 
         with WorkerContext.use_worker(worker):
             grads = run_batch_reverse_autograd(wf, [cand], grad_outputs)
 
-        
-        assert "A" not in scheduled
-        assert set(scheduled) == {"B", "C", "D"}
+        scheduled_aliases = {module._alias for _, _, module, _ in worker.backward_scheduled}
+        assert "A" not in scheduled_aliases
+        assert scheduled_aliases == {"B", "C", "D"}
 
     def test_handles_none_gradients_from_failed_task(self):
         wf = Workflow(BackwardModule())
@@ -206,7 +223,7 @@ class TestDistributedRunBatchReverseAutograd:
         worker = MockDaskWorker()
         worker._gather_results = [
             (tid_a, torch.tensor([2.0])),
-            (tid_b, None),  # simulate a failed task
+            (tid_b, None),
         ]
 
         with WorkerContext.use_worker(worker):
@@ -288,6 +305,20 @@ class TestDistributedRunBatchRealCluster:
 
         assert len(results) == 1
         assert results[0] == {}
+
+    def test_run_batch_reduced_files_symlinks(self, local_worker, candidates):
+        workflow = Workflow(DataProducer() >> batch_fuse(FileTrainer()))
+        with WorkerContext.use_worker(local_worker):
+            results = run_batch(workflow, candidates)
+        for i in range(len(candidates)):
+            link = os.path.join(Workdir.get_current_dir(), f"batch_{i}", "reconstruction", "model.pt")
+            assert os.path.islink(link)
+
+    def test_run_batch_reduced_files_result_warning(self, local_worker, candidates):
+        workflow = Workflow(DataProducer() >> batch_fuse(FileTrainer()))
+        with WorkerContext.use_worker(local_worker):
+            results = run_batch(workflow, candidates)
+        assert results == [{} for _ in candidates]
 
 
 @pytest.mark.integration

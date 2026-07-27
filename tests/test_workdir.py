@@ -326,3 +326,58 @@ def test_path_info_no_workdir_context(mock_makedirs, mock_exists):
     assert info is not None
     assert info.root == os.getcwd()
     assert info.rel_path == "simulation"
+
+
+@patch('os.path.exists', return_value=False)
+@patch('os.makedirs')
+def test_file_overlay_is_scoped(mock_makedirs, mock_exists):
+    with Workdir.create("tmp", "simulation"):
+        file = Workdir.register_file("simulation", "data.txt")
+        normal = file()
+        with Workdir.use_file_overlays({file: "/shared/data.txt"}):
+            assert file() == "/shared/data.txt"
+        assert file() == normal
+
+
+def test_resolve_file_applies_subdir_and_suffix(tmp_path):
+    file = Workdir.register_file("simulation", "events.h5")
+    with Workdir.create(str(tmp_path), keep=True, error_if_exists=False):
+        resolved = Workdir.resolve_file(file, subdir="batch_2", suffix=1)
+    assert resolved == str(tmp_path / "batch_2" / "simulation" / "events_1.h5")
+
+
+def test_physical_resolution_ignores_overlay(tmp_path):
+    file = Workdir.register_file("simulation", "events.h5")
+    with Workdir.create(str(tmp_path), keep=True, error_if_exists=False):
+        with Workdir.use_file_overlays({file: "/shared/events.h5"}):
+            resolved = Workdir.resolve_file(file, use_overlays=False)
+    assert resolved == str(tmp_path / "simulation" / "events.h5")
+
+
+def test_derived_file_uses_reduced_namespace(tmp_path):
+    file = Workdir.register_file("simulation", "events.h5")
+    with Workdir.create(str(tmp_path), keep=True, error_if_exists=False):
+        source = Workdir.resolve_file(file, subdir="batch_0", suffix=1)
+        derived = Workdir.resolve_derived_file(
+            file, "reduced", subdir="batch_0", suffix=1,
+        )
+    assert derived == str(
+        tmp_path / "batch_0" / "reduced" / "simulation" / "events_1.h5"
+    )
+    assert derived != source
+
+
+def test_create_does_not_eagerly_create_registered_paths(tmp_path):
+    Workdir.register("simulation")
+    with Workdir.create(str(tmp_path), keep=True, error_if_exists=False):
+        assert not (tmp_path / "simulation").exists()
+
+
+def test_link_creates_relative_symlink(tmp_path):
+    source = tmp_path / "shared" / "model.pt"
+    target = tmp_path / "batch_0" / "model.pt"
+    source.parent.mkdir()
+    source.touch()
+    Workdir.link(str(source), str(target))
+    assert target.is_symlink()
+    assert not os.path.isabs(os.readlink(target))

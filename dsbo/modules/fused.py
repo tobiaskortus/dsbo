@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 import networkx as nx
 from contextlib import nullcontext
 
@@ -264,11 +265,21 @@ class BatchFusedModule(Module):
         return Workdir.resolve_derived_file(file, namespace, subdir=subdir, suffix=self.inner.i)
 
     def __call__(self, design: dict, **kwargs) -> dict:
-        self.inner(design=design, **kwargs)
+        result = self.inner(design=design, **kwargs)
+        if result:
+            warnings.warn(
+                f"BatchFusedModule '{self.name}' returned a non-empty dict ({result}); "
+                f"results are discarded."
+            )
         return {}
 
     def run(self, design: dict, **kwargs) -> dict:
-        self.inner.run(design=design, **kwargs)
+        result = self.inner.run(design=design, **kwargs)
+        if result:
+            warnings.warn(
+                f"BatchFusedModule '{self.name}' returned a non-empty dict ({result}); "
+                f"results are discarded."
+            )
         return {}
 
 

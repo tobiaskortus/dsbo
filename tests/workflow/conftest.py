@@ -12,7 +12,8 @@ from dsbo.modules import Module
 from dsbo.modules.dsl import DependencyDict
 from dsbo.workflow import Workflow
 from dsbo.worker.dask import DaskWorkerBase
-from dsbo.utils.io import Workdir
+from dsbo.utils.io import Workdir, Input, Output
+from dsbo.utils.io.autograd import HDF5File
 from dask_jobqueue.local import LocalCluster
 
 
@@ -29,7 +30,7 @@ class MockDaskWorker(DaskWorkerBase):
         self._gather_results = None
         self._gather_forward_results = True  # if True, gather returns dicts
 
-    def schedule(self, module, design, dependencies=(), priority=None):
+    def schedule(self, module, design, dependencies=(), priority=None, file_overlays=None):
         tid = UUID(int=self.task_counter, version=4)
         self.task_counter += 1
         delayed = MagicMock()
@@ -122,6 +123,34 @@ class FailingModule(Module):
         super().__init__()
     def __call__(self, design, **kwargs):
         raise ValueError("simulated failure")
+
+
+class DataProducer(Module):
+    def __init__(self):
+        super().__init__()
+        self.output = Output(Workdir.register_file("simulation", "events.h5"))
+
+    def __call__(self, design, **kwargs):
+        HDF5File.write(self.output(), design["x"].reshape(1))
+
+
+class FileTrainer(Module):
+    def __init__(self):
+        super().__init__()
+        self.input = Input(Workdir.register_file("simulation", "events.h5"))
+        self.model = Output(Workdir.register_file("reconstruction", "model.pt"))
+
+    def __call__(self, design, **kwargs):
+        loss = HDF5File.open(self.input(), "cpu").sum()
+        torch.save(loss, self.model())
+        return {"loss": loss}
+
+
+class DataConsumer(Module):
+    def __init__(self):
+        super().__init__()
+        self.input = Input(Workdir.register_file("simulation", "events.h5"))
+
 
 class SurrogateModule(Module):
     """A real Module used as a module surrogate in tests."""

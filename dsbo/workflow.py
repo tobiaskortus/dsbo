@@ -197,28 +197,31 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
         delayed_map, task_map, name_map = {}, {}, {}
 
         for depth, task, index, targets in execution_plan():
-            dependencies = [delayed_map[p] for p in task_graph.predecessors(task)]
+            deps = []
+            for p in task_graph.predecessors(task):
+                if is_batch_fused(p):
+                    deps.append(delayed_map[(p, None)])
+                elif index is None:
+                    deps.extend(delayed_map[(p, i)] for i in range(count))
+                else:
+                    deps.append(delayed_map[(p, index)])
+
             subdir = "batch_reduce" if index is None else subdirs[index]
             overlays = file_overlays(task_graph, task, index, subdirs)
 
             with Workdir.create_subdir(subdir) if subdir else nullcontext():
                 task_id, delayed = worker.schedule(
                     task,
-                    #TODO: this is still hacky as hell. There should be some better strategy 
-                    #TODO: how to handle  candidates for batch_fuse modules.
                     candidates[0 if index is None else index].values,
-                    dependencies,
+                    deps,
                     priority=depth,
                     file_overlays=overlays,
                 )
 
-            delayed_map[task] = delayed
-            scheduled_tasks.append((task_id, task, delayed))
-            if not is_batch_fused(task):
-                for t in targets:
-                    # Ignore batch_task_ids for fused modules to avoid aggregating   
-                    # fused results in the return statement
-                    batch_task_ids[t].append(task_id)
+            delayed_map[(task, index)] = delayed
+            scheduled_tasks.append((task_id, task, index, delayed))
+            for t in targets:
+                batch_task_ids[t].append(task_id)
 
             eids = tuple(exec_ids[t] for t in targets)
             task_map[delayed.key] = eids[0] if len(eids) == 1 else eids
@@ -235,10 +238,8 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
         results_flat = worker.gather(futures, catch=catch)
         lookup = {task_id: result for task_id, result in results_flat}
 
-        #Create symlinks for visual inspection. NOTE: The framework uses overlays to resolve
-        #the original file and is not dependent on this functionality.
-        for task_id, task, _ in scheduled_tasks:
-            if task_id in lookup and is_batch_fused(task):
+        for _, task, _, _ in scheduled_tasks:
+            if is_batch_fused(task):
                 create_candidate_symlinks(task, subdirs)
 
         return [dict(chain.from_iterable(lookup.get(tid, {}).items() for tid in tids))
