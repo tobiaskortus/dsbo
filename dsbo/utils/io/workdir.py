@@ -85,7 +85,9 @@ class AbstractFilePath:
             overlay = Workdir._current_file_overlays.get() or {}
             overlay_value = overlay.get(self)
             if overlay_value is not None:
-                return overlay_value
+                if isinstance(overlay_value, str):
+                    return overlay_value
+                return overlay_value.resolve()
 
         dir_path = self._path()
         if dir_path is None:
@@ -207,7 +209,7 @@ class Workdir(dict):
 
     @classmethod
     @contextmanager
-    def use_file_overlays(cls, overlays: Mapping[AbstractFilePath, str]) -> Generator[None, None, None]:
+    def use_file_overlays(cls, overlays: Mapping[AbstractFilePath, str | Callable[[], str]]) -> Generator[None, None, None]:
         current = cls._current_file_overlays.get() or {}
         token = cls._current_file_overlays.set({**current, **overlays})
         try:
@@ -216,7 +218,7 @@ class Workdir(dict):
             cls._current_file_overlays.reset(token)
 
     @classmethod
-    def get_file_overlay(cls, file: AbstractFilePath) -> str | None:
+    def get_file_overlay(cls, file: AbstractFilePath) -> str | Callable[[], str] | None:
         return (cls._current_file_overlays.get() or {}).get(file)
 
     @classmethod
