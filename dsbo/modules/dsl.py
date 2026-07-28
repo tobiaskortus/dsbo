@@ -85,6 +85,7 @@ class DependencyDict(dict):
         super().__init__(mapping)
         self.groups: list[DependencyGroup] = []
         self.annotated_groups: list[AnnotatedDependencyGroup] = []
+        self._replica_count = 0
 
     @property
     def template_to_nodes(self) -> dict[object, list[ModuleDslMixin]]:
@@ -133,16 +134,22 @@ class DependencyDict(dict):
             all_nodes = list(set(self.keys()) | set(x for vs in self.values() for x in vs))
             max_inner = max((n.i for n in all_nodes if isinstance(getattr(n, 'i', None), int)), default=-1)
             stride = max_inner + 1 if max_inner >= 0 else 1
+            start = self._replica_count
             out = {}
             node_to_template: dict[ModuleDslMixin, ModuleDslMixin] = {}
             for outer_i in range(other):
                 copied = {
-                    orig: orig.replicate(outer_i * stride + orig.i if isinstance(getattr(orig, 'i', None), int) else outer_i)
+                    orig: orig.replicate(
+                        start + outer_i * stride + orig.i
+                        if isinstance(getattr(orig, 'i', None), int)
+                        else start + outer_i * stride
+                    )
                     for orig in all_nodes
                 }
                 node_to_template.update({copy: orig for orig, copy in copied.items()})
                 for orig_k, orig_vs in self.items():
                     out[copied[orig_k]] = [copied[v] for v in orig_vs]
+            self._replica_count = start + other * stride
             dd = DependencyDict(out)
             dd.groups = list(self.groups) + [DependencyGroup(
                 template=self,
