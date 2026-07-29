@@ -45,10 +45,6 @@ dev = [
     "pytest",
 ]
 
-dev = [
-    "pytest",
-]
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dsbo*"]
