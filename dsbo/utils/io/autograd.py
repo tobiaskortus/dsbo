@@ -28,22 +28,22 @@ class AutogradFileInterface(ABC):
         cls.handles.clear()
 
     @classmethod
-    def open(cls, fpath: str, device: str) -> torch.Tensor:
+    def open(cls, fpath: str, device: str, columns: list[str] | None = None) -> torch.Tensor:
         if fw._current_level != -1:
-            primal, tangent = cls.open_primal_tangent(fpath)
+            primal, tangent = cls.open_primal_tangent(fpath, columns=columns)
             if tangent is not None:
                 primal, tangent = torch.from_numpy(primal), torch.from_numpy(tangent)
                 return fw.make_dual(primal, tangent)
             else:
                 return torch.from_numpy(primal)
         else:
-            primal = cls.open_primal(fpath)
+            primal = cls.open_primal(fpath, columns=columns)
             x = torch.from_numpy(primal)
 
             if torch.is_grad_enabled():
                 x.requires_grad_(True)
                 handle = x.register_post_accumulate_grad_hook(
-                    lambda x: cls.write_backward_gradient(x.grad.detach().cpu().numpy(), fpath)
+                    lambda x: cls.write_backward_gradient(x.grad.detach().cpu().numpy(), fpath, columns=columns)
                 )
                 cls.handles[fpath] = handle
 
@@ -51,34 +51,39 @@ class AutogradFileInterface(ABC):
 
     @classmethod
     @abstractmethod
-    def open_primal(cls, fpath: str) -> np.ndarray:
+    def open_primal(cls, fpath: str, columns: list[str] | None = None) -> np.ndarray:
         pass
 
     @classmethod
     @abstractmethod
-    def open_primal_tangent(cls, fpath: str) -> tuple[np.ndarray, np.ndarray | None]:
+    def open_primal_tangent(cls, fpath: str, columns: list[str] | None = None) -> tuple[np.ndarray, np.ndarray | None]:
         pass
 
     @classmethod
-    def write(cls, fpath: str, input: torch.Tensor | tuple[np.ndarray | torch.Tensor, ...]):
+    def write(
+        cls,
+        fpath: str,
+        input: torch.Tensor | tuple[np.ndarray | torch.Tensor, ...],
+        columns: list[str] | None = None,
+    ):
         primal, tangent = cls._get_primal_tangent(input)
         if tangent is None:
-            cls.write_primal(fpath, primal)
+            cls.write_primal(fpath, primal, columns=columns)
         else:
-            cls.write_primal_tangent(fpath, primal, tangent)
+            cls.write_primal_tangent(fpath, primal, tangent, columns=columns)
 
     @classmethod
     @abstractmethod
-    def write_primal(cls, fpath: str, primal: np.ndarray):
+    def write_primal(cls, fpath: str, primal: np.ndarray, columns: list[str] | None = None):
         pass
 
     @classmethod
     @abstractmethod
-    def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray):
+    def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray, columns: list[str] | None = None):
         pass
 
     @classmethod
-    def write_backward_gradient(cls, gradient: np.ndarray, fpath: str):
+    def write_backward_gradient(cls, gradient: np.ndarray, fpath: str, columns: list[str] | None = None):
         if fpath not in cls.handles:
             raise RuntimeError(
                 f"Trying to write backward gradient for '{fpath}', but no autograd hook is "
@@ -86,20 +91,20 @@ class AutogradFileInterface(ABC):
             )
         grad_path = cls._gradient_path(fpath)
         if grad_path in cls._gradient_written:
-            gradient = gradient + cls._load_gradient(grad_path)
+            gradient = gradient + cls._load_gradient(grad_path, columns=columns)
+        cls._save_gradient(grad_path, gradient, columns=columns)
         cls._gradient_written.add(grad_path)
-        cls._save_gradient(grad_path, gradient)
         cls.handles[fpath].remove()
         del cls.handles[fpath]
 
     @classmethod
     @abstractmethod
-    def _load_gradient(cls, grad_path: str) -> np.ndarray:
+    def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
         pass
 
     @classmethod
     @abstractmethod
-    def _save_gradient(cls, grad_path: str, gradient: np.ndarray):
+    def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
         pass
 
     @classmethod
@@ -135,58 +140,180 @@ class HDF5File(AutogradFileInterface):
     DATASETS = ("primal", "tangent", "gradient")
     VDS_SOURCES_ATTRIBUTE = "dsbo_vds_sources"
 
+    # This attribute is used to reconstruct the correct order of the data when the columns argument is omitted while
+    # loading a file saved with columns.
+    COLUMNS_ATTRIBUTE = "dsbo_columns"
+
     @classmethod
     def reducible_extensions(cls) -> frozenset[str]:
         return frozenset({".h5", ".hdf5"})
 
     @classmethod
-    def _read_dataset(cls, file: h5py.File, name: str) -> np.ndarray:
+    def _read_dataset(cls, file: h5py.File, name: str, columns: list[str] | None = None) -> np.ndarray:
         cls._validate_vds_sources(file)
         dataset = file[name]
-        return np.asarray(dataset[()] if dataset.shape == () else dataset[:])
+        if isinstance(dataset, h5py.Dataset):
+            if columns is not None:
+                raise ValueError(f"HDF5 dataset '{name}' was not written with named columns.")
+            return np.asarray(dataset[()] if dataset.shape == () else dataset[:])
+
+        columns = cls._validate_columns(columns) if columns is not None else cls._stored_columns(dataset)
+        missing = [column for column in columns if column not in dataset]
+        if missing:
+            raise KeyError(f"HDF5 dataset '{name}' has no column '{missing[0]}'.")
+        values = [
+            np.asarray(value[()] if value.shape == () else value[:])
+            for value in (dataset[column] for column in columns)
+        ]
+        return np.stack(values, axis=0)
 
     @classmethod
-    def open_primal(cls, fpath: str) -> np.ndarray:
+    def open_primal(cls, fpath: str, columns: list[str] | None = None) -> np.ndarray:
         with h5py.File(fpath, "r") as file:
-            return cls._read_dataset(file, "primal")
+            return cls._read_dataset(file, "primal", columns=columns)
 
     @classmethod
-    def open_primal_tangent(cls, fpath: str) -> tuple[np.ndarray, np.ndarray | None]:
+    def open_primal_tangent(cls, fpath: str, columns: list[str] | None = None) -> tuple[np.ndarray, np.ndarray | None]:
         with h5py.File(fpath, "r") as file:
             if "primal" not in file:
                 raise ValueError("Saved HDF5 file must contain a 'primal' dataset.")
-            primal = cls._read_dataset(file, "primal")
-            tangent = cls._read_dataset(file, "tangent") if "tangent" in file else None
+            primal = cls._read_dataset(file, "primal", columns=columns)
+            tangent = cls._read_dataset(file, "tangent", columns=columns) if "tangent" in file else None
         return primal, tangent
 
     @classmethod
-    def write_primal(cls, fpath: str, primal: np.ndarray):
-        cls._write_datasets(fpath, primal=primal)
+    def write_primal(cls, fpath: str, primal: np.ndarray, columns: list[str] | None = None):
+        cls._write_datasets(fpath, columns=columns, primal=primal)
 
     @classmethod
-    def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray):
-        cls._write_datasets(fpath, primal=primal, tangent=tangent)
+    def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray, columns: list[str] | None = None):
+        cls._write_datasets(fpath, columns=columns, primal=primal, tangent=tangent)
 
     @classmethod
-    def _load_gradient(cls, grad_path: str) -> np.ndarray:
+    def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
         with h5py.File(grad_path, "r") as file:
-            return cls._read_dataset(file, "gradient")
+            gradient = file["gradient"]
+            if isinstance(gradient, h5py.Dataset):
+                return cls._read_dataset(file, "gradient", columns=columns)
+
+            columns = (
+                cls._validate_columns(columns)
+                if columns is not None else cls._gradient_primal_columns(grad_path)
+            )
+            template = gradient[cls._stored_columns(gradient)[0]]
+            template_value = np.asarray(template[()] if template.shape == () else template[:])
+            values = []
+            for column in columns:
+                if column in gradient:
+                    value = gradient[column]
+                    values.append(np.asarray(value[()] if value.shape == () else value[:]))
+                else:
+                    values.append(np.zeros_like(template_value))
+            return np.stack(values, axis=0)
 
     @classmethod
-    def _save_gradient(cls, grad_path: str, gradient: np.ndarray):
-        cls._write_datasets(grad_path, gradient=gradient)
+    def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
+        if columns is None:
+            columns = cls._gradient_primal_columns(grad_path)
+        if columns is not None and grad_path in cls._gradient_written:
+            selected = cls._validate_columns(columns, gradient)
+            with h5py.File(grad_path, "a", libver="latest") as file:
+                group = file["gradient"]
+                if not isinstance(group, h5py.Group):
+                    raise ValueError("Cannot accumulate named gradients into an unnamed gradient.")
+                stored = cls._stored_columns(group)
+                for column, value in zip(selected, gradient, strict=True):
+                    if column in group:
+                        del group[column]
+                    cls._create_dataset(group, column, value)
+                    if column not in stored:
+                        stored.append(column)
+                group.attrs[cls.COLUMNS_ATTRIBUTE] = json.dumps(stored)
+            return
+        cls._write_datasets(grad_path, columns=columns, gradient=gradient)
+
+    @classmethod
+    def _gradient_primal_columns(cls, grad_path: str) -> list[str] | None:
+        base, extension = os.path.splitext(grad_path)
+        suffix = "_gradient"
+        if not base.endswith(suffix):
+            return None
+        primal_path = f"{base[:-len(suffix)]}{extension}"
+        with h5py.File(primal_path, "r") as file:
+            primal = file["primal"]
+            return cls._stored_columns(primal) if isinstance(primal, h5py.Group) else None
 
     @classmethod
     def read_backward_gradient(cls, fpath: str) -> torch.Tensor:
-        return torch.from_numpy(cls._load_gradient(cls._gradient_path(fpath))).float()
+        grad_path = cls._gradient_path(fpath)
+        with h5py.File(fpath, "r") as primal_file:
+            cls._validate_vds_sources(primal_file)
+            primal = primal_file["primal"]
+            if isinstance(primal, h5py.Dataset):
+                return torch.from_numpy(cls._load_gradient(grad_path)).float()
+
+            with h5py.File(grad_path, "r") as gradient_file:
+                gradient = gradient_file["gradient"]
+                if isinstance(gradient, h5py.Dataset):
+                    value = np.asarray(gradient[()] if gradient.shape == () else gradient[:])
+                    return torch.from_numpy(value).float()
+                gradient_columns = cls._stored_columns(gradient)
+                dtype = gradient[gradient_columns[0]].dtype
+                values = []
+                for column in cls._stored_columns(primal):
+                    if column in gradient:
+                        value = gradient[column]
+                        values.append(np.asarray(value[()] if value.shape == () else value[:]))
+                    else:
+                        values.append(np.zeros(primal[column].shape, dtype=dtype))
+                return torch.from_numpy(np.stack(values, axis=0)).float()
 
     @classmethod
-    def _write_datasets(cls, fpath: str, **datasets: np.ndarray) -> None:
+    def _write_datasets(cls, fpath: str, columns: list[str] | None = None, **datasets: np.ndarray) -> None:
+        if columns is not None:
+            cls._validate_columns(columns)
+            for value in datasets.values():
+                cls._validate_columns(columns, value)
+
         os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
         with h5py.File(fpath, "w", libver="latest") as file:
             for name, value in datasets.items():
-                options = {} if value.ndim == 0 else {"compression": "gzip"}
-                file.create_dataset(name, data=value, **options)
+                if columns is None:
+                    cls._create_dataset(file, name, value)
+                    continue
+
+                group = file.create_group(name, track_order=True)
+                group.attrs[cls.COLUMNS_ATTRIBUTE] = json.dumps(columns)
+                for column, column_value in zip(columns, value, strict=True):
+                    cls._create_dataset(group, column, column_value)
+
+    @classmethod
+    def _create_dataset(cls, parent: h5py.File | h5py.Group, name: str, value: np.ndarray) -> None:
+        options = {} if value.ndim == 0 else {"compression": "gzip"}
+        parent.create_dataset(name, data=value, **options)
+
+    @classmethod
+    def _validate_columns(cls, columns: list[str], value: np.ndarray | None = None) -> list[str]:
+        if any(
+            not isinstance(column, str)
+            or not column
+            or "/" in column
+            or "\x00" in column
+            or column == "."
+            for column in columns
+        ):
+            raise ValueError("Column names must be valid, non-empty HDF5 names without '/'.")
+        if len(set(columns)) != len(columns):
+            raise ValueError("Column names must be unique.")
+        if value is not None and (value.ndim == 0 or value.shape[0] != len(columns)):
+            size = 0 if value.ndim == 0 else value.shape[0]
+            raise ValueError(f"Received {len(columns)} columns for an array with size {size} along dimension 0.")
+        return columns
+
+    @classmethod
+    def _stored_columns(cls, group: h5py.Group) -> list[str]:
+        columns = group.attrs.get(cls.COLUMNS_ATTRIBUTE)
+        return json.loads(columns) if columns is not None else list(group.keys())
 
     @classmethod
     def _validate_vds_sources(cls, file: h5py.File) -> None:
@@ -240,6 +367,11 @@ class HDF5File(AutogradFileInterface):
 
         with h5py.File(destination, "w", libver="latest") as output:
             output.attrs[cls.VDS_SOURCES_ATTRIBUTE] = json.dumps(relative_sources)
+            with h5py.File(sources[0], "r") as first_source:
+                for name in cls.DATASETS:
+                    if name in first_source and isinstance(first_source[name], h5py.Group):
+                        group = output.require_group(name)
+                        group.attrs[cls.COLUMNS_ATTRIBUTE] = json.dumps(cls._stored_columns(first_source[name]))
             for dataset_name in sorted(dataset_names):
                 shapes = [m[dataset_name][0] for m in metadata]
                 dtype = metadata[0][dataset_name][1]
@@ -261,11 +393,20 @@ class HDF5File(AutogradFileInterface):
                 with h5py.File(source, "r") as file:
                     if "primal" not in file:
                         raise ValueError(f"HDF5 source '{source}' has no 'primal' dataset.")
-                    metadata.append({
-                        name: (file[name].shape, file[name].dtype)
-                        for name in cls.DATASETS
-                        if name in file
-                    })
+                    source_metadata = {}
+                    for name in cls.DATASETS:
+                        if name not in file:
+                            continue
+                        value = file[name]
+                        if isinstance(value, h5py.Dataset):
+                            source_metadata[name] = (value.shape, value.dtype)
+                            continue
+                        for column in cls._stored_columns(value):
+                            column_value = value[column]
+                            if not isinstance(column_value, h5py.Dataset):
+                                raise ValueError(f"HDF5 source '{source}' has invalid column '{name}/{column}'.")
+                            source_metadata[f"{name}/{column}"] = (column_value.shape, column_value.dtype)
+                    metadata.append(source_metadata)
             except OSError:
                 raise TypeError(
                     f"HDF5 reduction source '{source}' is not a valid HDF5 file. "
@@ -315,14 +456,14 @@ class InMemoryFile(AutogradFileInterface):
     _storage: dict[str, torch.Tensor] = {}
 
     @classmethod
-    def open_primal(cls, fpath: str) -> np.ndarray:
+    def open_primal(cls, fpath: str, columns: list[str] | None = None) -> np.ndarray:
         value = cls._storage[fpath]
         if isinstance(value, dict):
             value = value["primal"]
         return value.cpu().numpy()
 
     @classmethod
-    def open_primal_tangent(cls, fpath: str) -> tuple[np.ndarray, np.ndarray | None]:
+    def open_primal_tangent(cls, fpath: str, columns: list[str] | None = None) -> tuple[np.ndarray, np.ndarray | None]:
         value = cls._storage[fpath]
         if isinstance(value, dict):
             primal = value["primal"].cpu().numpy()
@@ -332,22 +473,22 @@ class InMemoryFile(AutogradFileInterface):
         return value.cpu().numpy(), None
 
     @classmethod
-    def write_primal(cls, fpath: str, primal: np.ndarray):
+    def write_primal(cls, fpath: str, primal: np.ndarray, columns: list[str] | None = None):
         cls._storage[fpath] = torch.from_numpy(primal)
 
     @classmethod
-    def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray):
+    def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray, columns: list[str] | None = None):
         cls._storage[fpath] = {
             "primal": torch.from_numpy(primal),
             "tangent": torch.from_numpy(tangent),
         }
 
     @classmethod
-    def _load_gradient(cls, grad_path: str) -> np.ndarray:
+    def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
         return cls._storage[grad_path]
 
     @classmethod
-    def _save_gradient(cls, grad_path: str, gradient: np.ndarray):
+    def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
         cls._storage[grad_path] = torch.from_numpy(gradient)
 
     @classmethod
