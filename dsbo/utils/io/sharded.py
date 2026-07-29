@@ -229,11 +229,11 @@ class ShardedStorageBase(AutogradFileStorage, ABC):
 
 
     @classmethod
-    def open_primal(cls, fpath: str) -> np.ndarray:
+    def open_primal(cls, fpath: str, columns: list[str] | None = None) -> np.ndarray:
         return cls._load_array(cls._storage_path(fpath))
 
     @classmethod
-    def open_primal_tangent(cls, fpath: str) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    def open_primal_tangent(cls, fpath: str, columns: list[str] | None = None) -> tuple[np.ndarray, Optional[np.ndarray]]:
         storage_path = cls._storage_path(fpath)
         tangent_path = cls._tangent_path(storage_path)
         primal = cls._load_array(storage_path)
@@ -244,21 +244,21 @@ class ShardedStorageBase(AutogradFileStorage, ABC):
         return primal, tangent
 
     @classmethod
-    def write_primal(cls, fpath: str, primal: np.ndarray):
+    def write_primal(cls, fpath: str, primal: np.ndarray, columns: list[str] | None = None):
         cls._save_array(cls._storage_path(fpath), primal)
 
     @classmethod
-    def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray):
+    def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray, columns: list[str] | None = None):
         storage_path = cls._storage_path(fpath)
         cls._save_array(storage_path, primal)
         cls._save_array(cls._tangent_path(storage_path), tangent)
 
     @classmethod
-    def _save_gradient(cls, grad_path: str, gradient: np.ndarray):
+    def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
         cls._save_array(cls._storage_path(grad_path), gradient)
 
     @classmethod
-    def _load_gradient(cls, grad_path: str) -> np.ndarray:
+    def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
         return cls._load_array(cls._storage_path(grad_path))
 
     @classmethod
