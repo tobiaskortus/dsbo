@@ -21,6 +21,7 @@ nav:
     - Workflows: core/workflow.md
     - Surrogates: core/surrogates.md
   - Guide:
+    - Project Generator CLI: guide/cli.md
     - Writing Modules: guide/modules.md
     - Building Workflows: guide/workflows.md
     - I/O and Autograd: guide/io.md
