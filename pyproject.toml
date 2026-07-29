@@ -9,40 +9,40 @@ description = "Detector Surrogate-Based Optimization"
 requires-python = ">=3.10"
 
 dependencies = [
-    "tqdm",
     "attrs",
-    "torch",
-    "numpy",
-    "h5py",
-    "pandas",
     "dask[distributed]",
     "dask-jobqueue",
-    "grpcio",
-    "grpcio-tools",
-    "graphviz",
-    "matplotlib",
-    "lancedb",
+    "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main",
+    "diffusers",
     "duckdb",
     "duckdb-engine",
+    "filelock",
+    "graphviz",
+    "grpcio",
+    "h5py",
+    "lancedb",
+    "lightning",
+    "matplotlib",
+    "networkx",
+    "numpy",
+    "optuna",
+    "optuna-integration[botorch]",
+    "pandas",
+    "psutil",
+    "pyarrow",
+    "pytorch-lightning",
+    "sqlalchemy",
     "sqlmodel",
     "sqlite-vec",
-    "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main"
+    "torch",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
-optuna = [
-    "optuna",
-    "optuna-integration[botorch]",
-]
-
-aido = [
-    "diffusers",
-]
-
-all = [
-    "optuna",
-    "optuna-integration[botorch]",
-    "diffusers",
+dev = [
+    "grpcio-tools",
+    "pre-commit",
+    "pytest",
 ]
 
 dev = [

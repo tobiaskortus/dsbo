@@ -1,6 +1,6 @@
 import pytest
 
-from dsbo.modules.dsl import ModuleDslMixin, DependencyDict
+from dsbo.modules.dsl import ModuleDslMixin, DependencyDict, dynamic, Dynamic
 
 @pytest.fixture(scope="session", autouse=True)
 def depdict_obj_factory():
@@ -122,8 +122,6 @@ def test_module_mul_int():
         assert val == []
 
 
-def test_module_mul_dynamic():
-    assert False
 
 
 def test_depdict_or_depdict_module(depdict_obj_factory):
@@ -163,5 +161,3 @@ def test_depdict_mul_int(depdict_obj_factory):
             assert v.i == i
 
 
-def test_depdict_mul_dynamic(depdict_obj_factory):
-    assert False
