@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dsbo"
 version = "0.1.0"
-description = "Detector Suroogate-Based Optimization"
+description = "Detector Surrogate-Based Optimization"
 requires-python = ">=3.10"
 
 dependencies = [
@@ -43,6 +43,10 @@ all = [
     "optuna",
     "optuna-integration[botorch]",
     "diffusers",
+]
+
+dev = [
+    "pytest",
 ]
 
 [tool.setuptools.packages.find]
