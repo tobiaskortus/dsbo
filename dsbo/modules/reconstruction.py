@@ -5,10 +5,12 @@ from abc import ABC, abstractmethod
 
 import torch
 
+from dsbo.cli import register_cli_module
 from dsbo.modules import Module
 from dsbo.container import ContainerWrapperBase
 
 
+@register_cli_module("ReconstructionBase")
 class ReconstructionBase(Module):
     def __init__(self) -> None:
         super().__init__()

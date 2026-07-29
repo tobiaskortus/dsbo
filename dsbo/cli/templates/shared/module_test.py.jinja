@@ -1,0 +1,9 @@
+from dsbo.cli.testing import parametrize_with_checks
+
+{{ module.import_statement }}
+from {{ module_import_path }} import {{ module.class_name }}
+
+
+@parametrize_with_checks([{{ module.class_name }}], expected_base={{ module.base_name }})
+def test_is_module_type(module_class, check) -> None:
+    check(module_class)

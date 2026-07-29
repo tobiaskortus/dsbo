@@ -1,0 +1,13 @@
+{%- for import_statement in modules|map(attribute='import_statement')|unique %}
+{{ import_statement }}
+{%- endfor %}
+
+
+{% for module in modules %}
+class {{ module.class_name }}({{ module.base_name }}):
+    # TODO: implement methods required by {{ module.base_name }}.
+    def __init__(self) -> None:
+        super().__init__()
+{% if not loop.last %}
+{% endif -%}
+{% endfor %}

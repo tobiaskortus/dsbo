@@ -1,0 +1,9 @@
+{%- for module in modules %}
+from {{ project_slug }}.modules.{{ module.file_name }} import {{ module.class_name }}
+{%- endfor %}
+
+__all__ = [
+{%- for module in modules %}
+    "{{ module.class_name }}",
+{%- endfor %}
+]

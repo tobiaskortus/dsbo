@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "{{ cookiecutter.project_slug }}"
+version = "0.1.0"
+description = "{{ cookiecutter.project_slug }} workflow"
+requires-python = ">=3.10"
+
+dependencies = [
+    "dsbo @ git+ssh://git@github.com/tobiaskortus/dsbo.git",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["{{ cookiecutter.project_slug }}*"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py", "autotests_*.py"]

@@ -7,10 +7,12 @@ from diffusers.schedulers import DDPMScheduler, DDIMScheduler
 
 from typing import Callable
 
+from dsbo.cli import register_cli_module
 from dsbo.parameters import Candidate, Sampler
 from dsbo.backends.aido.strategy import SurrogateStrategy
 from dsbo.surrogates.diffusion import MlpDiffusion1D, Trainer
 
+@register_cli_module("Surrogate")
 class LocalSurrogate(nn.Module):
     def __init__(self, strategy: SurrogateStrategy):
         super().__init__()

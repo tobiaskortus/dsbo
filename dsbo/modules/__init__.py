@@ -13,6 +13,7 @@ from dsbo.modules.dsl import ModuleDslMixin
 from contextlib import nullcontext, suppress
 from dsbo.utils.io import Workdir, get_workdir
 from dsbo.utils.compile import dryrunnable, is_dry_run
+from dsbo.cli.registry import register_cli_module
 from dsbo.utils.functools import auto_wrap, ensure_dict_return
 from dsbo.utils.io import  AbstractFilePath, with_remote_workdir
 
@@ -41,6 +42,7 @@ def auto_wrap(cls, method_name, *decorators):
     setattr(cls, method_name, wrapped)
 
 
+@register_cli_module("Module")
 class Module(ModuleDslMixin, ABC):
 
     def __init__(self):

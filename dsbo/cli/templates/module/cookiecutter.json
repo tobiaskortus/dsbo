@@ -1,3 +1,6 @@
 {
-    "project_slug": "my_module"
+    "project_slug": "my_module",
+    "module_class_name": "MyModule",
+    "module_import": "from dsbo.modules import Module",
+    "module_import_path": "my_module.my_module"
 }
