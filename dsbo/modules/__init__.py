@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import inspect
-import types
 import weakref
 from abc import ABC
-from contextlib import nullcontext, suppress
 from functools import wraps
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
+
 from dsbo.utils.io import Output, Input
 from dsbo.autograd import autograd_context
+from dsbo.logger import WorkflowTaskLogger
+from dsbo.modules.dsl import ModuleDslMixin
+from contextlib import nullcontext, suppress
 from dsbo.utils.io import Workdir, get_workdir
 from dsbo.utils.compile import dryrunnable, is_dry_run
-from dsbo.modules.dsl import ModuleDslMixin
-from dsbo.logger import WorkflowTaskLogger
-from dsbo.utils.io import AbstractFilePath, with_remote_workdir
-from dsbo.worker.config import WorkerSpec
+from dsbo.utils.functools import auto_wrap, ensure_dict_return
+from dsbo.utils.io import  AbstractFilePath, with_remote_workdir
+
+if TYPE_CHECKING:
+    from dsbo.worker.spec import WorkerSpec
+    from dsbo.surrogates.module_surrogate import ModuleSurrogate
+    from dsbo.surrogates.module_surrogate import ModuleSurrogateContract
 
 
 def ensure_dict_return(fn):
@@ -68,8 +73,7 @@ class Module(ModuleDslMixin, ABC):
         super().__setattr__(name, value)
 
         #TODO: define a clear policy when Inputs and Outputs should be registered
-        # and when AbstractFilePath should be alloweds -> important to keep track of files 
-        # in e.g. MergeTransforms.
+        #TODO: and when AbstractFilePath should be allowed
         if isinstance(value, AbstractFilePath):
             self._registered_files[name] = value
 
@@ -84,6 +88,15 @@ class Module(ModuleDslMixin, ABC):
 
     def __repr__(self):
         return self.name
+    
+    @property
+    def surrogate_contract(self) -> ModuleSurrogateContract:
+        raise NotImplementedError("No surrogate contract defined for this module.")
+
+    def patch(self, surrogate: ModuleSurrogate):
+        surrogate.register_contract(self.surrogate_contract)
+        self.surrogate = surrogate
+        return self
 
     @property
     def name(self) -> str:
@@ -126,6 +139,14 @@ class Module(ModuleDslMixin, ABC):
     @property
     def registered_files(self) -> dict[str, AbstractFilePath]:
         return self._registered_files
+
+    @property
+    def registered_inputs(self) -> list[AbstractFilePath]:
+        return list(self._registered_inputs)
+
+    @property
+    def registered_outputs(self) -> list[AbstractFilePath]:
+        return list(self._registered_outputs)
 
 
 def dynamic_submodule(wrapped_fn):
@@ -215,6 +236,14 @@ def dynamic_submodule(wrapped_fn):
                     suffix = f"[{self.i}]" if self.i is not None else ""
                     return f"{type(self._parent).__name__}.{self._func.__name__}{suffix}"
 
+                @property
+                def registered_inputs(self) -> list[AbstractFilePath]:
+                    return self._parent.registered_inputs
+
+                @property
+                def registered_outputs(self) -> list[AbstractFilePath]:
+                    return self._parent.registered_outputs
+
             submodule = self._submodule_cache.get(obj)
 
             if submodule is not None:
@@ -227,3 +256,7 @@ def dynamic_submodule(wrapped_fn):
         
 
     return DynamicSubmodule(wrapped_fn)
+
+
+from dsbo.modules.dsl import with_no_grad
+from dsbo.modules.fused import BatchFusedModule, FusedModule, batch_fuse

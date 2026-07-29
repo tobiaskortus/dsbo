@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
-from typing import Any, Callable, Generator, Iterator, List, Optional, Set, Union
+from typing import Any, Callable, Generator, List, Mapping, Optional, Set
 
 
 def _is_dry_run():
@@ -35,6 +35,7 @@ class PathInfo:
     @property
     def suffix(self) -> Optional[str]:
         return "_".join(self.suffix_parts) if self.suffix_parts else None
+
 
 class AbstractPath:
     def __init__(self, path: str):
@@ -75,17 +76,23 @@ class AbstractFilePath:
         self._path = path
 
     def __call__(self) -> Optional[str]:
+        return Workdir.resolve_file(self)
+
+    def _resolve(self, use_overlays: bool = True) -> Optional[str]:
         parts = Workdir._current_file_context.get()
-        if parts and self._unique:
-            name, ext = os.path.splitext(self._filename)
-            filename = f"{name}_{'_'.join(parts)}{ext}"
-        else:
-            filename = self._filename
+
+        if use_overlays:
+            overlay = Workdir._current_file_overlays.get() or {}
+            overlay_value = overlay.get(self)
+            if overlay_value is not None:
+                if isinstance(overlay_value, str):
+                    return overlay_value
+                return overlay_value.resolve()
 
         dir_path = self._path()
         if dir_path is None:
             return None
-        full_path = os.path.join(dir_path, filename)
+        full_path = os.path.join(dir_path, self.filename_for(parts))
 
         dir_info = Workdir.get_path_info(dir_path)
         info = PathInfo(
@@ -116,16 +123,22 @@ class AbstractFilePath:
     def filename(self) -> str:
         return self._filename
 
+    def filename_for(self, suffix_parts: tuple[str, ...] = ()) -> str:
+        filename = self._filename
+        if suffix_parts and self._unique:
+            name, ext = os.path.splitext(filename)
+            filename = f"{name}_{'_'.join(suffix_parts)}{ext}"
+        return filename
+
     @property
     def pathname(self) -> str:
         return self._path.pathname
-
-
 
 class Workdir(dict):
     _current_workdir = contextvars.ContextVar("current_workdir", default=None)
     _current_file_context = contextvars.ContextVar("current_file_context", default=())
     _current_subdir = contextvars.ContextVar("current_subdir", default=())
+    _current_file_overlays = contextvars.ContextVar("current_file_overlays", default=None)
     _registered_paths: Set[str] = set()
     _path_registry: dict[str, PathInfo] = {}
     _registry_by_root: dict[str, list[str]] = {}  # root → [path, …]
@@ -177,10 +190,6 @@ class Workdir(dict):
 
         try:
             os.makedirs(workdir_root, exist_ok=True)
-            for path in registry.values():
-                if error_if_exists and os.path.exists(path):
-                    raise FileExistsError(f"Directory {path} already exists.")
-                os.makedirs(path, exist_ok=True)
             yield registry
         finally:
             cls._current_workdir.reset(token)
@@ -197,6 +206,20 @@ class Workdir(dict):
             yield
         finally:
             cls._current_subdir.reset(token)
+
+    @classmethod
+    @contextmanager
+    def use_file_overlays(cls, overlays: Mapping[AbstractFilePath, str | Callable[[], str]]) -> Generator[None, None, None]:
+        current = cls._current_file_overlays.get() or {}
+        token = cls._current_file_overlays.set({**current, **overlays})
+        try:
+            yield
+        finally:
+            cls._current_file_overlays.reset(token)
+
+    @classmethod
+    def get_file_overlay(cls, file: AbstractFilePath) -> str | Callable[[], str] | None:
+        return (cls._current_file_overlays.get() or {}).get(file)
 
     @classmethod
     @contextmanager
@@ -270,7 +293,57 @@ class Workdir(dict):
         if cls._cwd_workdir is None:
             cls._cwd_workdir = cls(os.getcwd())
         return cls._cwd_workdir
+    
 
+    @classmethod
+    def get_current_dir(cls) -> str:
+        workdir = get_workdir()
+        subdir_parts = get_subdir_parts()
+        if subdir_parts:
+            return os.path.join(workdir.workdir_root, *subdir_parts)
+        
+        return workdir.workdir_root
+
+    @classmethod
+    def resolve_file(
+        cls,
+        file: AbstractFilePath,
+        *,
+        subdir: str | None = None,
+        suffix: str | int | None = None,
+        use_overlays: bool = True,
+    ) -> str:
+        with cls.create_subdir(subdir) if subdir else nullcontext():
+            with cls.use_file_suffix(str(suffix)) if suffix is not None else nullcontext():
+                resolved = file._resolve(use_overlays=use_overlays)
+        assert resolved is not None
+        return resolved
+
+    @classmethod
+    def resolve_derived_file(
+        cls,
+        file: AbstractFilePath,
+        namespace: str,
+        *,
+        subdir: str | None = None,
+        suffix: str | int | None = None,
+    ) -> str:
+        with cls.create_subdir(subdir) if subdir else nullcontext():
+            with cls.create_subdir(namespace):
+                return cls.resolve_file(file, suffix=suffix, use_overlays=False,)
+
+    @staticmethod
+    def link(source: str, *targets: str, protect_files: bool = True) -> None:
+        source_path = Path(source)
+        for target_path in map(Path, targets):
+            if protect_files and target_path.exists() and not target_path.is_symlink():
+                raise FileExistsError(f"Cannot create symlink because a real file exists at {target_path}.")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target_path.symlink_to(os.path.relpath(source_path, target_path.parent))
+            except FileExistsError:
+                target_path.unlink()
+                target_path.symlink_to(os.path.relpath(source_path, target_path.parent))
 
 def get_workdir() -> Workdir:
     wd = Workdir._current_workdir.get()
@@ -305,11 +378,13 @@ def with_remote_workdir(func: Callable) -> Callable:
         workdir = kwargs.pop("workdir", None)
         suffix = kwargs.pop("suffix", None)
         subdir = kwargs.pop("subdir", None)
+        file_overlays = kwargs.pop("file_overlays", None)
 
         with Workdir.load(workdir) if workdir else nullcontext():
             with Workdir.create_subdir(subdir) if subdir else nullcontext():
                 with Workdir.use_file_suffix(suffix) if suffix else nullcontext():
-                    return func(*args, **kwargs)
+                    with Workdir.use_file_overlays(file_overlays) if file_overlays else nullcontext():
+                        return func(*args, **kwargs)
                 
     return wrapper
 

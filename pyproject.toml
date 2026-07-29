@@ -13,6 +13,7 @@ dependencies = [
     "attrs",
     "torch",
     "numpy",
+    "h5py",
     "typer",
     "pandas",
     "cookiecutter",

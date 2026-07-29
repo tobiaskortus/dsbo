@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import patch
 
 from dsbo.modules import Module, dynamic_submodule
-from dsbo.utils.io import AbstractFilePath, DefaultPaths
+from dsbo.utils.io import AbstractFilePath, DefaultPaths, Input, Output, Workdir
 
 class EmptyModuleMock(Module):
     def __init__(self):
@@ -19,7 +19,23 @@ class DefaultModuleMock(Module):
     def __call__(self, *args, **kwds):
         time.sleep(0.01)
         return {"result": 42}
-    
+
+
+def test_dynamic_submodule_inherits_parent_registered_files():
+    class Parent(Module):
+        def __init__(self):
+            super().__init__()
+            self.train_input = Input(Workdir.register_file("simulation", "train.h5"))
+            self.val_input = Input(Workdir.register_file("simulation", "val.h5"))
+            self.model = Output(Workdir.register_file("reconstruction", "model.pt"))
+
+        @dynamic_submodule
+        def train(self, design):
+            pass
+
+    parent = Parent()
+    assert parent.train.registered_inputs == parent.registered_inputs
+    assert parent.train.registered_outputs == parent.registered_outputs
 
 
 @patch('dsbo.modules.dryrunnable', return_value=False)

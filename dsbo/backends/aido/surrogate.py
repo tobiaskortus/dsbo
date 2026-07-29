@@ -1,4 +1,5 @@
 import torch
+import logging
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, TensorDataset
@@ -8,7 +9,7 @@ from typing import Callable
 
 from dsbo.parameters import Candidate, Sampler
 from dsbo.backends.aido.strategy import SurrogateStrategy
-from dsbo.surrogates.diffusion import LocalSurrogateDiffuser, Trainer
+from dsbo.surrogates.diffusion import MlpDiffusion1D, Trainer
 
 class LocalSurrogate(nn.Module):
     def __init__(self, strategy: SurrogateStrategy):
@@ -17,6 +18,9 @@ class LocalSurrogate(nn.Module):
 
     def trust_region(self, candidate: Candidate) -> bool:
         return self._strategy.trust_region(candidate)
+
+    def is_in_trust_region(self, candidate: Candidate) -> bool:
+        return self.trust_region(candidate)
     
     def fit(self, design: Candidate, workflow_callback: Callable[[dict], dict[str, float]]):
         pass
@@ -108,7 +112,7 @@ class LocalDiffusionSurrogate(LocalSurrogate):
             clip_sample=False,
         )
 
-        self.model = LocalSurrogateDiffuser(objective_dim=objective_dim, parameter_dim=C.shape[1], n_layers=self.num_layers)
+        self.model = MlpDiffusion1D(objective_dim=objective_dim, parameter_dim=C.shape[1], n_layers=self.num_layers)
         optimizer = AdamW(self.model.parameters(), lr=1e-3)
         trainer = Trainer(self.model, optimizer=optimizer, noise_scheduler=self.noise_scheduler, device=device)
 

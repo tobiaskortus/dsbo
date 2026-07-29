@@ -2,25 +2,27 @@ import os
 import shutil
 from typing import Optional
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+
+import torch
 
 from dsbo.modules import Module
 from dsbo.container import ContainerWrapperBase
+
 
 class ReconstructionBase(Module):
     def __init__(self) -> None:
         super().__init__()
 
-    def __call__(self, design: dict, **kwargs) -> Optional[dict[str, float]]:
+    def __call__(self, design: dict, **kwargs) -> Optional[dict[str, torch.Tensor]]:
         self.train(design, **kwargs)
         return self.validate(design, **kwargs)
-    
+
     @abstractmethod
     def train(self, design=None, **kwargs) -> None:
         pass
-    
+
     @abstractmethod
-    def validate(self, design=None, **kwargs) -> Optional[dict[str, float]]:
+    def validate(self, design=None, **kwargs) -> Optional[dict[str, torch.Tensor]]:
         pass
 
 
@@ -34,7 +36,3 @@ class ReconstructionContainerWrapper(ReconstructionBase, ContainerWrapperBase):
     def call_container(self, arguments: list, is_exec: bool = False) -> None:
         if is_exec: super().exec_container(arguments)
         else: super().run_container(arguments)
-
-
-
-    

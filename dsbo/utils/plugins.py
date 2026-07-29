@@ -1,0 +1,84 @@
+import time
+from typing import Callable, Dict, Optional
+from distributed.diagnostics.plugin import SchedulerPlugin
+
+from dsbo.storage.models import JobStatus
+from dsbo.storage import TransitionWriter
+
+
+class ProgressBarPlugin(SchedulerPlugin):
+    def __init__(self, progress_callback: Callable[[], None]) -> None:
+        super().__init__()
+        self.progress_callback = progress_callback
+
+    def transition(self, key, start, finish, *args, **kwargs):
+        match (start, finish):
+            case (_, "memory") | (_, "erred"):
+                self.progress_callback()
+
+
+class TaskStreamPlugin(SchedulerPlugin):
+    def __init__(
+        self,
+        writer: TransitionWriter,
+        task_map: Dict[str, str | tuple[str, ...]],
+        name_map: Dict[str, str],
+    ) -> None:
+        super().__init__()
+        self.writer = writer
+        self.task_map: Dict[str, str | tuple[str, ...]] = task_map
+        self.name_map: Dict[str, str] = name_map
+        self.log_buffer: Dict[str, list] = {}
+
+    def start(self, scheduler):
+        self.scheduler = scheduler
+
+    def log_event(self, topic: str, msg):
+        if topic == "runtimes" and isinstance(msg, dict) and msg.get("task_log"):
+            self.log_buffer.setdefault(msg.get("task"), []).append(msg["task_log"])
+
+    def transition(self, key, start, finish, *args, **kwargs):
+
+        def trigger_on_transition(status: JobStatus) -> None:
+            try:
+                if status == JobStatus.RUNNING or status == JobStatus.QUEUED:
+                    ts = self.scheduler.tasks[key]
+                    worker = None
+                    if ts is not None and ts.processing_on is not None:
+                        worker = ts.processing_on
+
+                    name    = self.name_map[key]
+                    if status == JobStatus.RUNNING:
+                        approx_start = time.time()
+                    exec_ids = self.task_map[key]
+                    if isinstance(exec_ids, str):
+                        exec_ids = (exec_ids,)
+                    for exec_id in exec_ids:
+                        self.writer(key, name, worker.name if worker != None else "unknown", approx_start, -1, exec_id, "", status)
+                    return
+
+                worker = self.scheduler.workers[kwargs["worker"]]
+                startstop = kwargs["startstops"][0]
+                name    = self.name_map[key]
+                messages = self.log_buffer.pop(key, [])
+                log = "\n".join(messages)
+
+                exec_ids = self.task_map[key]
+                if isinstance(exec_ids, str):
+                    exec_ids = (exec_ids,)
+                for exec_id in exec_ids:
+                    self.writer(key, name, worker.name, startstop["start"], startstop["stop"], exec_id, log, status)
+            except Exception as e:
+                print(f"[TaskStreamPlugin] transition error: {e}")
+
+        match (start, finish):
+            case (_, "processing"):
+                trigger_on_transition(status=JobStatus.RUNNING)
+            case (_, "queued"):
+                trigger_on_transition(status=JobStatus.QUEUED)
+            case (_, "memory"):
+                trigger_on_transition(status=JobStatus.SUCCESS)
+            case (_, "erred"):
+                trigger_on_transition(status=JobStatus.FAILED)
+            case (_, _):
+                pass

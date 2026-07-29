@@ -6,8 +6,8 @@ from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
 from dsbo.autograd import train_op
+from dsbo.config import get_active_file_backend
 from dsbo.modules import dynamic_submodule
-from dsbo.utils.io.autograd import NumpyFile
 from dsbo.modules.reconstruction import ReconstructionBase
 from dsbo.utils.io.workdir import Workdir, DefaultPaths, Input
 
@@ -17,8 +17,9 @@ def load_dataset(X_file: str, y_file: str, batch_size: int = 64, shuffle: bool =
                   aggr: tuple[torch.Tensor, torch.Tensor] | None = None,
                   detach_X: bool = True):
 
-    X = NumpyFile.open(X_file, "cpu").float()
-    y = NumpyFile.open(y_file, "cpu").float().detach()
+    Storage = get_active_file_backend()
+    X = Storage.open(X_file, "cpu").float()
+    y = Storage.open(y_file, "cpu").float().detach()
 
     if detach_X:
         X = X.detach()
