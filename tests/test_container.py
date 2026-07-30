@@ -6,6 +6,7 @@ import pytest
 from dsbo.workflow import Workflow
 from dsbo.modules import Module
 from dsbo.modules.dsl import DependencyDict
+from dsbo.worker.spec import LocalWorkerSpec, SLURMWorkerSpec
 
 from dsbo.container import (
     ContainerConfig,
@@ -556,6 +557,38 @@ class TestBackendRegistry:
 
 
 class TestContainerWrapperBase:
+    @pytest.mark.parametrize(
+        ("resources", "expected"),
+        [
+            (LocalWorkerSpec(cores=1, processes=1, memory="1GB"), False),
+            (SLURMWorkerSpec(cores=1, processes=1, memory="1GB", walltime="00:10:00"), False),
+            (SLURMWorkerSpec(cores=1, processes=1, memory="1GB", walltime="00:10:00", gpu_resources="gpu:1"), True),
+        ],
+    )
+    def test_worker_has_gpu_from_resources(self, resources, expected):
+        wrapper = ContainerWrapperBase(ImageRef(uri="ubuntu:22.04"))
+        wrapper.resources = resources
+
+        assert wrapper._worker_has_gpu() is expected
+
+    @patch("dsbo.container.discover_container_environments", return_value={"docker": True})
+    def test_cpu_worker_disables_cuda_for_runtime(self, mock_discover):
+        wrapper = ContainerWrapperBase(ImageRef(uri="ubuntu:22.04"), cuda_enabled=True)
+        wrapper.resources = LocalWorkerSpec(cores=1, processes=1, memory="1GB")
+        provider = MockImageProvider()
+        wrapper._make_provider = MagicMock(return_value=provider)
+
+        cmd = wrapper._ContainerWrapperBase__construct_cmd(["echo"])
+
+        assert "--gpus all" not in cmd
+
+    @patch("torch.cuda.is_available", return_value=False)
+    def test_worker_has_gpu_uses_local_torch_when_unassigned(self, mock_is_available):
+        wrapper = ContainerWrapperBase(ImageRef(uri="ubuntu:22.04"))
+
+        assert wrapper._worker_has_gpu() is False
+        mock_is_available.assert_called_once_with()
+
     def test_explicit_container_type_override(self):
         wrapper = ContainerWrapperBase(
             ImageRef(uri="ubuntu:22.04"), container_type=ContainerType.SINGULARITY,

@@ -360,6 +360,14 @@ class ContainerConfig:
                           extra_flags=self.extra_flags,
                           workdir=self.workdir)
 
+    def disable_cuda(self) -> "ContainerConfig":
+        if not self.cuda_enabled:
+            return self
+        return type(self)(cuda_enabled=False,
+                          bind_mounts=self.bind_mounts,
+                          extra_flags=self.extra_flags,
+                          workdir=self.workdir)
+
     def with_extra_flags(self, *flags: str) -> "ContainerConfig":
         return type(self)(cuda_enabled=self.cuda_enabled,
                           bind_mounts=self.bind_mounts,
@@ -628,9 +636,24 @@ class ContainerWrapperBase:
 
         image_ref = provider.prepare_image(self._image_def, image_dir or "")
 
-        self._runtime = self._get_runtime_for_type(selected_env, image_ref, provider, self._config)
+        runtime_config = self._config
+        if runtime_config.cuda_enabled and not self._worker_has_gpu():
+            runtime_config = runtime_config.disable_cuda()
+
+        self._runtime = self._get_runtime_for_type(selected_env, image_ref, provider, runtime_config)
         self._container_path = image_ref
         return self._runtime
+
+    def _worker_has_gpu(self) -> bool:
+        resources = getattr(self, "resources", None)
+        if resources is not None:
+            return getattr(resources, "gpu_resources", None) is not None
+
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            return False
 
     def __construct_cmd(self, args: List[str], is_exec: bool = False) -> List[str]:
         runtime = self._ensure_runtime()
