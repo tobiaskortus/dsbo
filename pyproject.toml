@@ -14,6 +14,7 @@ dependencies = [
     "torch",
     "numpy",
     "h5py",
+    "uproot>=5,<6",
     "pandas",
     "dask[distributed]",
     "dask-jobqueue",
