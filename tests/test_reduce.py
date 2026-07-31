@@ -9,7 +9,8 @@ import pytest
 import torch
 
 from dsbo.config import config
-from dsbo.utils.io.autograd import HDF5File, InMemoryFile
+from dsbo.utils.io.autograd import InMemoryFile
+from dsbo.utils.io.hdf5 import HDF5File
 from dsbo.utils.io.reduce import LazyReductionResolver, reduce_registered_file
 from dsbo.utils.io.root import ROOTFile
 

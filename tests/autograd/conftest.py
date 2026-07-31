@@ -3,12 +3,12 @@ import torch
 import pytest
 import numpy as np
 
+from dsbo.utils.io.hdf5 import HDF5File
 from dsbo.worker.dask import DaskWorkerBase
 from dsbo.workflow import Workflow
 from dsbo.utils.io.workdir import Workdir
 from dsbo.modules import Module, Input, Output
 from dsbo.parameters import Continuous, ParameterSpace, Sampler
-from dsbo.utils.io.autograd import HDF5File
 
 class LocalDaskWorker(DaskWorkerBase):
     def __init__(self):

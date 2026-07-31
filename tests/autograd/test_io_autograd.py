@@ -10,7 +10,8 @@ import torch
 import uproot
 import torch.autograd.forward_ad as fw
 
-from dsbo.utils.io.autograd import HDF5File, InMemoryFile
+from dsbo.utils.io.autograd import InMemoryFile
+from dsbo.utils.io.hdf5 import HDF5File
 from dsbo.utils.io.root import ROOTFile
 from dsbo.utils.io.sharded import ShardedHDF5Storage
 
