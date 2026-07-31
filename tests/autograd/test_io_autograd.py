@@ -318,7 +318,7 @@ def test_root_file_reduce_creates_virtual_manifest():
             assert ROOTFile.METADATA_OBJECT in file
             assert ROOTFile.VDS_SOURCES_OBJECT in file
         assert ROOTFile.dependencies(destination) == sources
-        with patch("dsbo.utils.io.autograd.uproot.concatenate", wraps=uproot.concatenate) as concatenate:
+        with patch("dsbo.utils.io.root.uproot.concatenate", wraps=uproot.concatenate) as concatenate:
             torch.testing.assert_close(
                 ROOTFile.open(destination, "cpu"),
                 torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
