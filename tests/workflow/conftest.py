@@ -79,7 +79,7 @@ def make_mock_worker(**attrs):
 
 class LocalDaskWorker(DaskWorkerBase):
     def __init__(self):
-        self.cluster = LocalCluster(cores=1, memory="500MB")
+        self.cluster = LocalCluster(cores=1, memory="2GB")
         self.cluster.scale(2)
         super().__init__(self.cluster)
 
