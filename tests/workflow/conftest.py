@@ -13,7 +13,7 @@ from dsbo.modules.dsl import DependencyDict
 from dsbo.workflow import Workflow
 from dsbo.worker.dask import DaskWorkerBase
 from dsbo.utils.io import Workdir, Input, Output
-from dsbo.utils.io.autograd import HDF5File
+from dsbo.utils.io.hdf5 import HDF5File
 from dask_jobqueue.local import LocalCluster
 
 

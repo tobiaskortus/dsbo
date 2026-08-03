@@ -341,5 +341,5 @@ class ShardedHDF5Storage(ShardedStorageBase):
 
     @classmethod
     def reduce(cls, sources: list[str], destination: str) -> None:
-        from dsbo.utils.io.autograd import HDF5File
+        from dsbo.utils.io.hdf5 import HDF5File
         HDF5File.reduce(sources, destination)

@@ -7,7 +7,7 @@ from pathlib import Path
 from dsbo.modules import Module
 from dsbo.utils.io import Input, Output
 from dsbo.utils.io.workdir import Workdir
-from dsbo.utils.io.autograd import HDF5File
+from dsbo.utils.io.hdf5 import HDF5File
 from dsbo.parameters import ParameterSpace, Vector, Candidate, CandidateBatch
 
 

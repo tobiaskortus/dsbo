@@ -9,8 +9,10 @@ import pytest
 import torch
 
 from dsbo.config import config
-from dsbo.utils.io.autograd import HDF5File, InMemoryFile
+from dsbo.utils.io.autograd import InMemoryFile
+from dsbo.utils.io.hdf5 import HDF5File
 from dsbo.utils.io.reduce import LazyReductionResolver, reduce_registered_file
+from dsbo.utils.io.root import ROOTFile
 
 
 def write_h5_files(tempdir: str, *values: float) -> list[str]:
@@ -120,6 +122,21 @@ def test_resolver_rejects_backend_without_reduction(tempdir):
     with config.use(file_backend=InMemoryFile):
         with pytest.raises(NotImplementedError, match="does not support file reduction"):
             resolver.resolve()
+
+
+def test_resolver_uses_root_backend(tempdir):
+    sources = []
+    for index, value in enumerate((5.0, 6.0)):
+        source = os.path.join(tempdir, f"source_{index}.root")
+        ROOTFile.write(source, torch.tensor([value]))
+        sources.append(source)
+    destination = os.path.join(tempdir, "reduced.root")
+
+    with config.use(file_backend=ROOTFile):
+        LazyReductionResolver(sources, destination).resolve()
+
+    with torch.no_grad():
+        torch.testing.assert_close(ROOTFile.open(destination, "cpu"), torch.tensor([5.0, 6.0]))
 
 
 def test_resolver_rejects_non_hdf5_source_with_error(tempdir):

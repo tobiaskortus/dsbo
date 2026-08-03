@@ -4,7 +4,8 @@ import contextvars
 from contextlib import contextmanager
 from typing import Any, Generator
 
-from dsbo.utils.io.autograd import AutogradFileInterface, HDF5File
+from dsbo.utils.io.autograd import AutogradFileInterface
+from dsbo.utils.io.hdf5 import HDF5File
 
 _config_var: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "dsbo_config", default={}
