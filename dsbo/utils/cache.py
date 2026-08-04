@@ -11,7 +11,7 @@ import numpy as np
 from enum import Enum
 import networkx as nx
 from dataclasses import dataclass
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, Callable, cast, Sequence, TYPE_CHECKING
 import torch.autograd.forward_ad as fw
 
 from dsbo.modules import Module, BatchFusedModule
@@ -248,6 +248,22 @@ class WorkflowExecutionCache:
             misses.append(c)
 
         return results, misses, indices
+
+    def load_or_compute(
+        self,
+        candidates: Candidates,
+        compute: Callable[[list[Candidate]], list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        results, misses, miss_indices = self.match_partial(candidates)
+        if misses:
+            computed = compute(misses)
+            if len(computed) != len(misses):
+                raise ValueError("Computed result count does not match cache miss count")
+            self.save_all(misses, computed)
+            for index, result in zip(miss_indices, computed):
+                results[index] = result
+
+        return cast(list[dict[str, Any]], results)
 
     def load_all(self, candidates: Candidates) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []

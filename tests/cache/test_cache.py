@@ -467,6 +467,30 @@ def test_match_partial(temp_dir, candidate_batch, simple_space):
     assert indices == [2]
 
 
+def test_load_or_compute_merges_and_caches_misses(temp_dir, simple_space):
+    cfg = CacheConfig(base_dir=str(temp_dir))
+    cache = WorkflowExecutionCache(Workflow(SimpleModule()), config=cfg, workdir_root=str(temp_dir))
+    candidates = [
+        Candidate(simple_space, torch.tensor([1.0])),
+        Candidate(simple_space, torch.tensor([2.0])),
+        Candidate(simple_space, torch.tensor([3.0])),
+    ]
+    cache.save(candidates[1], {"out": torch.tensor(20.0)})
+
+    computed_candidates = []
+
+    def compute(misses):
+        computed_candidates.extend(misses)
+        return [{"out": candidate.tensor[0] * 10} for candidate in misses]
+
+    results = cache.load_or_compute(candidates, compute)
+
+    assert computed_candidates == [candidates[0], candidates[2]]
+    assert [result["out"].item() for result in results] == [10.0, 20.0, 30.0]
+    assert cache.has(candidates[0])
+    assert cache.has(candidates[2])
+
+
 def test_cache_persists_across_cache_instances(temp_dir, candidate, results):
     wf = Workflow(SimpleModule())
 
