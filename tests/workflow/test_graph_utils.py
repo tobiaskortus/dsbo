@@ -70,20 +70,6 @@ class TestTaskLevels:
         assert levels["d"] == 2
 
 
-class TestIsOutputTask:
-    def test_sink_is_output(self):
-        G = nx.DiGraph()
-        a, b = object(), object()
-        G.add_edge(a, b)
-        assert is_output_task(G, b)
-
-    def test_non_sink_is_not_output(self):
-        G = nx.DiGraph()
-        a, b = object(), object()
-        G.add_edge(a, b)
-        assert not is_output_task(G, a)
-
-
 class TestGetDependentTaskGroups:
     def test_single_node(self):
         G = nx.DiGraph()

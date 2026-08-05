@@ -4,6 +4,7 @@ import pytest
 import sys
 import torch
 import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
@@ -30,7 +31,10 @@ class MockDaskWorker(DaskWorkerBase):
         self._gather_results = None
         self._gather_forward_results = True  # if True, gather returns dicts
 
-    def schedule(self, module, design, dependencies=(), priority=None, file_overlays=None):
+    def schedule(
+        self, module, design, dependencies=(), design_tensor=None,
+        priority=None, file_overlays=None,
+    ):
         tid = UUID(int=self.task_counter, version=4)
         self.task_counter += 1
         delayed = MagicMock()
@@ -169,8 +173,8 @@ class SurrogateModule(Module):
     @property
     def is_available(self):
         return True
-    def fit(self, candidate, workflow_callback):
-        pass
+    def select_training_task(self, candidate):
+        return None
 
 
 # ────────── Fixtures ──────────
@@ -219,12 +223,12 @@ def mock_cache():
     instance = MagicMock()
     instance.config = MagicMock()
     instance.config.should_cache.return_value = True
-    instance.match_partial.return_value = ([None, None, None], [], [])
+    instance.load_or_compute.side_effect = lambda candidates, compute: compute(candidates)
     yield instance
 
 @pytest.fixture
 def mock_run_batch():
-    with patch("dsbo.workflow.run_batch") as mock:
+    with patch("dsbo.workflow.runner.run_batch") as mock:
         mock.side_effect = lambda wf, misses, catch: [
             {"out": torch.tensor(float(c.tensor.item() * 10.0))} for c in misses
         ]
@@ -248,3 +252,18 @@ def _suppress_tqdm():
     """Redirect stderr to devnull to suppress tqdm progress bar output during tests."""
     with open(os.devnull, "w") as null, patch.object(sys, "stderr", null):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_study_storage():
+    """Give each test a fresh study storage instead of the session default."""
+    from dsbo.storage import use_storage
+    from dsbo.storage.sqlmodel import StudyStorage
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = StudyStorage.create(Path(tmpdir) / "study.db")
+        try:
+            with use_storage(storage):
+                yield storage
+        finally:
+            storage.close()

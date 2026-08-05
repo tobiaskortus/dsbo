@@ -1,16 +1,26 @@
 import os
-from pathlib import Path
-from unittest.mock import patch
-from tempfile import TemporaryDirectory
-
 import h5py
-import numpy as np
-import pytest
 import torch
+import pytest
+import numpy as np
+from tempfile import TemporaryDirectory
 import torch.autograd.forward_ad as fw
 
 from dsbo.utils.io.autograd import HDF5File, InMemoryFile
-from dsbo.utils.io.sharded import ShardedHDF5Storage
+
+
+def _record_results(path: str, outputs: dict[str, torch.Tensor]) -> None:
+    HDF5File.write_named_datasets(
+        path,
+        {key: value.numpy() for key, value in outputs.items()},
+    )
+
+
+def aggregate(ds) -> tuple[torch.Tensor, torch.Tensor]:
+    xs = torch.stack([ds[i][0] for i in range(len(ds))], dim=0)
+    ys = torch.stack([ds[i][1] for i in range(len(ds))], dim=0)
+    return xs, ys
+
 
 def test_hdf5_file_primal_only():
     #dual_level==-1 and no_grad
@@ -225,15 +235,14 @@ def test_hdf5_virtual_dataset_rejects_missing_sources():
             HDF5File.open(destination, "cpu")
 
 
-def test_sharded_hdf5_uses_autograd_schema_and_vds_reduction():
+def test_vds_reduction_concatenates_multiple_hdf5_files():
     with TemporaryDirectory() as tempdir:
-        ShardedHDF5Storage.max_rows_per_shard = 2
-        source = os.path.join(tempdir, "source.h5")
-        ShardedHDF5Storage.write(source, torch.tensor([[1.0], [2.0], [3.0]]))
-        shards = sorted(Path(tempdir).glob("source.*.h5"))
-        assert len(shards) == 2
+        source1 = os.path.join(tempdir, "s1.h5")
+        source2 = os.path.join(tempdir, "s2.h5")
+        HDF5File.write(source1, torch.tensor([[1.0], [2.0]]))
+        HDF5File.write(source2, torch.tensor([[3.0]]))
         destination = os.path.join(tempdir, "reduced.h5")
-        ShardedHDF5Storage.reduce([str(path) for path in shards], destination)
+        HDF5File.reduce([source1, source2], destination)
         torch.testing.assert_close(
             HDF5File.open(destination, "cpu"),
             torch.tensor([[1.0], [2.0], [3.0]]),
@@ -286,3 +295,34 @@ def test_inmemory_file_backward_gradient():
 
     grad = InMemoryFile.read_backward_gradient(file_path)
     torch.testing.assert_close(grad, 2.0 * primal)
+
+
+def test_nested_record_vds_merge_roundtrip():
+    with TemporaryDirectory() as tempdir:
+        sources = []
+        for c in range(3):
+            path = os.path.join(tempdir, f"cand_{c}.h5")
+            _record_results(path, {"energy": torch.tensor([c, c + 0.5])})
+            _record_results(path, {"loss": torch.tensor([10.0 + 2 * c, 11.0 + 2 * c])})
+            sources.append(path)
+        merged = os.path.join(tempdir, "merged.h5")
+        HDF5File.reduce(sources, merged)
+
+        with h5py.File(merged, "r") as file:
+            energy = file["energy"]
+            loss = file["loss"]
+            assert energy.is_virtual
+            assert loss.is_virtual
+            np.testing.assert_allclose(energy[:], [0, 0.5, 1, 1.5, 2, 2.5])
+            np.testing.assert_allclose(loss[:], [10, 11, 12, 13, 14, 15])
+        assert len(HDF5File.dependencies(merged)) == len(sources)
+
+
+def test_reduce_rejects_incompatible_nested_records():
+    with TemporaryDirectory() as tempdir:
+        p1 = os.path.join(tempdir, "a.h5")
+        p2 = os.path.join(tempdir, "b.h5")
+        _record_results(p1, {"k": torch.tensor([1.0])})
+        _record_results(p2, {"k": torch.tensor([2.0]), "j": torch.tensor([3.0])})
+        with pytest.raises(ValueError, match="identical datasets"):
+            HDF5File.reduce([p1, p2], os.path.join(tempdir, "m.h5"))

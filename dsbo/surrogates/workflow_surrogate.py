@@ -1,41 +1,20 @@
 from __future__ import annotations
 
 import torch
+import pytorch_lightning as pl
 from typing import Any, Mapping, TYPE_CHECKING
+from torch.utils.data import Subset, random_split, DataLoader
+from pytorch_lightning.callbacks import EarlyStopping, Callback
 
-
+from dsbo.utils.io import Input, Workdir
+from dsbo.modules import dynamic_submodule
+from dsbo.config import get_active_file_backend
 from dsbo.surrogates import SurrogateBase, SurrogateStrategy
-from lightning.pytorch.utilities import disable_possible_user_warnings
+from dsbo.utils.io.workdir import DefaultFilenames, DefaultPaths
 
 
-
-def reduce(result: dict[str, torch.Tensor] | ResultsBatch) -> dict[str, torch.Tensor] | ResultsBatch:
-    if isinstance(result, ResultsBatch):
-        return ResultsBatch([reduce(r) for r in result])
-
-    return {k: v.mean() for k, v in result.items()}
-
-def expand(result: dict[str, torch.Tensor] | ResultsBatch) -> dict[str, torch.Tensor] | ResultsBatch:
-    if isinstance(result, ResultsBatch):
-        return ResultsBatch([expand(r) for r in result])
-
-    vector_lengths = [v.shape[0] for v in result.values() if v.ndim == 1 and v.shape[0] > 1]
-    
-    if vector_lengths:
-        assert len(set(vector_lengths)) == 1, f"All vectors must have the same length, got lengths: {vector_lengths}"
-        target_len = vector_lengths[0]
-    else:
-        raise Exception("No vector entries found in the result to determine target length for expansion.")
-    
-    expanded = {}
-    for k, v in result.items():
-        if v.ndim == 0 or (v.ndim == 1 and v.shape[0] == 1):
-            expanded[k] = v.repeat(target_len)
-        else:
-            expanded[k] = v
-
-    return expanded
-
+if TYPE_CHECKING:
+    from dsbo.parameters import CandidateBatch
 
 def surrogate_predictions_to_dict(tensor: torch.Tensor, keys: list[str], n: int) -> dict[str, torch.Tensor]:
     if n > 1:
@@ -45,30 +24,46 @@ def surrogate_predictions_to_dict(tensor: torch.Tensor, keys: list[str], n: int)
 
 
 class WorkflowSurrogate(SurrogateBase):
+    requires_design_tensor = True
+
     def __init__(self, surrogate: Any, strategy: SurrogateStrategy):
         super().__init__(surrogate, strategy)
 
     def __call__(self, design, **kwargs):
         pass
 
+    def to_datasets(self, training_data_path: str, candidates: CandidateBatch) -> tuple[Subset, Subset]:
+            from dsbo.utils.io.datasets.datasets import WorkflowSurrogateDataset
 
-from typing import Any, Callable
+            dataset = WorkflowSurrogateDataset(
+                training_data_path,
+                candidates.tensor,
+                backend=get_active_file_backend(),
+            )
+            self._records_dataset = dataset
+            self.keys = dataset.keys
+            self.n = dataset.n
+            val_size = max(1, int(len(dataset) * self.val_split))
+            train_size = len(dataset) - val_size
 
-import torch
-from torch.utils.data import TensorDataset, random_split, DataLoader
+            return random_split(dataset, [train_size, val_size])
 
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping
 
-from dsbo.modules import Module
-from dsbo.parameters import Candidate, CandidateBatch
-from dsbo.surrogates import SurrogateBase, SurrogateStrategy
-from dsbo.surrogates.workflow_surrogate import (
-    WorkflowSurrogate,
-    surrogate_predictions_to_dict,
-    reduce,
-)
-from dsbo.workflow import ResultsBatch
+class _EpochLoggingCallback(Callback):
+    """WorkflowTaskLogger captures stdout into the task log file.
+    NOTE: Hopefully only a temporary fix"""
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        train_loss = metrics.get("train_loss")
+        val_loss = metrics.get("val_loss")
+        epoch = trainer.current_epoch
+        parts = [f"Epoch {epoch}"]
+        if train_loss is not None:
+            parts.append(f"train_loss={float(train_loss):.6f}")
+        if val_loss is not None:
+            parts.append(f"val_loss={float(val_loss):.6f}")
+        print(" | ".join(parts))
 
 
 class MLPSurrogateModule(pl.LightningModule):
@@ -128,15 +123,15 @@ class MLPSurrogateModule(pl.LightningModule):
         }
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=16, num_workers=1, persistent_workers=True, shuffle=True)  # type: ignore[attr-defined]
+        return DataLoader(self.train_dataset, batch_size=16, num_workers=0, shuffle=True)  # type: ignore[attr-defined]
 
     def val_dataloader(self):
         if hasattr(self, "val_dataset") and self.val_dataset is not None:  # type: ignore[attr-defined]
-            return DataLoader(self.val_dataset, batch_size=16, num_workers=1, persistent_workers=True)  # type: ignore[attr-defined]
+            return DataLoader(self.val_dataset, batch_size=16, num_workers=0)  # type: ignore[attr-defined]
         return None
 
 
-class MLPWorkflowSurrogate(WorkflowSurrogate):
+class DefaultWorkflowSurrogate(WorkflowSurrogate):
     hidden_dims: tuple[int, ...] = (64, 64)
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
@@ -161,6 +156,10 @@ class MLPWorkflowSurrogate(WorkflowSurrogate):
         dummy = torch.nn.Linear(1, 1)
         super().__init__(surrogate=dummy, strategy=strategy)
 
+        self.data_path = Input(
+            Workdir.register_file(DefaultPaths.TRAINING_RECORDS, DefaultFilenames.RESULTS)
+        )
+
         if hidden_dims is not None:
             self.hidden_dims = hidden_dims
         if learning_rate is not None:
@@ -179,60 +178,26 @@ class MLPWorkflowSurrogate(WorkflowSurrogate):
         # Populated during training
         self.keys: list[str] = []
         self.n: int = 1
+        self._mean_x: torch.Tensor | None = None
+        self._std_x: torch.Tensor | None = None
+        self._mean_y: torch.Tensor | None = None
+        self._std_y: torch.Tensor | None = None
 
+    @dynamic_submodule
+    def train(self, design, candidates):
+        data_path = self.data_path()
+        model_file_path = self.model_file_path()
 
-    @staticmethod
-    def _filter_failed(
-        candidates: CandidateBatch, results: ResultsBatch
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        X = candidates.tensor
-        Y = results.tensor
+        train_ds, val_ds = self.to_datasets(data_path, candidates)
 
-        # TODO: define a consistent "failed" definition
-        return X, Y
+        self._records_dataset.compute_stats()
+        self._mean_x = self._records_dataset.mean_x
+        self._std_x = self._records_dataset.std_x
+        self._mean_y = self._records_dataset.mean_y
+        self._std_y = self._records_dataset.std_y
 
-    def to_datasets(self, candidates: CandidateBatch, results: ResultsBatch) -> tuple[TensorDataset, TensorDataset]:
-        X, Y = self._filter_failed(candidates, results)
-        total = X.shape[0]
-
-        if total < 2:
-            raise ValueError(
-                f"Need at least 2 valid samples for training, got {total}."
-            )
-
-        val_size = max(1, int(total * self.val_split))
-        train_size = total - val_size
-
-        # Split indices
-        indices = torch.randperm(total)
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:]
-
-        train_dataset = TensorDataset(X[train_indices], Y[train_indices])
-        val_dataset = TensorDataset(X[val_indices], Y[val_indices])
-
-        return train_dataset, val_dataset
-
-    # -- training ------------------------------------------------------------
-
-    def train(
-        self,
-        candidate: Candidate,
-        run_batch: Callable[[CandidateBatch], ResultsBatch],
-    ) -> None:
-        disable_possible_user_warnings()
-  
-
-        candidates = self.strategy.generate_candidates(
-            candidate, space=candidate.space, n=self.sample_count
-        )
-        results = reduce(ResultsBatch(run_batch(candidates)))
-
-        self.keys = list(results.keys)
-        in_dim = candidate.space.dims()
-        out_dim = len(self.keys)
-
-        train_ds, val_ds = self.to_datasets(candidates, results)
+        in_dim = train_ds[0][0].shape[0]
+        out_dim = train_ds[0][1].shape[0]
 
         model = MLPSurrogateModule(
             in_dim=in_dim,
@@ -244,7 +209,7 @@ class MLPWorkflowSurrogate(WorkflowSurrogate):
         model.train_dataset = train_ds 
         model.val_dataset = val_ds
 
-        early_stop = EarlyStopping(
+        early_stopping = EarlyStopping(
             monitor="val_loss",
             patience=self.patience,
             mode="min",
@@ -253,34 +218,65 @@ class MLPWorkflowSurrogate(WorkflowSurrogate):
 
         trainer = pl.Trainer(
             max_epochs=self.max_epochs,
-            callbacks=[early_stop],
-            enable_progress_bar=True,
+            callbacks=[early_stopping, _EpochLoggingCallback()],
+            enable_progress_bar=False,
+            enable_model_summary=False,
             enable_checkpointing=False,
             logger=False,
         )
-        trainer.fit(model)
 
-        self.write_to_registry(model)
+        try:
+            trainer.fit(model)
+            torch.save(self._model_state(model), model_file_path)
+        finally:
+            # Always release the records HDF5 handle, even if training errors.
+            if getattr(self, "_records_dataset", None) is not None:
+                self._records_dataset.close()
+                self._records_dataset = None
+        return {}
 
-        return model
+    def _model_state(self, model) -> dict:
+        return {
+            "state_dict": model.state_dict(),
+            "in_dim": model.hparams.in_dim,
+            "out_dim": model.hparams.out_dim,
+            "keys": self.keys,
+            "n": self.n,
+            "mean_x": self._mean_x,
+            "std_x": self._std_x,
+            "mean_y": self._mean_y,
+            "std_y": self._std_y,
+        }
 
+    def state_dict(self) -> dict:
+        return self._model_state(self.surrogate)
 
-    def __call__(self, design: Candidate, **kwargs) -> dict[str, torch.Tensor]:
-        x = design.tensor
-
-        in_dim = x.shape[0] if x.ndim == 1 else x.shape[1]
-        out_dim = len(self.keys)
-
+    def from_state_dict(self, state: dict) -> None:
         model = MLPSurrogateModule(
-            in_dim=in_dim,
-            out_dim=out_dim,
+            in_dim=state["in_dim"],
+            out_dim=state["out_dim"],
             hidden_dims=self.hidden_dims,
             learning_rate=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        model.load_state_dict(self.load_from_registry())
+        model.load_state_dict(state["state_dict"])
         model.eval()
+        self.keys = state["keys"]
+        self.n = state["n"]
+        self._mean_x = state.get("mean_x")
+        self._std_x = state.get("std_x")
+        self._mean_y = state.get("mean_y")
+        self._std_y = state.get("std_y")
+        self.surrogate = model
 
+
+    def __call__(self, design: Mapping[str, Any], design_tensor: torch.Tensor, **kwargs) -> dict[str, torch.Tensor]:
+        model = self.get_runtime_model()
+        x = design_tensor
+        if self._mean_x is not None:
+            x = (design_tensor - self._mean_x) / self._std_x
         y = model(x)
+        if self._mean_y is not None:
+            y = y * self._std_y + self._mean_y
 
         return surrogate_predictions_to_dict(y, self.keys, self.n)

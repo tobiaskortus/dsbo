@@ -5,7 +5,7 @@ import uuid
 from typing import TYPE_CHECKING, Optional, List, Dict
 
 import time
-from sqlalchemy import Double, Column, LargeBinary, JSON
+from sqlalchemy import Double, Column, LargeBinary, JSON, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 if TYPE_CHECKING:
@@ -85,13 +85,17 @@ class Trial(SQLModel, table=True):
 
 
 class ArtifactEntry(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("name", "root", "version", name="uq_artifact_name_root_version"),
+    )
     id:           str           = Field(default_factory=_new_id, primary_key=True)
     name:         str           = Field(index=True)
     type:         str
     version:      int
+    root:         str           = Field(default="", index=True)
     step:         int | None    = Field(default=None)
     stage:        str | None    = Field(default=None)
     meta:         dict          = Field(sa_column=Column("metadata", JSON, default=dict))
     created_at:   float         = Field(sa_column=Column(Double), default_factory=time.time)
-    artifact_dir: str
+    artifact_dir: str           = Field(default="")
     filepath:     str | None    = Field(default=None)

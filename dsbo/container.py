@@ -549,7 +549,7 @@ def get_runtime_for_type(container_type: ContainerType, image: str,
 
 
 def warm_container_dependencies(workflow: "Workflow", verbose: bool = True) -> dict[ImageRef | ImageFile | DefinitionFile, str]:
-    from tqdm import tqdm
+    from tqdm.auto import tqdm
     from dsbo.modules.fused import inner_module
 
     result = dict.fromkeys(

@@ -5,10 +5,9 @@ import numpy as np
 import h5py
 from abc import ABC, abstractmethod
 import torch.autograd.forward_ad as fw
-from torch.utils.data import DataLoader
 from torch.utils.hooks import RemovableHandle
 
-from dsbo.utils.io.workdir import AbstractFilePath
+from dsbo.utils.io.datasets.views import DatasetView, HDF5DatasetView, InMemoryDatasetView
 
 
 class AutogradFileInterface(ABC):
@@ -83,6 +82,22 @@ class AutogradFileInterface(ABC):
         pass
 
     @classmethod
+    def columns(cls, fpath: str) -> list[str]:
+        pass
+
+    @classmethod
+    @abstractmethod
+    def write_named_datasets(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        #TODO: I dont really like this conceptually but lets keep it for now.
+        pass
+
+    @classmethod
+    @abstractmethod
+    def open_dataset(cls, fpath: str, prefix: str | None = None) -> DatasetView:
+        pass
+
+
+    @classmethod
     def write_backward_gradient(cls, gradient: np.ndarray, fpath: str, columns: list[str] | None = None):
         if fpath not in cls.handles:
             raise RuntimeError(
@@ -99,16 +114,6 @@ class AutogradFileInterface(ABC):
 
     @classmethod
     @abstractmethod
-    def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
-        pass
-
-    @classmethod
-    @abstractmethod
-    def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
-        pass
-
-    @classmethod
-    @abstractmethod
     def read_backward_gradient(cls, fpath: str) -> torch.Tensor:
         pass
 
@@ -117,9 +122,23 @@ class AutogradFileInterface(ABC):
         raise NotImplementedError(f"{cls.__name__} does not support file reduction.")
 
     @classmethod
+    def shape_from_path(cls, path: str) -> tuple[int, ...]:
+        return cls.open_primal(path).shape
+
+    @classmethod
     def _gradient_path(cls, fpath: str) -> str:
         base, stem = os.path.splitext(fpath)
         return f"{base}_gradient{stem}"
+
+    @classmethod
+    @abstractmethod
+    def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
+        pass
+
+    @classmethod
+    @abstractmethod
+    def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
+        pass
 
     @classmethod
     def _get_primal_tangent(cls, input: torch.Tensor | tuple[np.ndarray | torch.Tensor, ...]) -> tuple[np.ndarray, np.ndarray | None]:
@@ -188,6 +207,32 @@ class HDF5File(AutogradFileInterface):
     @classmethod
     def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray, columns: list[str] | None = None):
         cls._write_datasets(fpath, columns=columns, primal=primal, tangent=tangent)
+
+    @classmethod
+    def write_named_datasets(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        if not datasets:
+            return
+        os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
+        with h5py.File(fpath, "a", libver="latest") as file:
+            for path, value in datasets.items():
+                parent_path, name = os.path.split(path)
+                if not name:
+                    raise ValueError(f"Invalid HDF5 dataset path: '{path}'.")
+                parent = file.require_group(parent_path) if parent_path else file
+                if name in parent:
+                    del parent[name]
+                cls._create_dataset(parent, name, value)
+
+    @classmethod
+    def open_dataset(cls, fpath: str, prefix: str | None = None) -> DatasetView:
+        cls.validate(fpath)
+        return HDF5DatasetView(fpath, prefix=prefix)
+
+    @classmethod
+    def columns(cls, fpath: str) -> list[str]:
+        with h5py.File(fpath, "r") as file:
+            primal = file["primal"]
+            return cls._stored_columns(primal) if isinstance(primal, h5py.Group) else []
 
     @classmethod
     def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
@@ -368,14 +413,21 @@ class HDF5File(AutogradFileInterface):
         with h5py.File(destination, "w", libver="latest") as output:
             output.attrs[cls.VDS_SOURCES_ATTRIBUTE] = json.dumps(relative_sources)
             with h5py.File(sources[0], "r") as first_source:
-                for name in cls.DATASETS:
-                    if name in first_source and isinstance(first_source[name], h5py.Group):
-                        group = output.require_group(name)
-                        group.attrs[cls.COLUMNS_ATTRIBUTE] = json.dumps(cls._stored_columns(first_source[name]))
+                cls._copy_group_attributes(first_source, output)
             for dataset_name in sorted(dataset_names):
                 shapes = [m[dataset_name][0] for m in metadata]
                 dtype = metadata[0][dataset_name][1]
                 cls._write_vds(output, dataset_name, relative_sources, shapes, dtype)
+
+    @classmethod
+    def _copy_group_attributes(cls, source: h5py.Group, target: h5py.Group) -> None:
+        for name, value in source.items():
+            if not isinstance(value, h5py.Group):
+                continue
+            if cls.COLUMNS_ATTRIBUTE in value.attrs:
+                target_group = target.require_group(name)
+                target_group.attrs[cls.COLUMNS_ATTRIBUTE] = value.attrs[cls.COLUMNS_ATTRIBUTE]
+            cls._copy_group_attributes(value, target[name] if name in target else target.create_group(name))
 
     @classmethod
     def _collect_metadata(cls, sources: list[str]) -> list[dict[str, tuple[tuple[int, ...], str]]]:
@@ -391,21 +443,13 @@ class HDF5File(AutogradFileInterface):
                 )
             try:
                 with h5py.File(source, "r") as file:
-                    if "primal" not in file:
-                        raise ValueError(f"HDF5 source '{source}' has no 'primal' dataset.")
-                    source_metadata = {}
-                    for name in cls.DATASETS:
-                        if name not in file:
-                            continue
-                        value = file[name]
-                        if isinstance(value, h5py.Dataset):
-                            source_metadata[name] = (value.shape, value.dtype)
-                            continue
-                        for column in cls._stored_columns(value):
-                            column_value = value[column]
-                            if not isinstance(column_value, h5py.Dataset):
-                                raise ValueError(f"HDF5 source '{source}' has invalid column '{name}/{column}'.")
-                            source_metadata[f"{name}/{column}"] = (column_value.shape, column_value.dtype)
+                    source_metadata: dict[str, tuple[tuple[int, ...], str]] = {}
+                    file.visititems(
+                        lambda name, obj: source_metadata.update([(name, (obj.shape, obj.dtype))])
+                        if isinstance(obj, h5py.Dataset) else None
+                    )
+                    if not source_metadata:
+                        raise ValueError(f"HDF5 source '{source}' contains no datasets.")
                     metadata.append(source_metadata)
             except OSError:
                 raise TypeError(
@@ -423,6 +467,9 @@ class HDF5File(AutogradFileInterface):
         shapes: list[tuple[int, ...]],
         dtype: str,
     ) -> None:
+        parent, _ = os.path.split(dataset_name)
+        if parent:
+            output.require_group(parent)
         if shapes[0] == ():
             cls._validate_shapes(dataset_name, shapes)
             layout = h5py.VirtualLayout(shape=(len(shapes),), dtype=dtype)
@@ -450,10 +497,44 @@ class HDF5File(AutogradFileInterface):
                 f"Cannot reduce HDF5 dataset '{dataset_name}' with incompatible shapes: {shapes}."
             )
 
+    @classmethod
+    def shape_from_path(cls, path: str) -> tuple[int, ...]:
+        with h5py.File(path, "r") as f:
+            return f["primal"].shape
+
 class InMemoryFile(AutogradFileInterface):
     """A simple in-memory file interface for reverse-mode AD without actual file I/O.
     Does only work for simple workflows with local execution without dask workers."""
     _storage: dict[str, torch.Tensor] = {}
+    _named_storage: dict[str, dict[str, torch.Tensor]] = {}
+
+    @classmethod
+    def write_named_datasets(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        stored = cls._named_storage.setdefault(fpath, {})
+        stored.update({key: torch.from_numpy(value) for key, value in datasets.items()})
+
+    @classmethod
+    def open_dataset(cls, fpath: str, prefix: str | None = None) -> DatasetView:
+        if prefix is not None:
+            return InMemoryDatasetView(cls._named_storage[fpath], prefix=prefix)
+
+        datasets: dict[str, torch.Tensor] = {}
+        named = cls._named_storage.get(fpath)
+        if named:
+            datasets.update(named)
+        if fpath in cls._storage:
+            value = cls._storage[fpath]
+            if isinstance(value, dict):
+                datasets.update(
+                    {
+                        key: tensor
+                        for key, tensor in value.items()
+                        if isinstance(tensor, torch.Tensor)
+                    }
+                )
+            else:
+                datasets.setdefault("primal", value)
+        return InMemoryDatasetView(datasets)
 
     @classmethod
     def open_primal(cls, fpath: str, columns: list[str] | None = None) -> np.ndarray:
@@ -484,6 +565,13 @@ class InMemoryFile(AutogradFileInterface):
         }
 
     @classmethod
+    def columns(cls, fpath: str) -> list[str]:
+        value = cls._storage[fpath]
+        if isinstance(value, dict):
+            return [k for k in value if k != "tangent"]
+        return []
+
+    @classmethod
     def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
         return cls._storage[grad_path]
 
@@ -494,17 +582,3 @@ class InMemoryFile(AutogradFileInterface):
     @classmethod
     def read_backward_gradient(cls, fpath: str) -> torch.Tensor:
         return torch.tensor(cls._storage[cls._gradient_path(fpath)]).float()
-
-
-class AutogradFileStorage(AutogradFileInterface):
-    @classmethod
-    @abstractmethod
-    def to_data_loader(
-        cls,
-        data_fpath_abstract: AbstractFilePath,
-        cond_fpath_abstract: AbstractFilePath,
-        batch_size: int = 64,
-        shuffle: bool = True,
-        num_workers: int = 0,
-    ) -> DataLoader:
-       pass

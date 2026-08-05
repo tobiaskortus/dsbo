@@ -370,6 +370,13 @@ class DependencyGroup:
         for node, tmpl in node_to_template.items():
             template_to_nodes.setdefault(tmpl, []).append(node)
         return template_to_nodes
+
+    def relabel(self, mapping: dict[ModuleDslMixin, ModuleDslMixin]) -> DependencyGroup:
+        node_to_template = {
+            mapping.get(node, node): template
+            for node, template in self.node_to_template.items()
+        }
+        return DependencyGroup(self.template, self.count, node_to_template)
     
 
 class AnnotatedDependencyGroup:

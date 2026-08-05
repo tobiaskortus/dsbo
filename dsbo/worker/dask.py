@@ -11,9 +11,8 @@ from dask.delayed import Delayed, delayed
 from dask.distributed import Client, Future
 
 import dsbo
-from dask_jobqueue.local import LocalCluster
-from contextlib import contextmanager, nullcontext
-from dsbo.autograd import SerializedTensor, _pack, _unpack
+from contextlib import contextmanager
+from dsbo.autograd import _pack, _unpack
 from dask_heterogeneous.hybrid import HybridCluster
 from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
@@ -29,6 +28,14 @@ dask.config.set({
     "distributed.worker.memory.pause": 0.95,
     "distributed.worker.memory.terminate": 0.98,
 })
+
+
+def _pack_tensor(t: torch.Tensor | None):
+    return None if t is None else _pack({"value": t})["value"]
+
+
+def _unpack_tensor(t):
+    return None if t is None else _unpack({"value": t})["value"]
 
 
 class DaskWorkerBase:
@@ -78,6 +85,7 @@ class DaskWorkerBase:
         module: Module,
         design: dict,
         dependencies: Iterable = (),
+        design_tensor: torch.Tensor | None = None,
         priority: int | None = None,
         file_overlays=None,
     ) -> tuple[uuid.UUID, Delayed]:
@@ -86,6 +94,7 @@ class DaskWorkerBase:
         workdir = getattr(get_workdir(), "workdir_root", None)
         resources = getattr(module.resources, "resources", None)
         packed_design = _pack(design)
+        packed_design_tensor = _pack_tensor(design_tensor)
 
         is_forward_ad = fw._current_level > -1
         is_grad_enabled = torch.is_grad_enabled()
@@ -94,9 +103,9 @@ class DaskWorkerBase:
 
         task_id = uuid.uuid4()
 
-        def _module_wrapper(module, design_arg, *deps):
+        def _module_wrapper(module, design_arg, design_tensor_arg, *deps):
             dsbo.config._set(config_state)
-            packed_result = module.run(
+            task_kwargs = dict(
                 design=design_arg,
                 workdir=workdir,
                 suffix=suffix,
@@ -107,11 +116,15 @@ class DaskWorkerBase:
                 pack_result=is_forward_ad,
                 unpack_design=True,
             )
+            design_tensor = _unpack_tensor(design_tensor_arg)
+            if design_tensor is not None:
+                task_kwargs["design_tensor"] = design_tensor
+            packed_result = module.run(**task_kwargs)
             return task_id, packed_result
 
         with dask.annotate(resources=(resources or {}), priority=priority):
             delayed_obj = delayed(_module_wrapper, name=module.name)(
-                module, packed_design, *dependencies
+                module, packed_design, packed_design_tensor, *dependencies
             )
 
         return task_id, delayed_obj

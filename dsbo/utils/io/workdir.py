@@ -19,7 +19,13 @@ def _is_dry_run():
 class DefaultPaths(str, Enum):
     SIMULATION = "simulation"
     RECONSTRUCTION = "reconstruction"
+    SURROGATE = "surrogate"
     LOGS = "logs"
+    TRAINING_RECORDS = "result_records"
+
+
+class DefaultFilenames(str, Enum):
+    RESULTS = "results.h5"
 
 @dataclass(frozen=True)
 class PathInfo:

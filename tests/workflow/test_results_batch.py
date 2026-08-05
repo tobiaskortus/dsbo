@@ -46,3 +46,16 @@ class TestResultsBatch:
         assert isinstance(values, torch.Tensor)
         assert values.shape == (4,)
         torch.testing.assert_close(values, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+
+    def test_from_tensor(self):
+        batch = ResultsBatch.from_tensor(
+            torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            keys=["scalar", "vector"],
+            splits=[1, 2],
+            is_scalar={"scalar": True, "vector": False},
+        )
+
+        torch.testing.assert_close(batch[0]["scalar"], torch.tensor(1.0))
+        torch.testing.assert_close(batch[0]["vector"], torch.tensor([2.0, 3.0]))
+        torch.testing.assert_close(batch[1]["scalar"], torch.tensor(4.0))
+        torch.testing.assert_close(batch[1]["vector"], torch.tensor([5.0, 6.0]))
