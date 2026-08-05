@@ -23,6 +23,10 @@ class SimpleModule(Module):
         return {"metric_name": result}
 ```
 
+!!! warning "Modules are stateless"
+
+    Module tasks run on workers as short-lived processes. Any state you assign to `self` during a task — for example a trained model stored on `self` — lives only on that worker's process and is lost once the task finishes; mutations do not propagate back to the client. Treat modules as stateless: keep everything that must outlive a task in durable storage (write files via `Workdir` / artifact storage) and pass references (paths, artifact refs) to the next task, which loads them on demand.
+
 ## Module with File I/O
 
 Most modules read and write files. Use `Workdir.register_file()` to declare the files your module uses, then call the returned callable at runtime to get the resolved path:
