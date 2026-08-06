@@ -1,24 +1,51 @@
 from __future__ import annotations
 
+import os
+import networkx as nx
 from contextlib import contextmanager
 from typing import Iterable, Iterator, TYPE_CHECKING, Sequence
 
-import networkx as nx
-
+from dsbo.modules.utils import ResultRecorder
+from dsbo.workflow.runner import candidate_subdirs
+from dsbo.utils.io import Workdir, get_subdir, get_workdir
 from dsbo.workflow.graph_context import WorkflowExecutionGraphContext, WorkflowGraphExecutionStateState
 from dsbo.surrogates.graph_transformations import (
     GraphMode,
+    SurrogateTrainingPlan,
     build_module_surrogate_eval_graph,
     build_module_surrogate_training_plan,
     build_workflow_surrogate_training_plan,
 )
-from dsbo.utils.io import Workdir
 
 if TYPE_CHECKING:
     from dsbo.modules import Module
     from dsbo.parameters import Candidate
     from dsbo.surrogates import SurrogateBase
     from dsbo.surrogates.workflow_surrogate import WorkflowSurrogate
+
+
+def _reset_stale_records(plan: SurrogateTrainingPlan) -> None:
+    """Remove stale datasets from reused directories (e.g. during development/debugging) 
+    such that they cannot leak into new surrogate training."""
+    record = plan.record_path
+    if record is None:
+        return
+
+    filenames = {record.filename} | {
+        record.filename_for((str(node.i),))
+        for node in plan.graph.nodes()
+        if isinstance(node, ResultRecorder) and node.i is not None
+    }
+
+    
+    base = os.path.join(get_workdir().root, get_subdir(), record.pathname)
+
+    for batch in candidate_subdirs(len(plan.candidates)):
+        record_dir = os.path.join(base, batch) if batch else base
+        for filename in filenames:
+            path = os.path.join(record_dir, filename)
+            if os.path.exists(path):
+                os.remove(path)
 
 
 class SurrogateTrainingContext:
@@ -57,6 +84,9 @@ class SurrogateTrainingContext:
                             
             plan = training_plans[mode](self._default_graph, self._dependency_groups, self._surrogate,
                                         self._training_task, candidates)
+
+            if plan.record_path is not None:
+                _reset_stale_records(plan)
 
             state = WorkflowGraphExecutionStateState(mode, plan.graph, plan)
             

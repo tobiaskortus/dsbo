@@ -21,7 +21,7 @@ from dsbo.surrogates.graph_transformations import (
     build_workflow_surrogate_training_plan,
 )
 
-from tests.workflow.conftest import SimpleModule
+from tests.surrogates.conftest import SimpleModule
 
 
 class _Strategy(SurrogateStrategy):

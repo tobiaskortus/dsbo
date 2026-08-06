@@ -7,11 +7,11 @@ from typing import Iterable, TYPE_CHECKING
 import networkx as nx
 
 from dsbo.modules import Module
-from dsbo.modules.dsl import ModuleDslMixin
-from dsbo.modules.fused import BatchFusedModule, batch_fuse, is_batch_fused
-from dsbo.modules.utils import ResultRecorder
 from dsbo.utils.io import Workdir
-from dsbo.utils.io.workdir import DefaultFilenames, DefaultPaths
+from dsbo.modules.dsl import ModuleDslMixin
+from dsbo.modules.utils import ResultRecorder
+from dsbo.modules.fused import BatchFusedModule, batch_fuse, is_batch_fused
+from dsbo.utils.io.workdir import AbstractFilePath, DefaultFilenames, DefaultPaths
 
 if TYPE_CHECKING:
     from dsbo.parameters import CandidateBatch
@@ -32,6 +32,7 @@ class SurrogateTrainingPlan:
     graph: nx.DiGraph
     trainer: BatchFusedModule | None
     train_submodule: Module | None
+    record_path: AbstractFilePath | None = None
 
     @property
     def candidates(self):
@@ -237,4 +238,4 @@ def build_workflow_surrogate_training_plan(
     _attach_training_sink(G, train_fused)
     G._dependency_groups = tuple(dg.relabel(node_to_recorder) for dg in dependency_groups)
 
-    return SurrogateTrainingPlan(G, train_fused, training_task)
+    return SurrogateTrainingPlan(G, train_fused, training_task, record_path)
