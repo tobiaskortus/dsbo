@@ -141,8 +141,13 @@ class DaskWorkerBase:
         def _backward_wrapper(module, candidate, *deps):
             dsbo.config._set(config_state)
             grad_candidate = candidate.detach().requires_grad_()
+            design_tensor = grad_candidate.tensor if getattr(module, "requires_design_tensor", False) else None
             with torch.enable_grad():
-                module.run_backward(grad_candidate.values, grad_output, workdir=workdir, suffix=suffix, subdir=subdir)
+                module.run_backward(
+                    grad_candidate.values, grad_output,
+                    design_tensor=design_tensor,
+                    workdir=workdir, suffix=suffix, subdir=subdir,
+                )
             return task_id, grad_candidate.grad.clone() if grad_candidate.grad is not None else None
 
         with dask.annotate(resources=(resources or {}), priority=priority):

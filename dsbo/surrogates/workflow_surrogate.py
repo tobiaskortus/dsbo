@@ -279,3 +279,12 @@ class DefaultWorkflowSurrogate(WorkflowSurrogate):
             y = y * self._std_y + self._mean_y
 
         return surrogate_predictions_to_dict(y, self.keys, self.n)
+
+    def backward(self, design, grad_output=None, design_tensor=None) -> None:
+        if grad_output is None:
+            return
+        keys = list(grad_output.keys())
+        results = self(design, design_tensor=design_tensor)
+        tensors = [results[k] for k in keys]
+        grad_tensors = [grad_output[k] for k in keys]
+        torch.autograd.backward(tensors, grad_tensors)

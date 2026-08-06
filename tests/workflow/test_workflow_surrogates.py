@@ -8,7 +8,7 @@ from dsbo.utils.io import Workdir, Input
 from dsbo.utils.cache import CacheConfig, CachePolicy
 from dsbo.surrogates import SurrogateBase, SurrogateStrategy
 from dsbo.surrogates.graph_transformations import GraphMode
-from dsbo.workflow import Workflow
+from dsbo.workflow import Workflow, RunBatchAutogradFn
 from dsbo.surrogates.workflow_surrogate import DefaultWorkflowSurrogate
 from tests.workflow.conftest import SimpleModule, SurrogateModule, FailingModule
 from dsbo.workflow.workflow import ResultsBatch
@@ -204,6 +204,26 @@ class TestRunWorkflowWithSurrogate:
         assert torch.equal(result["a"], torch.tensor([1.0, 3.0, 5.0]))
         assert torch.equal(result["b"], torch.tensor([2.0, 4.0, 6.0]))
 
+    def test_mlp_workflow_surrogate_backward(self):
+        surrogate = DefaultWorkflowSurrogate(MagicMock())
+        surrogate.keys = ["out"]
+        surrogate.n = 1
+        model = torch.nn.Linear(1, 1)
+        with torch.no_grad():
+            model.weight.fill_(2.0)
+            model.bias.fill_(0.0)
+
+        design_tensor = torch.tensor([3.0], requires_grad=True)
+
+        with patch.object(surrogate, "get_runtime_model", return_value=model):
+            surrogate.backward(
+                {"x": torch.tensor(0.0)},
+                {"out": torch.tensor([1.0])},
+                design_tensor=design_tensor,
+            )
+
+        assert torch.allclose(design_tensor.grad, torch.tensor(2.0))
+
     def test_workflow_surrogate(self, single_module_workflow, candidate):
         surrogate = WorkflowSurrogateModule()
         surrogate._is_pretrained = True
@@ -221,6 +241,28 @@ class TestRunWorkflowWithSurrogate:
         assert len(results) == len(candidates)
         for result in results:
             assert torch.allclose(result["out"], torch.tensor(42.0))
+
+    def test_workflow_surrogate_backward_routes_through_saved_context(self, single_module_workflow, candidate):
+        surrogate = WorkflowSurrogateModule()
+        surrogate._is_pretrained = True
+        single_module_workflow.patch(surrogate)
+
+        seen_modes = []
+
+        def _tracking_reverse(workflow, *args, **kwargs):
+            seen_modes.append(workflow.graph_context.mode)
+            return [torch.zeros_like(candidate.tensor)]
+
+        with patch("dsbo.workflow.runner.run_batch_reverse_autograd", side_effect=_tracking_reverse):
+            x = torch.tensor([[3.0]], requires_grad=True)
+            with single_module_workflow.surrogate_execution.use_surrogates_if_available([candidate]):
+                vals, keys, _, _ = RunBatchAutogradFn.apply(
+                    single_module_workflow, x, candidate.space, (),
+                )
+                vals.sum().backward()
+
+        assert seen_modes == [GraphMode.WORKFLOW_SURROGATE_EVAL]
+        assert single_module_workflow.graph_context.mode == GraphMode.DEFAULT
 
     def test_module_surrogate(self, candidate):
         m = SimpleModule()

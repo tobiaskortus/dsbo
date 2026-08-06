@@ -191,7 +191,7 @@ def run_batch_reverse_autograd(
 
     G = workflow.task_graph
     tasks_rev = list(reversed(list(nx.topological_sort(G))))
-    pbar = tqdm(total=len(candidates) * len(tasks_rev))
+    progress = tqdm(total=len(candidates) * len(tasks_rev), desc=f"Running workflow (reverse) [{workflow.graph_context.mode.value}]", unit="tasks")
 
     if worker is None:
         gradients = []
@@ -205,7 +205,13 @@ def run_batch_reverse_autograd(
                         if task._no_grad_op:
                             continue
 
-                        task.run_backward(grad_candidate.values, candidate_grad_output if is_sink else None)
+                        design_tensor = grad_candidate.tensor if getattr(task, "requires_design_tensor", False) else None
+                        task.run_backward(
+                            grad_candidate.values,
+                            candidate_grad_output if is_sink else None,
+                            design_tensor=design_tensor,
+                        )
+                        progress.update()
                 gradients.append(
                     grad_candidate.grad.clone() if grad_candidate.grad is not None else torch.zeros_like(candidate.tensor)
                 )
@@ -213,6 +219,7 @@ def run_batch_reverse_autograd(
                 gradients.append(torch.zeros_like(candidate.tensor))
                 if not isinstance(e, catch):
                     raise
+        progress.close()
         return gradients
     else:
         batch_delays = []
@@ -260,8 +267,10 @@ def run_batch_reverse_autograd(
 
         futures_computed = worker.compute(batch_delays)
         for f in futures_computed:
-            f.add_done_callback(lambda _: pbar.update())
+            f.add_done_callback(lambda _: progress.update())
+            
         results_flat = worker.gather(futures_computed, catch=catch)
+        progress.close()
         lookup = {tid: grad for tid, grad in results_flat if grad is not None}
 
         gradients = []
@@ -295,6 +304,7 @@ class RunBatchAutogradFn(torch.autograd.Function):
         ctx.workflow = workflow
         ctx.space = space
         ctx.save_for_backward(design_tensors)
+        ctx.graph_state = workflow.graph_context.current
 
         candidates = candidates_from_tensor(design_tensors, space)
 
@@ -346,7 +356,8 @@ class RunBatchAutogradFn(torch.autograd.Function):
             grad_flat, ctx.result_keys, ctx.splits, ctx.result_is_scalar
         )
 
-        gradients = run_batch_reverse_autograd(ctx.workflow, candidates, grad_outputs, catch=(RuntimeError,))
+        with ctx.workflow.graph_context.use(ctx.graph_state):
+            gradients = run_batch_reverse_autograd(ctx.workflow, candidates, grad_outputs, catch=(RuntimeError,))
         return None, torch.stack(gradients, dim=0), None, None
 
 

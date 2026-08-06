@@ -124,11 +124,14 @@ class Module(ModuleDslMixin, ABC):
                 return self(design=design, **kwargs)
 
     @with_remote_workdir
-    def run_backward(self, design: dict, grad_output: dict | None = None) -> None:
+    def run_backward(self, design: dict, grad_output: dict | None = None, design_tensor: torch.Tensor | None = None) -> None:
         with Workdir.use_file_suffix(str(self.i)) if self.i is not None else nullcontext():
-            self.backward(design, grad_output)
+            if design_tensor is None:
+                self.backward(design, grad_output)
+            else:
+                self.backward(design, grad_output, design_tensor=design_tensor)
 
-    def backward(self, design: dict, grad_output: dict | None = None) -> None:
+    def backward(self, design: dict, grad_output: dict | None = None, **kwargs) -> None:
         pass
 
     def to(self, resource: WorkerSpec) -> Module:
