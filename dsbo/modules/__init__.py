@@ -101,6 +101,7 @@ class Module(ModuleDslMixin, ABC):
 
     def patch(self, surrogate: ModuleSurrogate):
         surrogate.register_contract(self.surrogate_contract)
+        self.surrogate = surrogate
         surrogate.model_file_path = Output(
             Workdir.register_file(
                 DefaultPaths.SURROGATE,

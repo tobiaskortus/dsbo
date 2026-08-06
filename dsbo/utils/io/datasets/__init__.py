@@ -3,9 +3,10 @@ from dsbo.utils.io.datasets.datasets import (
     SurrogateDataset,
     WorkflowSurrogateDataset,
 )
-from dsbo.utils.io.datasets.views import DatasetView
+from dsbo.utils.io.datasets.views import ColumnGroupDatasetView, DatasetView
 
 __all__ = [
+    "ColumnGroupDatasetView",
     "DatasetView",
     "ModuleSurrogateDataset",
     "SurrogateDataset",

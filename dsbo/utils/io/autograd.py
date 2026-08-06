@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 import torch.autograd.forward_ad as fw
 from torch.utils.hooks import RemovableHandle
 
-from dsbo.utils.io.datasets.views import DatasetView, HDF5DatasetView, InMemoryDatasetView
+from dsbo.utils.io.datasets.views import DatasetView, HDF5DatasetView, InMemoryDatasetView, HDF5ColumnGroupDatasetView
 
 
 class AutogradFileInterface(ABC):
@@ -226,6 +226,10 @@ class HDF5File(AutogradFileInterface):
     @classmethod
     def open_dataset(cls, fpath: str, prefix: str | None = None) -> DatasetView:
         cls.validate(fpath)
+        if prefix is None:
+            with h5py.File(fpath, "r") as file:
+                if isinstance(file.get("primal"), h5py.Group):
+                    return HDF5ColumnGroupDatasetView(fpath)
         return HDF5DatasetView(fpath, prefix=prefix)
 
     @classmethod
@@ -500,7 +504,15 @@ class HDF5File(AutogradFileInterface):
     @classmethod
     def shape_from_path(cls, path: str) -> tuple[int, ...]:
         with h5py.File(path, "r") as f:
-            return f["primal"].shape
+            primal = f["primal"]
+            if isinstance(primal, h5py.Dataset):
+                return tuple(primal.shape)
+            columns = cls._stored_columns(primal)
+            if not columns:
+                raise ValueError(f"HDF5 dataset '{path}' contains no columns under 'primal'.")
+            template = primal[columns[0]]
+            num_samples = 1 if template.shape == () else template.shape[0]
+            return (num_samples, len(columns))
 
 class InMemoryFile(AutogradFileInterface):
     """A simple in-memory file interface for reverse-mode AD without actual file I/O.

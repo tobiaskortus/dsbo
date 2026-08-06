@@ -7,17 +7,17 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-
 from diffusers.schedulers import DDPMScheduler, DDIMScheduler
 
-from dsbo.modules import Module, dynamic_submodule
-from dsbo.config import get_active_file_backend
 from dsbo.utils.io import Input
+from dsbo.autograd import train_op
+from dsbo.config import get_active_file_backend
+from dsbo.modules import Module, dynamic_submodule
 from dsbo.utils.io.autograd import AutogradFileInterface
 from dsbo.utils.io.datasets import ModuleSurrogateDataset
-from dsbo.utils.io.workdir import AbstractFilePath, PathAnnotation
 from dsbo.surrogates import SurrogateBase, SurrogateStrategy
 from dsbo.surrogates.diffusion import MlpDiffusion1D, Trainer
+from dsbo.utils.io.workdir import AbstractFilePath, PathAnnotation
 
 
 class LazyShape(tuple):
@@ -293,6 +293,7 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
         return diffusion_model
 
 
+    @train_op
     @dynamic_submodule
     def train(self, design, candidates):
         model_file_path = self.model_file_path() if callable(self.model_file_path) else self.model_file_path

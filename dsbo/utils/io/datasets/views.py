@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import h5py
+import json
+import torch
+import numpy as np
 from typing import Callable
 from abc import ABC, abstractmethod
 
-import h5py
-import torch
 
 
 class RowSource:
@@ -56,6 +58,34 @@ class DatasetView(ABC):
         self.close()
 
 
+class ColumnGroupDatasetView(DatasetView):
+    def __init__(self, group_name: str = "primal"):
+        self._group_name = group_name
+        self._keys = (group_name,)
+        self.columns: tuple[str, ...] = ()
+        self.num_samples: int = 0
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return self._keys
+
+    def shape(self, key: str) -> tuple[int, ...]:
+        return (self.num_samples, len(self.columns))
+
+    def read(self, key: str, index: int | slice):
+        return np.stack(
+            [np.asarray(self._read_column(column, index)) for column in self.columns],
+            axis=-1,
+        )
+
+    def partition_sizes(self, key: str) -> tuple[int, ...]:
+        return (self.num_samples,)
+
+    @abstractmethod
+    def _read_column(self, column: str, index: int | slice):
+        ...
+
+
 class HDF5DatasetView(DatasetView):
     def __init__(self, fpath: str, prefix: str | None = None):
         self._file = h5py.File(fpath, "r")
@@ -97,6 +127,36 @@ class HDF5DatasetView(DatasetView):
                 counts.append(end[0] - start[0] + 1)
             return tuple(counts)
         return (1 if dataset.shape == () else dataset.shape[0],)
+
+    def close(self) -> None:
+        self._file.close()
+
+
+class HDF5ColumnGroupDatasetView(ColumnGroupDatasetView):
+    def __init__(self, fpath: str, group_name: str = "primal"):
+        from dsbo.utils.io.autograd import HDF5File
+        self._file = h5py.File(fpath, "r")
+        try:
+            group = self._file[group_name]
+            if not isinstance(group, h5py.Group):
+                raise ValueError(f"HDF5 dataset '{group_name}' is not a group of named columns.")
+            stored = group.attrs.get(HDF5File.COLUMNS_ATTRIBUTE)
+            columns = tuple(json.loads(stored)) if stored else tuple(group.keys())
+            if not columns:
+                raise ValueError(f"HDF5 group '{group_name}' contains no columns.")
+            template = group[columns[0]]
+            num_samples = 1 if template.shape == () else template.shape[0]
+        except Exception:
+            self._file.close()
+            raise
+
+        super().__init__(group_name=group_name)
+        self.columns = columns
+        self.num_samples = num_samples
+        self._group = group
+
+    def _read_column(self, column: str, index: int | slice):
+        return np.asarray(self._group[column][index])
 
     def close(self) -> None:
         self._file.close()
