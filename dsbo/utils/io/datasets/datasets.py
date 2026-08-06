@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-import numpy as np
 import torch
+import numpy as np
+from typing import TYPE_CHECKING
 from torch.utils.data import Dataset
+
+from dsbo.utils.io.datasets.views import RowSource
 
 if TYPE_CHECKING:
     from dsbo.utils.io.autograd import AutogradFileInterface
-    from dsbo.utils.io.datasets.views import DatasetView, RowSource
+    from dsbo.utils.io.datasets.views import DatasetView
 
 
 class SurrogateDataset(Dataset):
