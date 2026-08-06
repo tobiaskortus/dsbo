@@ -128,8 +128,8 @@ class SurrogateLifecycle:
                 )
 
     @contextmanager
-    def use_surrogates_if_available(self, candidates: Sequence[Candidate]):
-        if self._graph_context.mode != GraphMode.DEFAULT:
+    def use_surrogates_if_available(self, candidates: Sequence[Candidate], use_surrogates: bool = True):
+        if not use_surrogates or self._graph_context.mode != GraphMode.DEFAULT:
             #TODO: Should nested contexts raise an exception?
             yield
             return

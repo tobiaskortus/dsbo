@@ -108,23 +108,24 @@ class Workflow:
     def patch(self, surrogate: WorkflowSurrogate):
         self.surrogate_execution.set_workflow_surrogate(surrogate)
 
-    def run(self, design: Candidate, catch: tuple[type[Exception], ...] = ()) -> dict[str, float]:
-        for context in self.surrogate_execution.pending_training_sessions(design):
-            with context.activate() as candidates:
-                # Automatically runs the relevant surrogate training and writes
-                # the trained model to the artifact storage.
-                self.run_batch(candidates)
+    def run(self, design: Candidate, catch: tuple[type[Exception], ...] = (), use_surrogates: bool = True) -> dict[str, float]:
+        if use_surrogates:
+            for context in self.surrogate_execution.pending_training_sessions(design):
+                with context.activate() as candidates:
+                    # Automatically runs the relevant surrogate training and writes
+                    # the trained model to the artifact storage.
+                    self.run_batch(candidates, use_surrogates=use_surrogates)
 
-        return self.run_batch([design], catch)[0]
+        return self.run_batch([design], catch, use_surrogates)[0]
 
-    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[type[Exception], ...] = ()):
+    def run_batch(self, candidates: Sequence[Candidate], catch: tuple[type[Exception], ...] = (), use_surrogates: bool = True):
         if not candidates:
             return ResultsBatch([])
 
         # Make sure that the provided candidates are a CandidateBatch object.‚
         candidates = CandidateBatch(candidates)
 
-        with self.surrogate_execution.use_surrogates_if_available(candidates):
+        with self.surrogate_execution.use_surrogates_if_available(candidates, use_surrogates):
             
             self._warm_container_dependencies(verbose=True)
             

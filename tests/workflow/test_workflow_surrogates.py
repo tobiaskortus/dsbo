@@ -11,6 +11,7 @@ from dsbo.surrogates.graph_transformations import GraphMode
 from dsbo.workflow import Workflow
 from dsbo.surrogates.workflow_surrogate import DefaultWorkflowSurrogate
 from tests.workflow.conftest import SimpleModule, SurrogateModule, FailingModule
+from dsbo.workflow.workflow import ResultsBatch
 
 
 class WorkflowSurrogateModule(Module):
@@ -229,6 +230,52 @@ class TestRunWorkflowWithSurrogate:
 
         transition.assert_not_called()
         assert workflow.graph_context.mode == GraphMode.DEFAULT
+
+
+class TestUseSurrogatesFlag:
+    def test_run_false_skips_surrogate_training(self):
+        m = SimpleModule()
+        wf = Workflow(m)
+        surrogate = MagicMock()
+        training_task = TrainOnlySurrogate().train
+        surrogate.select_training_task.return_value = training_task
+        surrogate.generate_training_candidates.return_value = []
+        wf.patch(surrogate)
+
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        with patch.object(wf, "run_batch") as run_batch, \
+             patch.object(wf.surrogate_execution, "pending_training_sessions") as pending:
+            wf.run(cand, use_surrogates=False)
+
+        pending.assert_not_called()
+        surrogate.select_training_task.assert_not_called()
+        surrogate.generate_training_candidates.assert_not_called()
+        run_batch.assert_called_once_with([cand], (), False)
+
+    def test_run_false_stays_in_default_mode(self):
+        module = SimpleModule()
+        module.surrogate = SurrogateModule()
+        workflow = Workflow(module)
+
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        with patch.object(workflow, "run_batch", return_value=ResultsBatch([{}])):
+            workflow.run(cand, use_surrogates=False)
+
+        assert workflow.graph_context.mode == GraphMode.DEFAULT
+
+    def test_run_batch_false_does_not_trigger_surrogate_execution(self):
+        module = SimpleModule()
+        module.surrogate = SurrogateModule()
+        workflow = Workflow(module)
+
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        with torch.no_grad(), \
+             patch("dsbo.workflow.workflow.run_batch", return_value=ResultsBatch([])) as run_batch:
+            results = workflow.run_batch([cand], use_surrogates=False)
+
+        run_batch.assert_called_once()
+        assert workflow.graph_context.mode == GraphMode.DEFAULT
+        assert results == []
 
 
 class _StubStrategy(SurrogateStrategy):
