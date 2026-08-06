@@ -175,7 +175,7 @@ class TestRunWorkflowWithSurrogate:
         surrogate = DefaultWorkflowSurrogate(MagicMock())
         surrogate.keys = ["out"]
         surrogate.n = 1
-        model = MagicMock(return_value=torch.tensor([42.0]))
+        model = MagicMock(return_value=torch.tensor([[42.0]]))
         design_tensor = torch.tensor([3.0])
 
         with patch.object(surrogate, "get_runtime_model", return_value=model):
@@ -183,8 +183,26 @@ class TestRunWorkflowWithSurrogate:
                 {"x": torch.tensor(99.0)}, design_tensor=design_tensor,
             )
 
-        model.assert_called_once_with(design_tensor)
-        assert torch.equal(result["out"], torch.tensor(42.0))
+        model.assert_called_once_with(design_tensor.unsqueeze(0).repeat(1, 1))
+        assert torch.equal(result["out"], torch.tensor([42.0]))
+
+    def test_mlp_workflow_surrogate_samples_n_values_per_key(self):
+        surrogate = DefaultWorkflowSurrogate(MagicMock())
+        surrogate.keys = ["a", "b"]
+        surrogate.n = 3
+        model = MagicMock(return_value=torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
+        design_tensor = torch.tensor([3.0])
+
+        with patch.object(surrogate, "get_runtime_model", return_value=model):
+            result = surrogate(
+                {"x": torch.tensor(99.0)}, design_tensor=design_tensor,
+            )
+
+        model.assert_called_once()
+        (model_args, _) = model.call_args
+        assert torch.equal(model_args[0], design_tensor.unsqueeze(0).repeat(3, 1))
+        assert torch.equal(result["a"], torch.tensor([1.0, 3.0, 5.0]))
+        assert torch.equal(result["b"], torch.tensor([2.0, 4.0, 6.0]))
 
     def test_workflow_surrogate(self, single_module_workflow, candidate):
         surrogate = WorkflowSurrogateModule()

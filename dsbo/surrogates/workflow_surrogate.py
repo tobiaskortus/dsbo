@@ -17,10 +17,8 @@ if TYPE_CHECKING:
     from dsbo.parameters import CandidateBatch
 
 def surrogate_predictions_to_dict(tensor: torch.Tensor, keys: list[str], n: int) -> dict[str, torch.Tensor]:
-    if n > 1:
-        return {k: tensor[:, i] for i, k in enumerate(keys)}
-    
-    return {k: tensor[i] for i, k in enumerate(keys)}
+    tensor = tensor.reshape(-1, len(keys))
+    return {k: tensor[:, i] for i, k in enumerate(keys)}
 
 
 class WorkflowSurrogate(SurrogateBase):
@@ -275,6 +273,7 @@ class DefaultWorkflowSurrogate(WorkflowSurrogate):
         x = design_tensor
         if self._mean_x is not None:
             x = (design_tensor - self._mean_x) / self._std_x
+        x = x.unsqueeze(0).repeat(self.n, 1)
         y = model(x)
         if self._mean_y is not None:
             y = y * self._std_y + self._mean_y
