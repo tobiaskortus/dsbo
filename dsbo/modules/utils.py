@@ -10,8 +10,8 @@ from dsbo.utils.io.workdir import AbstractFilePath
 
 class ResultRecorder(Module):
     def __init__(self, inner: Module, record_path: AbstractFilePath):
-        object.__setattr__(self, "inner", inner)
         super().__init__()
+        self.inner = inner
         self.i = inner.i
         self._record_output = Output(record_path)
 
@@ -35,7 +35,8 @@ class ResultRecorder(Module):
 
     @resources.setter
     def resources(self, value):
-        self.inner.resources = value
+        if hasattr(self, "inner"):
+            self.inner.resources = value
 
     @property
     def name(self):
