@@ -24,6 +24,7 @@ from dask_jobqueue.local import LocalCluster
 class MockDaskWorker(DaskWorkerBase):
     def __init__(self):
         self.client = MagicMock()
+        self.client.run_on_scheduler.return_value = False
         self.cluster = MagicMock()
         self.task_counter = 0
         self.scheduled = []
