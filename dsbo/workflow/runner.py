@@ -48,13 +48,24 @@ def num_tasks_for_batch(workflow: Workflow, num_candidates: int) -> int:
     return count
 
 
-def register_task_stream(worker, graph, exec_ids, batch_path, task_map, name_map, name):
+def _update_task_stream_plugin(name, writer, task_map, name_map, tag, dask_scheduler=None):
+    plugin = dask_scheduler.plugins.get(name)
+    if plugin is None:
+        return False
+    plugin.update(writer, task_map, name_map, tag)
+    return True
+
+
+def register_task_stream(worker, graph, exec_ids, batch_path, task_map, name_map, name, tag=""):
     storage = get_current_storage()
     if storage is None:
         return
     workflow_record = storage.workflow.add_workflow(graph)
     storage.workflow.add_runs(workflow_record, exec_ids, batch_path)
-    plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map)
+    writer = storage.workflow._make_transition_writer()
+    if worker.client.run_on_scheduler(_update_task_stream_plugin, name, writer, task_map, name_map, tag):
+        return
+    plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map, tag=tag)
     worker.client.register_plugin(plugin, name=name)
 
 
@@ -158,7 +169,9 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
             task_map[delayed.key] = eids[0] if len(eids) == 1 else eids
             name_map[delayed.key] = task.name
 
-        register_task_stream(worker, task_graph, exec_ids, batch_path, task_map, name_map, "dsbo_task_stream")
+        register_task_stream(worker, task_graph, exec_ids, batch_path, 
+                             task_map, name_map, "dsbo_task_stream", 
+                             tag=workflow.graph_context.mode.value)
 
         futures = worker.compute([d for *_, d in scheduled_tasks])
 
@@ -263,6 +276,7 @@ def run_batch_reverse_autograd(
         register_task_stream(
             worker, G, exec_ids, batch_path,
             task_map, name_map, "dsbo_task_stream_bwd",
+            tag=workflow.graph_context.mode.value,
         )
 
         futures_computed = worker.compute(batch_delays)
