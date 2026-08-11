@@ -33,6 +33,7 @@ class TransitionWriter(ABC):
         exec_id: str,
         log: str,
         status: JobStatus,
+        tag: str = "",
     ) -> None:
         pass
 
@@ -41,17 +42,25 @@ _current_storage: contextvars.ContextVar[StudyStorageBase | None] = contextvars.
 
 
 @contextmanager
-def use_storage(storage: StudyStorageBase) -> Generator[StudyStorageBase, None, None]:
+def use_storage(storage: StudyStorageBase | None) -> Generator[StudyStorageBase | None, None, None]:
+    if storage is None:
+        yield None
+        return
+
     token = _current_storage.set(storage)
     try:
         yield storage
     finally:
         _current_storage.reset(token)
 
-def get_current_storage() -> Optional[StudyStorageBase]:
+
+def get_current_storage(create: bool = True) -> Optional[StudyStorageBase]:
     storage = _current_storage.get()
     if storage is not None:
         return storage
+
+    if not create:
+        return None
 
     from dsbo.storage.sqlmodel import StudyStorage
     storage = StudyStorage.create(default_storage_path())
@@ -112,11 +121,11 @@ class WorkflowStorageBase(ABC):
     def get_job_traces(self, exec_id: str, after_trace_id: Optional[int] = None) -> List[JobTrace]:
         pass
 
-    def create_task_stream_plugin(self, task_map: Dict[str, str | tuple[str, ...]] | None = None, name_map: Dict[str, str] | None = None) -> TaskStreamPlugin:
+    def create_task_stream_plugin(self, task_map: Dict[str, str | tuple[str, ...]] | None = None, name_map: Dict[str, str] | None = None, tag: str = "") -> TaskStreamPlugin:
         from dsbo.utils.plugins import TaskStreamPlugin
         if self._readonly:
             raise RuntimeError("Cannot create TaskStreamPlugin from readonly StudyStorage.")
-        return TaskStreamPlugin(writer=self._make_transition_writer(), task_map=task_map, name_map=name_map)
+        return TaskStreamPlugin(writer=self._make_transition_writer(), task_map=task_map, name_map=name_map, tag=tag)
 
     @abstractmethod
     def _make_transition_writer(self) -> TransitionWriter:

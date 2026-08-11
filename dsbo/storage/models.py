@@ -59,6 +59,7 @@ class JobTrace(SQLModel, table=True):
     stop:         float     = Field(sa_column=Column(Double), default=-1.0)
     log:          str       = Field(default="")
     status:       JobStatus
+    tag:          str       = Field(default="")
 
 
 class Intermediate(SQLModel, table=True):

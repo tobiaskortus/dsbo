@@ -22,6 +22,10 @@ from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTr
 from dsbo.utils.io.workdir import Workdir
 
 
+class StudyStorageExistsError(FileExistsError):
+    pass
+
+
 def _configure_sqlite_vec(engine: Engine, vector_dim: int) -> None:
     import sqlite_vec
 
@@ -57,6 +61,7 @@ class SQLModelTransitionWriter(TransitionWriter):
         exec_id: str,
         log: str,
         status: JobStatus,
+        tag: str = "",
     ) -> None:
         engine = create_engine(self.url, poolclass=NullPool)
         with Session(engine) as session:
@@ -80,6 +85,7 @@ class SQLModelTransitionWriter(TransitionWriter):
                         stop=stop,
                         log=log,
                         status=status,
+                        tag=tag,
                     )
                 else:
                     job_trace.status = status
@@ -97,6 +103,7 @@ class SQLModelTransitionWriter(TransitionWriter):
                 job_trace.stop = stop
                 job_trace.log = log
                 job_trace.status = status
+                job_trace.tag = tag
 
             session.add(job_trace)
 
@@ -297,6 +304,10 @@ class TrialStorage(TrialStorageBase):
         if isinstance(design_vec, torch.Tensor):
             design_vec = design_vec.detach().cpu().numpy()
 
+        objectives = self._json_scalars(objectives, "objectives")
+        if constraints is not None:
+            constraints = self._json_scalars(constraints, "constraints")
+
         arr = np.asarray(design_vec, dtype=np.float32)
         with Session(self._engine) as session:
             trial = Trial(step=int(step), design=arr.tobytes(), 
@@ -312,6 +323,19 @@ class TrialStorage(TrialStorageBase):
             self._index_design(trial_id, arr)
 
         return trial
+
+    @staticmethod
+    def _json_scalars(values: dict, name: str) -> dict:
+        result = {}
+        for key, value in values.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise ValueError(f"{name}['{key}'] must be a scalar tensor.")
+                value = value.detach().cpu().item()
+            elif isinstance(value, np.generic):
+                value = value.item()
+            result[key] = value
+        return result
 
 
     def _index_design(self, trial_id: str, arr: np.ndarray) -> None:
@@ -521,6 +545,7 @@ class StudyStorage(StudyStorageBase):
         super().__init__(db_path="")
         self._engine = engine
         self._readonly = readonly
+        self._vector_dim = vector_dim
         inspector = inspect(engine)
         if not inspector.get_table_names():  # DB is empty
             SQLModel.metadata.create_all(engine)
@@ -530,10 +555,40 @@ class StudyStorage(StudyStorageBase):
         self._intermediates_storage = IntermediatesStorage(engine, readonly)
         self._artifact_storage = ArtifactStorage("artifacts", engine)
 
+    def __getstate__(self) -> dict:
+        url = self._engine.url.render_as_string(hide_password=False)
+        if url == "sqlite:///:memory:":
+            raise TypeError("In-memory study storage cannot be shared with worker processes.")
+        return {
+            "url": url,
+            "readonly": self._readonly,
+            "vector_dim": self._vector_dim,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        url = state["url"]
+        connect_args = {"check_same_thread": False} if url.startswith("sqlite:") else {}
+        engine = create_engine(url, connect_args=connect_args)
+        vector_dim = state["vector_dim"]
+        if vector_dim is not None:
+            _configure_sqlite_vec(engine, vector_dim)
+        self.__init__(
+            engine,
+            readonly=state["readonly"],
+            vector_dim=vector_dim,
+        )
+
 
     @classmethod
     def create(cls, db_path: Path | str, *, readonly: bool = False,
                vector_dim: int | None = None) -> "StudyStorage":
+        db_path = Path(db_path).resolve()
+        if db_path.exists():
+            raise StudyStorageExistsError(
+                f"Study storage '{db_path}' already exists. Use "
+                "StudyStorage.open(...) to access the existing study."
+            )
+        
         engine = create_engine(
             f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
         )
@@ -543,7 +598,15 @@ class StudyStorage(StudyStorageBase):
 
     @classmethod
     def open(cls, db_path: Path | str, vector_dim: int | None = None) -> "StudyStorage":
-        return cls.create(db_path, readonly=True, vector_dim=vector_dim)
+        db_path = Path(db_path).resolve()
+        if not db_path.is_file():
+            raise FileNotFoundError(f"Study storage '{db_path}' does not exist.")
+        engine = create_engine(
+            f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+        )
+        if vector_dim is not None:
+            _configure_sqlite_vec(engine, vector_dim)
+        return cls(engine, readonly=True, vector_dim=vector_dim)
     
     def close(self):
         self._engine.dispose()
