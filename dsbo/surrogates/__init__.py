@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from pathlib import Path
 from abc import abstractmethod
-from typing import Any, BinaryIO, TYPE_CHECKING
+from typing import BinaryIO, TYPE_CHECKING
 
 import torch
 
@@ -15,7 +15,6 @@ from dsbo.utils.io.workdir import DefaultPaths
 from dsbo.modules import Module, dynamic_submodule
 from dsbo.parameters import ParameterSpace, Candidate
 from dsbo.surrogates.graph_transformations import GraphMode
-
 
 if TYPE_CHECKING:
     from dsbo.utils.cache import CacheConfig
@@ -49,9 +48,8 @@ class SurrogateStrategy:
 
 
 class SurrogateBase(Module):
-    def __init__(self, surrogate: Any, strategy: SurrogateStrategy):
+    def __init__(self, strategy: SurrogateStrategy):
         super().__init__()
-        self.surrogate = surrogate
         self.strategy = strategy
 
         object.__setattr__(self, "_data_path", None)
@@ -127,16 +125,16 @@ class SurrogateBase(Module):
         )
 
     def is_in_trust_region(self, candidate: Candidate) -> bool:
-            if not self.is_pretrained and not self.is_finetuned:
-                return False
-                    
-            return self.strategy.is_in_trust_region(candidate)
+        if not self.is_pretrained and not self.is_finetuned:
+            return False
+                
+        return self.strategy.is_in_trust_region(candidate)
 
     def training_stage(self, task: Module) -> str:
-            stage = self._task_stages.get(task)
-            if stage is None:
-                raise ValueError(f"{task.name} is not a lifecycle task of {type(self).__name__}.")
-            return stage.artifact_stage
+        stage = self._task_stages.get(task)
+        if stage is None:
+            raise ValueError(f"{task.name} is not a lifecycle task of {type(self).__name__}.")
+        return stage.artifact_stage
         
     def select_training_task(self, candidate: Candidate) -> Module | None:
         if self._use_cached_models() and self.is_in_trust_region(candidate):
@@ -145,11 +143,11 @@ class SurrogateBase(Module):
         return self._lifecycle_tasks[self._get_next_stage()]
 
     def get_runtime_model(self):
-            ref = self._resolve_model_ref()
-            storage = get_current_storage()
-            checkpoint = storage.artifacts.load_file(ref, "model.pt")
-            self.load_from_file(checkpoint)
-            return self.surrogate
+        ref = self._resolve_model_ref()
+        storage = get_current_storage()
+        checkpoint = storage.artifacts.load_file(ref, "model.pt")
+        self.load_from_file(checkpoint)
+        return self.surrogate
 
     def _resolve_model_ref(self) -> ArtifactRef:
         storage = get_current_storage()

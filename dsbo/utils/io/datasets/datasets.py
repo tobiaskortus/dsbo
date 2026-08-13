@@ -289,3 +289,19 @@ class WorkflowSurrogateDataset(SurrogateDataset):
             dtype=torch.float32,
         )
         return self.normalize("x", x), self.normalize("y", y)
+
+
+def design_split(n_candidates: int, rows_per_design: int, val_split: float, seed: int) -> tuple[list[int], list[int]]:
+    """Split candidates by *design* into (train, val) row indices."""
+    k = rows_per_design
+
+    def rows_of(designs: list[int]) -> list[int]:
+        return [r for c in designs for r in range(c * k, (c + 1) * k)]
+
+    if n_candidates < 2:
+        return list(range(n_candidates * k)), list(range(n_candidates * k))
+
+    perm = torch.randperm(n_candidates, generator=torch.Generator().manual_seed(seed)).tolist()
+    n_val = min(max(1, int(n_candidates * val_split)), n_candidates - 1)
+    val_designs, train_designs = perm[:n_val], perm[n_val:]
+    return rows_of(train_designs), rows_of(val_designs)

@@ -950,7 +950,7 @@ class TestRunBatchWithWorker:
         wf = Workflow(module)
         worker = MockDaskWorker()
         with WorkerContext.use_worker(worker):
-            candidates = [Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([5.0]))]
+            candidates = [Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([5.0]))]
             results = run_batch(wf, candidates)
             assert len(results) == 1
 
@@ -960,9 +960,9 @@ class TestRunBatchWithWorker:
         worker = MockDaskWorker()
         with WorkerContext.use_worker(worker):
             candidates = [
-                Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([1.0])),
-                Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([2.0])),
-                Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0])),
+                Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([1.0])),
+                Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([2.0])),
+                Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0])),
             ]
             results = run_batch(wf, candidates)
             assert len(results) == 3

@@ -182,7 +182,7 @@ class SurrogateModule(Module):
 
 @pytest.fixture
 def simple_space():
-    return ParameterSpace(x=Continuous(0, 10, 1))
+    return ParameterSpace(x=Continuous(0, 10))
 
 @pytest.fixture
 def candidate(simple_space):

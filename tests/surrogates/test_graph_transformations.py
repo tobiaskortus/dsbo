@@ -16,6 +16,7 @@ from dsbo.utils.io.workdir import DefaultPaths, DefaultFilenames
 from dsbo.surrogates import SurrogateStrategy
 from dsbo.surrogates.module_surrogate import ModuleSurrogate
 from dsbo.surrogates.workflow_surrogate import WorkflowSurrogate
+from dsbo.worker.spec import LocalWorkerSpec
 from dsbo.surrogates.graph_transformations import (
     build_module_surrogate_training_plan,
     build_workflow_surrogate_training_plan,
@@ -24,7 +25,7 @@ from dsbo.surrogates.graph_transformations import (
 from tests.surrogates.conftest import SimpleModule
 
 
-class _Strategy(SurrogateStrategy):
+class Strategy(SurrogateStrategy):
     def is_in_trust_region(self, candidate):
         return False
 
@@ -37,7 +38,7 @@ class _ModuleSurrogate(ModuleSurrogate):
     surrogates expose their lifecycle task."""
 
     def __init__(self):
-        super().__init__(surrogate=None, strategy=_Strategy())
+        super().__init__(strategy=Strategy())
         self.data_file = Input(Workdir.register_file("simulation", "events.h5"))
 
     @dynamic_submodule
@@ -53,10 +54,7 @@ class _ModuleSurrogate(ModuleSurrogate):
 
 class _WorkflowSurrogate(WorkflowSurrogate):
     def __init__(self):
-        super().__init__(surrogate=None, strategy=_Strategy())
-        self.data_path = Input(
-            Workdir.register_file(DefaultPaths.TRAINING_RECORDS, DefaultFilenames.RESULTS)
-        )
+        super().__init__(strategy=Strategy())
 
     @dynamic_submodule
     def train(self, design, **kwargs):
@@ -70,7 +68,7 @@ class _WorkflowSurrogate(WorkflowSurrogate):
 
 
 def _candidate(value=1.0):
-    return Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([value]))
+    return Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([value]))
 
 
 class TestModuleSurrogateTrainingPlan:
@@ -140,6 +138,30 @@ class TestModuleSurrogateTrainingPlan:
 
 
 class TestWorkflowSurrogateTrainingPlan:
+    def test_recorders_preserve_wrapped_node_resources(self):
+        resource = LocalWorkerSpec(cores=1, processes=1, memory="1GB")
+        module = SimpleModule().to(resource)
+        wf = Workflow(module)
+        surrogate = _WorkflowSurrogate().to(resource)
+
+        plan = build_workflow_surrogate_training_plan(
+            wf.task_graph,
+            wf.surrogate_execution.dependency_groups,
+            surrogate,
+            surrogate.train,
+            [_candidate()],
+        )
+
+        recorder = next(n for n in plan.graph if type(n).__name__ == "ResultRecorder")
+        assert recorder.resources is resource
+        assert module.resources is resource
+        assert all(node.resources is resource for node in plan.graph)
+
+        other = LocalWorkerSpec(cores=2, processes=1, memory="2GB")
+        recorder.to(other)
+        assert recorder.resources is other
+        assert module.resources is other
+
     def test_wraps_every_node_in_recorder_and_attaches_trainer(self):
         wf = Workflow(SimpleModule() * 3)
         surrogate = _WorkflowSurrogate()

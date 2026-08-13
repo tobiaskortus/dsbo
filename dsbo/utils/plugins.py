@@ -53,6 +53,7 @@ class TaskStreamPlugin(SchedulerPlugin):
     async def close(self):
         await asyncio.to_thread(self._executor.shutdown, wait=True)
 
+    @staticmethod
     def _report_write_error(future: Future) -> None:
         error = future.exception()
         if error is not None:

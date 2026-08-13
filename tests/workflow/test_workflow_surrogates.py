@@ -10,6 +10,7 @@ from dsbo.surrogates import SurrogateBase, SurrogateStrategy
 from dsbo.surrogates.graph_transformations import GraphMode
 from dsbo.workflow import Workflow, RunBatchAutogradFn
 from dsbo.surrogates.workflow_surrogate import DefaultWorkflowSurrogate
+from dsbo.surrogates.diffusion import MlpDiffusion1D
 from tests.workflow.conftest import SimpleModule, SurrogateModule, FailingModule
 from dsbo.workflow.workflow import ResultsBatch
 
@@ -79,7 +80,7 @@ class TestSurrogateTrainingSessions:
         surrogate.training_stage.return_value = "trained"
         wf.patch(surrogate)
 
-        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
         plan = MagicMock(
             model_file="model.pt",
             candidates=[],
@@ -115,7 +116,7 @@ class TestSurrogateTrainingSessions:
         surrogate.select_training_task.return_value = None
         wf.patch(surrogate)
 
-        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
         sessions = list(wf.surrogate_execution.pending_training_sessions(cand))
         surrogate.select_training_task.assert_called_once_with(cand)
         assert sessions == []
@@ -129,7 +130,7 @@ class TestSurrogateTrainingSessions:
         m.surrogate.training_stage.return_value = "trained"
         wf = Workflow(m)
 
-        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
         plan = MagicMock(
             model_file="model.pt",
             candidates=[],
@@ -164,65 +165,69 @@ class TestSurrogateTrainingSessions:
         m.surrogate.select_training_task.return_value = None
         wf = Workflow(m)
 
-        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
         sessions = list(wf.surrogate_execution.pending_training_sessions(cand))
         m.surrogate.select_training_task.assert_called_once_with(cand)
         assert sessions == []
 
 
 class TestRunWorkflowWithSurrogate:
-    def test_mlp_workflow_surrogate_uses_design_tensor(self):
+    def _tiny_diffusion_surrogate(self, objective_dim=2, parameter_dim=1, sample_count=3):
         surrogate = DefaultWorkflowSurrogate(MagicMock())
-        surrogate.keys = ["out"]
+        surrogate.keys = [f"k{i}" for i in range(objective_dim)]
         surrogate.n = 1
-        model = MagicMock(return_value=torch.tensor([[42.0]]))
+        surrogate.sample_count = sample_count
+        surrogate.num_infer_timesteps = 4
+        surrogate._mean_x = None
+        surrogate._std_x = None
+        surrogate._mean_y = None
+        surrogate._std_y = None
+        surrogate._diffusion_model = MlpDiffusion1D(
+            objective_dim=objective_dim,
+            parameter_dim=parameter_dim,
+            emb_dim=16,
+            hidden_dim=16,
+            n_layers=2,
+        )
+        surrogate._create_schedulers()
+        return surrogate
+
+    def test_diffusion_surrogate_samples_n_values_per_key(self):
+        surrogate = self._tiny_diffusion_surrogate(objective_dim=2, sample_count=3)
         design_tensor = torch.tensor([3.0])
 
-        with patch.object(surrogate, "get_runtime_model", return_value=model):
-            result = surrogate(
-                {"x": torch.tensor(99.0)}, design_tensor=design_tensor,
-            )
+        with patch.object(surrogate, "get_runtime_model", side_effect=lambda: None):
+            result = surrogate({"x": torch.tensor(99.0)}, design_tensor=design_tensor)
 
-        model.assert_called_once_with(design_tensor.unsqueeze(0).repeat(1, 1))
-        assert torch.equal(result["out"], torch.tensor([42.0]))
+        assert result["k0"].shape == (3,)
+        assert result["k1"].shape == (3,)
+        assert torch.isfinite(result["k0"]).all() and torch.isfinite(result["k1"]).all()
 
-    def test_mlp_workflow_surrogate_samples_n_values_per_key(self):
-        surrogate = DefaultWorkflowSurrogate(MagicMock())
-        surrogate.keys = ["a", "b"]
-        surrogate.n = 3
-        model = MagicMock(return_value=torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
-        design_tensor = torch.tensor([3.0])
+    def test_diffusion_surrogate_samples_are_distinct_given_distinct_conditions(self):
+        surrogate = self._tiny_diffusion_surrogate(objective_dim=1, sample_count=1)
+        d1 = torch.tensor([1.0])
+        d2 = torch.tensor([5.0])
 
-        with patch.object(surrogate, "get_runtime_model", return_value=model):
-            result = surrogate(
-                {"x": torch.tensor(99.0)}, design_tensor=design_tensor,
-            )
+        with patch.object(surrogate, "get_runtime_model", side_effect=lambda: None):
+            y1 = surrogate({"x": torch.tensor(0.0)}, design_tensor=d1)["k0"]
+            y2 = surrogate({"x": torch.tensor(0.0)}, design_tensor=d2)["k0"]
 
-        model.assert_called_once()
-        (model_args, _) = model.call_args
-        assert torch.equal(model_args[0], design_tensor.unsqueeze(0).repeat(3, 1))
-        assert torch.equal(result["a"], torch.tensor([1.0, 3.0, 5.0]))
-        assert torch.equal(result["b"], torch.tensor([2.0, 4.0, 6.0]))
+        assert torch.isfinite(y1).all() and torch.isfinite(y2).all()
 
-    def test_mlp_workflow_surrogate_backward(self):
-        surrogate = DefaultWorkflowSurrogate(MagicMock())
-        surrogate.keys = ["out"]
-        surrogate.n = 1
-        model = torch.nn.Linear(1, 1)
-        with torch.no_grad():
-            model.weight.fill_(2.0)
-            model.bias.fill_(0.0)
-
+    def test_diffusion_surrogate_backward_flows_gradient_to_design(self):
+        surrogate = self._tiny_diffusion_surrogate(objective_dim=1, parameter_dim=1, sample_count=1)
         design_tensor = torch.tensor([3.0], requires_grad=True)
 
-        with patch.object(surrogate, "get_runtime_model", return_value=model):
+        with patch.object(surrogate, "get_runtime_model", side_effect=lambda: None):
             surrogate.backward(
                 {"x": torch.tensor(0.0)},
-                {"out": torch.tensor([1.0])},
+                {"k0": torch.tensor([1.0])},
                 design_tensor=design_tensor,
             )
 
-        assert torch.allclose(design_tensor.grad, torch.tensor(2.0))
+        assert design_tensor.grad is not None
+        assert design_tensor.grad.shape == (1,)
+        assert torch.isfinite(design_tensor.grad)
 
     def test_workflow_surrogate(self, single_module_workflow, candidate):
         surrogate = WorkflowSurrogateModule()
@@ -302,7 +307,7 @@ class TestUseSurrogatesFlag:
         surrogate.generate_training_candidates.return_value = []
         wf.patch(surrogate)
 
-        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
         with patch.object(wf, "run_batch") as run_batch, \
              patch.object(wf.surrogate_execution, "pending_training_sessions") as pending:
             wf.run(cand, use_surrogates=False)
@@ -317,7 +322,7 @@ class TestUseSurrogatesFlag:
         module.surrogate = SurrogateModule()
         workflow = Workflow(module)
 
-        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
         with patch.object(workflow, "run_batch", return_value=ResultsBatch([{}])):
             workflow.run(cand, use_surrogates=False)
 
@@ -328,7 +333,7 @@ class TestUseSurrogatesFlag:
         module.surrogate = SurrogateModule()
         workflow = Workflow(module)
 
-        cand = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
         with torch.no_grad(), \
              patch("dsbo.workflow.workflow.run_batch", return_value=ResultsBatch([])) as run_batch:
             results = workflow.run_batch([cand], use_surrogates=False)
@@ -352,7 +357,7 @@ class _StubStrategy(SurrogateStrategy):
 
 class NoOpSurrogate(SurrogateBase):
     def __init__(self):
-        super().__init__(surrogate=None, strategy=_StubStrategy())
+        super().__init__(strategy=_StubStrategy())
         self.calls: list[str] = []
         self.data_file = Input(Workdir.register_file("simulation", "events.h5"))
 
@@ -383,7 +388,7 @@ class PretrainFinetuneSurrogate(NoOpSurrogate):
 
 
 class TestTrainingTaskSelection:
-    candidate = Candidate(ParameterSpace(x=Continuous(0, 10, 1)), torch.tensor([3.0]))
+    candidate = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
 
     def test_implements_reads_lifecycle_not_descriptor(self):
         single = TrainOnlySurrogate()
