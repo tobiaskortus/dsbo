@@ -134,7 +134,7 @@ class HDF5DatasetView(DatasetView):
 
 class HDF5ColumnGroupDatasetView(ColumnGroupDatasetView):
     def __init__(self, fpath: str, group_name: str = "primal"):
-        from dsbo.utils.io.autograd import HDF5File
+        from dsbo.utils.io.hdf5 import HDF5File
         self._file = h5py.File(fpath, "r")
         try:
             group = self._file[group_name]
@@ -160,6 +160,85 @@ class HDF5ColumnGroupDatasetView(ColumnGroupDatasetView):
 
     def close(self) -> None:
         self._file.close()
+
+
+class ROOTDatasetView(DatasetView):
+    def __init__(self, fpath: str, prefix: str | None = None):
+        from dsbo.utils.io.root import ROOTFile
+
+        ROOTFile.validate(fpath)
+        metadata, _ = ROOTFile._load_container(fpath)
+        prefix_path = f"{prefix}/" if prefix else ""
+        self._fpath = fpath
+        self._paths = {
+            name.removeprefix(prefix_path): name
+            for name in metadata["datasets"]
+            if name.startswith(prefix_path)
+        }
+        self._metadata = {
+            key: metadata["datasets"][path]
+            for key, path in self._paths.items()
+        }
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return tuple(sorted(self._paths))
+
+    def shape(self, key: str) -> tuple[int, ...]:
+        return tuple(self._metadata[key]["shape"])
+
+    def read(self, key: str, index: int | slice):
+        from dsbo.utils.io.root import ROOTFile
+
+        return ROOTFile._read_dataset(self._fpath, self._paths[key])[index]
+
+    def partition_sizes(self, key: str) -> tuple[int, ...]:
+        from dsbo.utils.io.root import ROOTFile
+
+        if not ROOTFile.dependencies(self._fpath):
+            shape = self.shape(key)
+            return (1 if shape == () else shape[0],)
+        sizes = []
+        for source in ROOTFile._leaf_sources(self._fpath):
+            metadata, _ = ROOTFile._load_container(source)
+            shape = tuple(metadata["datasets"][self._paths[key]]["shape"])
+            sizes.append(1 if shape == () else shape[0])
+        return tuple(sizes)
+
+    def close(self) -> None:
+        pass
+
+
+class ROOTColumnGroupDatasetView(ColumnGroupDatasetView):
+    def __init__(self, fpath: str, group_name: str = "primal"):
+        from dsbo.utils.io.root import ROOTFile
+
+        ROOTFile.validate(fpath)
+        metadata, _ = ROOTFile._load_container(fpath)
+        dataset = metadata["datasets"].get(group_name)
+        if dataset is None or dataset["columns"] is None:
+            raise ValueError(f"ROOT dataset '{group_name}' is not a group of named columns.")
+        columns = tuple(dataset["columns"])
+        if not columns:
+            raise ValueError(f"ROOT dataset '{group_name}' contains no columns.")
+
+        super().__init__(group_name=group_name)
+        self._fpath = fpath
+        self.columns = columns
+        shape = tuple(dataset["shape"])
+        self.num_samples = 1 if len(shape) == 1 else shape[1]
+
+    def _read_column(self, column: str, index: int | slice):
+        from dsbo.utils.io.root import ROOTFile
+
+        return ROOTFile._read_dataset(
+            self._fpath,
+            self._group_name,
+            columns=[column],
+        )[0][index]
+
+    def close(self) -> None:
+        pass
 
 
 class InMemoryDatasetView(DatasetView):

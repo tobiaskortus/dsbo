@@ -8,7 +8,7 @@ from dsbo.workflow import (
     to_1d_tensor, candidates_from_tensor, Workflow,
 )
 from dsbo.utils.io import Input, Output, Workdir
-from dsbo.utils.io.autograd import HDF5File
+from dsbo.utils.io.hdf5 import HDF5File
 from dsbo.modules import BatchFusedModule, Module, batch_fuse
 from dsbo.utils.io import Workdir
 from dsbo.modules.dsl import DependencyDict
@@ -883,14 +883,14 @@ class TestBatchFuse:
                 # Only resolve self.a; self.b is never touched
                 return {"out": HDF5File.open(self.a(), "cpu").sum()}
 
-        import dsbo.utils.io.autograd as _autograd_module
+        import dsbo.utils.io.hdf5 as _hdf5_module
         _real_reduce = HDF5File.reduce
 
         def tracking_reduce(sources, destination):
             reduce_destinations.append(destination)
             return _real_reduce(sources, destination)
 
-        with patch.object(_autograd_module.HDF5File, "reduce", tracking_reduce):
+        with patch.object(_hdf5_module.HDF5File, "reduce", tracking_reduce):
             workflow = Workflow(Producer() >> batch_fuse(Trainer()))
             run_batch(workflow, candidates)
 
@@ -923,14 +923,14 @@ class TestBatchFuse:
                 vals = HDF5File.open(self.features(), "cpu")
                 return {"loss": vals.sum()}
 
-        import dsbo.utils.io.autograd as _autograd_module2
+        import dsbo.utils.io.hdf5 as _hdf5_module2
         _real_reduce2 = HDF5File.reduce
 
         def tracking_reduce(sources, destination):
             reduce_calls.append(destination)
             return _real_reduce2(sources, destination)
 
-        with patch.object(_autograd_module2.HDF5File, "reduce", tracking_reduce):
+        with patch.object(_hdf5_module2.HDF5File, "reduce", tracking_reduce):
             run_batch(
                 Workflow(Producer() >> batch_fuse(Trainer())),
                 candidates,
