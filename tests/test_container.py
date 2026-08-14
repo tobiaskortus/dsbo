@@ -865,21 +865,23 @@ class TestPullImageRefToSif:
         assert provider._ensure_docker_scheme("library/ubuntu:22.04") == "docker://library/ubuntu:22.04"
 
 
-    @patch("shutil.which", return_value="/usr/bin/docker")
-    def test_docker_prepare_image_with_plain_uri(self, mock_which):
+    @patch.object(DockerImageProvider, "exists", return_value=True)
+    def test_docker_prepare_image_with_plain_uri(self, mock_exists):
         """Docker should pass plain URIs through as-is."""
         provider = DockerImageProvider()
         ref = ImageRef(uri="ubuntu:22.04")
         result = provider.prepare_image(ref)
         assert result == "ubuntu:22.04"
+        mock_exists.assert_called_once_with("ubuntu:22.04")
 
-    @patch("shutil.which", return_value="/usr/bin/docker")
-    def test_docker_prepare_image_with_docker_scheme_uri(self, mock_which):
+    @patch.object(DockerImageProvider, "exists", return_value=True)
+    def test_docker_prepare_image_with_docker_scheme_uri(self, mock_exists):
         """Docker should pass docker:// URIs through as-is (Docker handles both)."""
         provider = DockerImageProvider()
         ref = ImageRef(uri="docker://ubuntu:22.04")
         result = provider.prepare_image(ref)
         assert result == "docker://ubuntu:22.04"
+        mock_exists.assert_called_once_with("docker://ubuntu:22.04")
 
 
 class TestImageDefinitionFile:

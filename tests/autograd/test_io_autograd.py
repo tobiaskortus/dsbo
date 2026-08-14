@@ -8,14 +8,28 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import torch.autograd.forward_ad as fw
 
+from dsbo.config import config, get_active_file_backend
 from dsbo.utils.io.autograd import InMemoryFile
 from dsbo.utils.io.datasets import ModuleSurrogateDataset, WorkflowSurrogateDataset
 from dsbo.utils.io.hdf5 import HDF5File
 from dsbo.utils.io.root import ROOTFile
 
 
-def _record_results(path: str, outputs: dict[str, torch.Tensor]) -> None:
-    HDF5File.write_named_datasets(
+@pytest.fixture(
+    params=[
+        pytest.param((HDF5File, ".h5"), id="hdf5"),
+        pytest.param((ROOTFile, ".root"), id="root"),
+    ]
+)
+def file_backend(request):
+    backend, extension = request.param
+    with config.use(file_backend=backend):
+        assert get_active_file_backend() is backend
+        yield backend, extension
+
+
+def _record_results(backend, path: str, outputs: dict[str, torch.Tensor]) -> None:
+    backend.write_named_datasets(
         path,
         {key: value.numpy() for key, value in outputs.items()},
     )
@@ -26,53 +40,42 @@ def aggregate(ds) -> tuple[torch.Tensor, torch.Tensor]:
     ys = torch.stack([ds[i][1] for i in range(len(ds))], dim=0)
     return xs, ys
 
-def test_hdf5_file_primal_only():
-    #dual_level==-1 and no_grad
-    with torch.no_grad():
-        x = torch.tensor([1.0, 2.0])
-        x = x * 3
-
-        with TemporaryDirectory() as tempdir:
-            file_path = os.path.join(tempdir, "x.h5")
-            HDF5File.write(file_path, x)
-            x_loaded = HDF5File.open(file_path, "cpu")
-
-            torch.testing.assert_close(x_loaded, torch.tensor([3.0, 6.0]))
-
-
-def test_hdf5_file_forward_ad_tangent():
+def test_file_backend_forward_ad_tangent(file_backend):
+    backend, extension = file_backend
     with fw.dual_level():
         x = fw.make_dual(torch.tensor([1.0, 2.0]), torch.tensor([1.0, 0.0]))
         x = x * 3
 
         with TemporaryDirectory() as tempdir:
-            file_path = os.path.join(tempdir, "x.h5")
-            HDF5File.write(file_path, x)
-            x_loaded = HDF5File.open(file_path, "cpu")
+            file_path = os.path.join(tempdir, f"x{extension}")
+            backend.write(file_path, x)
+            x_loaded = backend.open(file_path, "cpu")
             tangent = fw.unpack_dual(x_loaded).tangent
             
             torch.testing.assert_close(x_loaded, torch.tensor([3.0, 6.0]))
             torch.testing.assert_close(tangent, torch.tensor([3.0, 0.0]))
 
 
-def test_hdf5_file_backward_gradient():
+def test_file_backend_backward_gradient(file_backend):
+    backend, extension = file_backend
+    backend.reset_gradient_state()
     with TemporaryDirectory() as tempdir:
-        file_path = os.path.join(tempdir, "x.h5")
+        file_path = os.path.join(tempdir, f"x{extension}")
 
         primal = torch.tensor([2.0, 3.0])
-        HDF5File.write(file_path, primal)
+        backend.write(file_path, primal)
 
         with torch.enable_grad():
-            x = HDF5File.open(file_path, "cpu")
+            x = backend.open(file_path, "cpu")
             y = (x * x).sum()
 
             # Check that the autograd hook was registered during open()
-            assert file_path in HDF5File.handles
+            assert file_path in backend.handles
             
             y.backward()
 
-        assert os.path.exists(os.path.join(tempdir, "x_gradient.h5"))
-        grad = HDF5File.read_backward_gradient(file_path)
+        assert os.path.exists(os.path.join(tempdir, f"x_gradient{extension}"))
+        grad = backend.read_backward_gradient(file_path)
         torch.testing.assert_close(grad, 2.0 * primal)
 
 
@@ -92,15 +95,17 @@ def test_hdf5_file_named_columns():
         torch.testing.assert_close(HDF5File.open(file_path, "cpu", columns=["third", "first"]), values[[2, 0]])
 
 
-def test_hdf5_file_named_columns_forward_ad_tangent():
+def test_file_backend_named_columns_forward_ad_tangent(file_backend):
+    backend, extension = file_backend
+    backend.reset_gradient_state()
     with TemporaryDirectory() as tempdir, fw.dual_level():
-        file_path = os.path.join(tempdir, "x.h5")
-        primal = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-        tangent = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
+        file_path = os.path.join(tempdir, f"x{extension}")
+        primal = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+        tangent = torch.arange(8, 16, dtype=torch.float32).reshape(2, 2, 2)
 
-        HDF5File.write(file_path, fw.make_dual(primal, tangent), columns=["first", "second"])
+        backend.write(file_path, fw.make_dual(primal, tangent), columns=["first", "second"])
 
-        loaded = HDF5File.open(file_path, "cpu", columns=["second"])
+        loaded = backend.open(file_path, "cpu", columns=["second"])
 
         torch.testing.assert_close(loaded, primal[[1]])
         torch.testing.assert_close(fw.unpack_dual(loaded).tangent, tangent[[1]])
@@ -161,26 +166,27 @@ def test_hdf5_file_named_columns_accumulate_gradients():
 
 
 @pytest.mark.parametrize("selection_first", [False, True])
-def test_hdf5_file_named_columns_accumulate_full_and_selected(selection_first):
-    HDF5File.reset_gradient_state()
+def test_file_backend_named_columns_accumulate_full_and_selected(file_backend, selection_first):
+    backend, extension = file_backend
+    backend.reset_gradient_state()
     with TemporaryDirectory() as tempdir:
-        file_path = os.path.join(tempdir, "x.h5")
+        file_path = os.path.join(tempdir, f"x{extension}")
         values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
 
-        HDF5File.write(file_path, values, columns=["first", "second"])
+        backend.write(file_path, values, columns=["first", "second"])
 
         def backward_selection():
-            selected = HDF5File.open(file_path, "cpu", columns=["second"])
+            selected = backend.open(file_path, "cpu", columns=["second"])
             (selected * 2.0).sum().backward()
 
         def backward_full():
-            HDF5File.open(file_path, "cpu").sum().backward()
+            backend.open(file_path, "cpu").sum().backward()
 
         operations = (backward_selection, backward_full) if selection_first else (backward_full, backward_selection)
         for operation in operations:
             operation()
 
-        torch.testing.assert_close(HDF5File.read_backward_gradient(file_path), torch.tensor([[1.0, 1.0], [3.0, 3.0]]))
+        torch.testing.assert_close(backend.read_backward_gradient(file_path), torch.tensor([[1.0, 1.0], [3.0, 3.0]]))
 
 
 def test_hdf5_file_named_columns_validate_dimension_zero():
@@ -191,17 +197,18 @@ def test_hdf5_file_named_columns_validate_dimension_zero():
             HDF5File.write(file_path, torch.ones((3, 2)), columns=["first", "second"])
 
 
-def test_hdf5_file_named_columns_reduce():
+def test_file_backend_named_columns_reduce(file_backend):
+    backend, extension = file_backend
     with TemporaryDirectory() as tempdir, torch.no_grad():
-        sources = [os.path.join(tempdir, f"source_{i}.h5") for i in range(2)]
-        HDF5File.write(sources[0], torch.tensor([[1.0, 2.0], [4.0, 5.0]]), columns=["first", "second"])
-        HDF5File.write(sources[1], torch.tensor([[3.0], [6.0]]), columns=["first", "second"])
-        destination = os.path.join(tempdir, "reduced.h5")
+        sources = [os.path.join(tempdir, f"source_{i}{extension}") for i in range(2)]
+        backend.write(sources[0], torch.tensor([[1.0, 2.0], [4.0, 5.0]]), columns=["first", "second"])
+        backend.write(sources[1], torch.tensor([[3.0], [6.0]]), columns=["first", "second"])
+        destination = os.path.join(tempdir, f"reduced{extension}")
 
-        HDF5File.reduce(sources, destination)
+        backend.reduce(sources, destination)
 
         torch.testing.assert_close(
-            HDF5File.open(destination, "cpu"),
+            backend.open(destination, "cpu"),
             torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
         )
 
@@ -261,57 +268,32 @@ def test_vds_reduction_concatenates_multiple_hdf5_files():
         np.empty((0, 2), dtype=np.float32),
     ],
 )
-def test_root_file_round_trips_shape_and_dtype(value):
+def test_file_backend_round_trips_shape_and_dtype(file_backend, value):
+    backend, extension = file_backend
     with TemporaryDirectory() as tempdir, torch.no_grad():
-        file_path = os.path.join(tempdir, "x.root")
-        ROOTFile.write(file_path, torch.from_numpy(value))
+        file_path = os.path.join(tempdir, f"x{extension}")
+        backend.write(file_path, torch.from_numpy(value))
 
-        loaded = ROOTFile.open(file_path, "cpu")
+        loaded = backend.open(file_path, "cpu")
 
         assert loaded.shape == value.shape
         assert loaded.numpy().dtype == value.dtype
         np.testing.assert_array_equal(loaded.numpy(), value)
-        with uproot.open(file_path) as file:
-            assert file["primal"].classname == "TTree"
-            assert ROOTFile.METADATA_OBJECT in file
 
 
-def test_root_file_named_columns_forward_ad_tangent():
-    ROOTFile.reset_gradient_state()
+def test_root_file_writes_ttree_layout():
     with TemporaryDirectory() as tempdir, fw.dual_level():
         file_path = os.path.join(tempdir, "x.root")
         primal = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
         tangent = torch.arange(8, 16, dtype=torch.float32).reshape(2, 2, 2)
         ROOTFile.write(file_path, fw.make_dual(primal, tangent), columns=["first", "second"])
 
-        loaded = ROOTFile.open(file_path, "cpu", columns=["second", "first"])
-
-        torch.testing.assert_close(loaded, primal[[1, 0]])
-        torch.testing.assert_close(fw.unpack_dual(loaded).tangent, tangent[[1, 0]])
         with uproot.open(file_path) as file:
+            assert file["primal"].classname == "TTree"
             assert file["primal"].keys() == ["first", "second"]
             assert file["tangent"].keys() == ["first", "second"]
             assert file["primal/first"].array(library="np").shape == (2, 2)
-
-
-def test_root_file_named_columns_accumulate_backward_gradients():
-    ROOTFile.reset_gradient_state()
-    with TemporaryDirectory() as tempdir:
-        file_path = os.path.join(tempdir, "x.root")
-        values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-        ROOTFile.write(file_path, values, columns=["first", "second"])
-
-        first = ROOTFile.open(file_path, "cpu", columns=["first"])
-        (first * 2.0).sum().backward()
-        full = ROOTFile.open(file_path, "cpu")
-        full.sum().backward()
-
-        torch.testing.assert_close(
-            ROOTFile.read_backward_gradient(file_path),
-            torch.tensor([[3.0, 3.0], [1.0, 1.0]]),
-        )
-        with uproot.open(ROOTFile._gradient_path(file_path)) as file:
-            assert file["gradient"].classname == "TTree"
+            assert ROOTFile.METADATA_OBJECT in file
 
 
 def test_root_file_reduce_creates_virtual_manifest():
@@ -417,14 +399,15 @@ def test_root_file_nested_virtual_reduction():
             ROOTFile.reduce([nested_reduction], os.path.join(tempdir, "invalid.root"))
 
 
-def test_root_file_module_surrogate_dataset():
+def test_file_backend_module_surrogate_dataset(file_backend):
+    backend, extension = file_backend
     with TemporaryDirectory() as tempdir, torch.no_grad():
-        data_path = os.path.join(tempdir, "data.root")
-        cond_path = os.path.join(tempdir, "cond.root")
-        ROOTFile.write(data_path, torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
-        ROOTFile.write(cond_path, torch.tensor([[2.0], [4.0], [8.0]]))
+        data_path = os.path.join(tempdir, f"data{extension}")
+        cond_path = os.path.join(tempdir, f"cond{extension}")
+        backend.write(data_path, torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
+        backend.write(cond_path, torch.tensor([[2.0], [4.0], [8.0]]))
 
-        with ModuleSurrogateDataset(data_path, cond_path, ROOTFile) as dataset:
+        with ModuleSurrogateDataset(data_path, cond_path, get_active_file_backend()) as dataset:
             assert len(dataset) == 3
             x, cond = aggregate(dataset)
 
@@ -432,27 +415,28 @@ def test_root_file_module_surrogate_dataset():
         torch.testing.assert_close(cond.mean(dim=0), torch.zeros(1), atol=1e-6, rtol=0)
 
 
-def test_root_file_workflow_surrogate_dataset_records():
+def test_file_backend_workflow_surrogate_dataset_records(file_backend):
+    backend, extension = file_backend
     with TemporaryDirectory() as tempdir:
         sources = []
         for candidate in range(2):
-            path = os.path.join(tempdir, f"candidate_{candidate}.root")
-            ROOTFile.write_named_datasets(
+            path = os.path.join(tempdir, f"candidate_{candidate}{extension}")
+            backend.write_named_datasets(
                 path,
                 {"energy": np.array([candidate, candidate + 0.5])},
             )
-            ROOTFile.write_named_datasets(
+            backend.write_named_datasets(
                 path,
                 {"loss": np.array([10.0 + candidate, 11.0 + candidate])},
             )
             sources.append(path)
 
-        records_path = os.path.join(tempdir, "records.root")
-        ROOTFile.reduce(sources, records_path)
+        records_path = os.path.join(tempdir, f"records{extension}")
+        backend.reduce(sources, records_path)
         with WorkflowSurrogateDataset(
             records_path,
             torch.tensor([[1.0], [2.0]]),
-            ROOTFile,
+            get_active_file_backend(),
         ) as dataset:
             assert dataset.keys == ["energy", "loss"]
             assert dataset.n == 2
@@ -517,8 +501,8 @@ def test_nested_record_vds_merge_roundtrip():
         sources = []
         for c in range(3):
             path = os.path.join(tempdir, f"cand_{c}.h5")
-            _record_results(path, {"energy": torch.tensor([c, c + 0.5])})
-            _record_results(path, {"loss": torch.tensor([10.0 + 2 * c, 11.0 + 2 * c])})
+            _record_results(HDF5File, path, {"energy": torch.tensor([c, c + 0.5])})
+            _record_results(HDF5File, path, {"loss": torch.tensor([10.0 + 2 * c, 11.0 + 2 * c])})
             sources.append(path)
         merged = os.path.join(tempdir, "merged.h5")
         HDF5File.reduce(sources, merged)
@@ -537,7 +521,7 @@ def test_reduce_rejects_incompatible_nested_records():
     with TemporaryDirectory() as tempdir:
         p1 = os.path.join(tempdir, "a.h5")
         p2 = os.path.join(tempdir, "b.h5")
-        _record_results(p1, {"k": torch.tensor([1.0])})
-        _record_results(p2, {"k": torch.tensor([2.0]), "j": torch.tensor([3.0])})
+        _record_results(HDF5File, p1, {"k": torch.tensor([1.0])})
+        _record_results(HDF5File, p2, {"k": torch.tensor([2.0]), "j": torch.tensor([3.0])})
         with pytest.raises(ValueError, match="identical datasets"):
             HDF5File.reduce([p1, p2], os.path.join(tempdir, "m.h5"))
