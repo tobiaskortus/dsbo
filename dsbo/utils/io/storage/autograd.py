@@ -11,10 +11,24 @@ from dsbo.utils.io.datasets.views import DatasetView, InMemoryDatasetView
 class AutogradFileInterface(ABC):
     handles: dict[str, RemovableHandle] = {}
     _gradient_written: set[str] = set()
+    _registered_extensions: set[str] = set()
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        AutogradFileInterface._registered_extensions.update(cls.reducible_extensions())
 
     @classmethod
     def reducible_extensions(cls) -> frozenset[str]:
         return frozenset()
+
+    @classmethod
+    def default_extension(cls) -> str:
+        extensions = cls.reducible_extensions()
+        return min(extensions, key=lambda extension: (len(extension), extension)) if extensions else ""
+
+    @classmethod
+    def registered_extensions(cls) -> frozenset[str]:
+        return frozenset(AutogradFileInterface._registered_extensions)
 
     @classmethod
     def reset_gradient_state(cls):
@@ -89,8 +103,12 @@ class AutogradFileInterface(ABC):
         pass
 
     @classmethod
+    def write_row_store(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        cls.write_named_datasets(fpath, datasets)
+
+    @classmethod
     @abstractmethod
-    def open_dataset(cls, fpath: str, prefix: str | None = None) -> DatasetView:
+    def open_dataset(cls, fpath: str) -> DatasetView:
         pass
 
     @classmethod
@@ -163,10 +181,7 @@ class InMemoryFile(AutogradFileInterface):
         stored.update({key: torch.from_numpy(value) for key, value in datasets.items()})
 
     @classmethod
-    def open_dataset(cls, fpath: str, prefix: str | None = None) -> DatasetView:
-        if prefix is not None:
-            return InMemoryDatasetView(cls._named_storage[fpath], prefix=prefix)
-
+    def open_dataset(cls, fpath: str) -> DatasetView:
         datasets: dict[str, torch.Tensor] = {}
         named = cls._named_storage.get(fpath)
         if named:

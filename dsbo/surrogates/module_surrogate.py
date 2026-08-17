@@ -13,7 +13,7 @@ from dsbo.utils.io import Input, LazyShape
 from dsbo.autograd import train_op
 from dsbo.config import get_active_file_backend
 from dsbo.modules import dynamic_submodule
-from dsbo.utils.io.autograd import AutogradFileInterface
+from dsbo.utils.io.storage.autograd import AutogradFileInterface
 from dsbo.utils.io.datasets import ModuleSurrogateDataset
 from dsbo.surrogates import SurrogateBase, SurrogateStrategy
 from dsbo.surrogates.diffusion import MlpDiffusion1D, Trainer

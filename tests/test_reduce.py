@@ -9,10 +9,10 @@ import pytest
 import torch
 
 from dsbo.config import config
-from dsbo.utils.io.autograd import InMemoryFile
-from dsbo.utils.io.hdf5 import HDF5File
+from dsbo.utils.io.storage.autograd import InMemoryFile
+from dsbo.utils.io.storage.hdf5 import HDF5File
 from dsbo.utils.io.reduce import LazyReductionResolver, reduce_registered_file
-from dsbo.utils.io.root import ROOTFile
+from dsbo.utils.io.storage.root import ROOTFile
 
 
 def write_h5_files(tempdir: str, *values: float) -> list[str]:

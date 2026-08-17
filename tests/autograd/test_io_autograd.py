@@ -9,10 +9,10 @@ from unittest.mock import patch
 import torch.autograd.forward_ad as fw
 
 from dsbo.config import config, get_active_file_backend
-from dsbo.utils.io.autograd import InMemoryFile
+from dsbo.utils.io.storage.autograd import InMemoryFile
 from dsbo.utils.io.datasets import ModuleSurrogateDataset, WorkflowSurrogateDataset
-from dsbo.utils.io.hdf5 import HDF5File
-from dsbo.utils.io.root import ROOTFile
+from dsbo.utils.io.storage.hdf5 import HDF5File
+from dsbo.utils.io.storage.root import ROOTFile
 
 
 @pytest.fixture(
@@ -310,7 +310,7 @@ def test_root_file_reduce_creates_virtual_manifest():
             assert ROOTFile.METADATA_OBJECT in file
             assert ROOTFile.VDS_SOURCES_OBJECT in file
         assert ROOTFile.dependencies(destination) == sources
-        with patch("dsbo.utils.io.root.uproot.concatenate", wraps=uproot.concatenate) as concatenate:
+        with patch("dsbo.utils.io.storage.root.uproot.concatenate", wraps=uproot.concatenate) as concatenate:
             torch.testing.assert_close(
                 ROOTFile.open(destination, "cpu"),
                 torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
@@ -409,6 +409,11 @@ def test_file_backend_module_surrogate_dataset(file_backend):
 
         with ModuleSurrogateDataset(data_path, cond_path, get_active_file_backend()) as dataset:
             assert len(dataset) == 3
+            batched = dataset.__getitems__([2, 0, 2])
+            individual = [dataset[index] for index in (2, 0, 2)]
+            for actual, expected in zip(batched, individual, strict=True):
+                torch.testing.assert_close(actual[0], expected[0])
+                torch.testing.assert_close(actual[1], expected[1])
             x, cond = aggregate(dataset)
 
         torch.testing.assert_close(x.mean(dim=0), torch.zeros(2), atol=1e-6, rtol=0)
@@ -433,15 +438,37 @@ def test_file_backend_workflow_surrogate_dataset_records(file_backend):
 
         records_path = os.path.join(tempdir, f"records{extension}")
         backend.reduce(sources, records_path)
-        with WorkflowSurrogateDataset(
-            records_path,
-            torch.tensor([[1.0], [2.0]]),
-            get_active_file_backend(),
-        ) as dataset:
-            assert dataset.keys == ["energy", "loss"]
-            assert dataset.n == 2
-            assert len(dataset) == 4
-            x, y = aggregate(dataset)
+
+        def load_dataset():
+            with WorkflowSurrogateDataset(
+                records_path,
+                torch.tensor([[1.0], [2.0]]),
+                get_active_file_backend(),
+            ) as dataset:
+                assert dataset.keys == ["energy", "loss"]
+                assert dataset.n == 2
+                assert len(dataset) == 4
+                np.testing.assert_allclose(dataset._records.read("energy", slice(1, 3)), [0.5, 1.0])
+                assert dataset._records.partition_sizes("energy") == (2, 2)
+                with patch.object(
+                    dataset._records,
+                    "read_many",
+                    side_effect=AssertionError("normalization scanned record values"),
+                ):
+                    dataset.compute_stats()
+                torch.testing.assert_close(dataset.mean_y, torch.tensor([0.75, 11.0]))
+                batched = dataset.__getitems__([0, 1])
+                individual = [dataset[0], dataset[1]]
+                for actual, expected in zip(batched, individual, strict=True):
+                    torch.testing.assert_close(actual[0], expected[0])
+                    torch.testing.assert_close(actual[1], expected[1])
+                return aggregate(dataset)
+
+        if backend is ROOTFile:
+            with patch.object(ROOTFile, "_read_dataset", side_effect=AssertionError("full ROOT read")):
+                x, y = load_dataset()
+        else:
+            x, y = load_dataset()
 
         assert x.shape == (4, 1)
         assert y.shape == (4, 2)
@@ -525,3 +552,93 @@ def test_reduce_rejects_incompatible_nested_records():
         _record_results(HDF5File, p2, {"k": torch.tensor([2.0]), "j": torch.tensor([3.0])})
         with pytest.raises(ValueError, match="identical datasets"):
             HDF5File.reduce([p1, p2], os.path.join(tempdir, "m.h5"))
+
+
+def test_file_backend_workflow_surrogate_row_store(file_backend):
+    backend, extension = file_backend
+    with TemporaryDirectory() as tempdir:
+        sources = []
+        for candidate in range(2):
+            path = os.path.join(tempdir, f"candidate_{candidate}{extension}")
+            backend.write_row_store(
+                path,
+                {
+                    "energy": np.array([candidate, candidate + 0.5], dtype=np.float32),
+                    "loss": np.array([10.0 + candidate, 11.0 + candidate], dtype=np.float32),
+                },
+            )
+            sources.append(path)
+
+        if backend is HDF5File:
+            with h5py.File(sources[0], "r") as file:
+                assert list(file) == [HDF5File.ROW_STORE_DATASET]
+                assert file[HDF5File.ROW_STORE_DATASET].shape == (2, 2)
+                assert file[HDF5File.ROW_STORE_DATASET].compression is None
+        else:
+            metadata, _ = ROOTFile._load_container(sources[0])
+            assert list(metadata["datasets"]) == [ROOTFile.ROW_STORE_DATASET]
+            keyed_metadata = metadata["datasets"][ROOTFile.ROW_STORE_DATASET]
+            assert keyed_metadata["keys"] == ["energy", "loss"]
+            assert keyed_metadata["columns"] is None
+            assert keyed_metadata["branches"] == [ROOTFile.VALUE_BRANCH]
+            with uproot.open(sources[0]) as file:
+                assert file.file.compression is None
+                assert list(file[ROOTFile.ROW_STORE_DATASET].keys()) == keyed_metadata["branches"]
+
+        records_path = os.path.join(tempdir, f"records{extension}")
+        backend.reduce(sources, records_path)
+        expected = torch.tensor(
+            [[0.0, 10.0], [0.5, 11.0], [1.0, 11.0], [1.5, 12.0]],
+            dtype=torch.float32,
+        )
+        with WorkflowSurrogateDataset(
+            records_path, torch.tensor([[1.0], [2.0]]), get_active_file_backend()
+        ) as dataset:
+            dataset.compute_stats()
+            torch.testing.assert_close(dataset.mean_y, torch.tensor([0.75, 11.0]))
+            for i in range(len(dataset)):
+                _, y = dataset[i]
+                torch.testing.assert_close(
+                    y * dataset.std_y + dataset.mean_y, expected[i]
+                )
+
+
+def test_workflow_surrogate_normalization_uses_train_rows_only(file_backend):
+    """Normalization must be fit on the *training* rows only, so validation data
+    never leaks into the training moments. Regression test for the prior bug
+    where compute_stats() ran on the whole dataset before the split."""
+    backend, extension = file_backend
+    from dsbo.utils.io.datasets import design_split
+
+    with TemporaryDirectory() as tempdir:
+        sources = []
+        # Train candidates have small y; val candidates have much larger y.
+        ys = [1.0, 2.0, 100.0, 200.0]
+        for c, y in enumerate(ys):
+            path = os.path.join(tempdir, f"candidate_{c}{extension}")
+            backend.write_row_store(path, {"y": np.array([y], dtype=np.float32)})
+            sources.append(path)
+        records_path = os.path.join(tempdir, f"records{extension}")
+        backend.reduce(sources, records_path)
+        design = torch.tensor([[float(c)] for c in range(len(ys))])
+
+        with WorkflowSurrogateDataset(
+            records_path, design, get_active_file_backend()
+        ) as dataset:
+            train_rows, val_rows = design_split(len(ys), dataset.n, val_split=0.5, seed=0)
+
+            dataset.compute_stats(train_rows)
+            train_mean_y = dataset.mean_y
+
+            # Brute-force expected mean over exactly the training rows, keeping
+            # the per-feature shape (n_features,) that _fit_stats produces.
+            # Each training row is one (candidate, single feature) sample.
+            expected_train = torch.as_tensor(
+                [[ys[r // dataset.n]] for r in train_rows], dtype=torch.float32
+            ).mean(dim=0)
+            assert train_mean_y.shape == (1,)
+            torch.testing.assert_close(train_mean_y, expected_train)
+
+            # And it must NOT equal the whole-data mean (which would leak val).
+            whole = torch.as_tensor(ys, dtype=torch.float32).mean()
+            assert not torch.allclose(train_mean_y, whole)

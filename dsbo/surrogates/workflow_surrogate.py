@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from diffusers.schedulers import DDPMScheduler, DDIMScheduler
 from typing import Any, Mapping, TYPE_CHECKING
-from torch.utils.data import Subset, DataLoader
+from torch.utils.data import Subset, DataLoader, default_collate
 
 from dsbo.autograd import train_op
 from dsbo.utils.io import Input, Workdir
@@ -18,6 +18,12 @@ from dsbo.utils.io.workdir import AbstractFilePath, DefaultFilenames, DefaultPat
 if TYPE_CHECKING:
     from dsbo.parameters import CandidateBatch
 
+
+def _collate_workflow_surrogate_batch(batch):
+    x, y = default_collate(batch)
+    return y, x
+
+
 def surrogate_predictions_to_dict(tensor: torch.Tensor, keys: list[str], n: int) -> dict[str, torch.Tensor]:
     tensor = tensor.reshape(-1, len(keys))
     return {k: tensor[:, i] for i, k in enumerate(keys)}
@@ -28,7 +34,11 @@ class WorkflowSurrogate(SurrogateBase):
 
     def __init__(self, strategy: SurrogateStrategy):
         super().__init__(strategy=strategy)
-        self._data_path = Input(Workdir.register_file(DefaultPaths.TRAINING_RECORDS, DefaultFilenames.RESULTS))
+        self._data_path = Input(Workdir.register_file(
+                DefaultPaths.TRAINING_RECORDS,
+                DefaultFilenames.RESULTS,
+            )
+        )
 
     def __call__(self, design, **kwargs):
         raise NotImplementedError(
@@ -57,30 +67,39 @@ class WorkflowSurrogate(SurrogateBase):
             backend=get_active_file_backend(),
         )
         self._records_dataset = dataset
-        dataset.compute_stats()
-        self._mean_x = dataset.mean_x
-        self._std_x = dataset.std_x
-        self._mean_y = dataset.mean_y
-        self._std_y = dataset.std_y
         self.keys = dataset.keys
         self.n = dataset.n
 
+        # Split by candidate *before* fitting normalization, then compute the
+        # moments over the training rows only. Both loaders below reuse these
+        # train-derived constants, so validation data never leaks into the
+        # training normalization (and is normalized identically at inference).
         train_indices, val_indices = design_split(
             n_candidates=candidates.tensor.shape[0],
             rows_per_design=self.n,
             val_split=self.val_split,
             seed=self.seed,
         )
+        dataset.compute_stats(train_indices)
+        self._mean_x = dataset.mean_x
+        self._std_x = dataset.std_x
+        self._mean_y = dataset.mean_y
+        self._std_y = dataset.std_y
 
-        def collate(batch):
-            return (
-                torch.stack([y for _, y in batch]),
-                torch.stack([x for x, _ in batch]),
+        num_workers = getattr(self, "num_workers", 8)
+        loader_options = {
+            "batch_size": self.batch_size,
+            "num_workers": num_workers,
+            "collate_fn": _collate_workflow_surrogate_batch,
+        }
+        if num_workers:
+            loader_options.update(
+                persistent_workers=True,
+                prefetch_factor=getattr(self, "prefetch_factor", 4),
             )
-
         return (
-            DataLoader(Subset(dataset, train_indices), batch_size=self.batch_size, shuffle=True, collate_fn=collate),
-            DataLoader(Subset(dataset, val_indices), batch_size=self.batch_size, shuffle=False, collate_fn=collate),
+            DataLoader(Subset(dataset, train_indices), shuffle=True, **loader_options),
+            DataLoader(Subset(dataset, val_indices), shuffle=False, **loader_options),
         )
 
     @property
@@ -107,9 +126,16 @@ class DefaultWorkflowSurrogate(WorkflowSurrogate):
         num_infer_timesteps: int = 50,
         eta: float = 0.8,
         seed: int = 0,
-        patience: int | None = None):
+        patience: int | None = None,
+        num_workers: int = 8,
+        prefetch_factor: int = 4,
+    ):
 
         super().__init__(strategy=strategy)
+        if num_workers < 0:
+            raise ValueError("num_workers must be non-negative.")
+        if prefetch_factor < 1:
+            raise ValueError("prefetch_factor must be positive.")
 
         self.emb_dim = emb_dim
         self.hidden_dim = hidden_dim
@@ -127,6 +153,8 @@ class DefaultWorkflowSurrogate(WorkflowSurrogate):
         self.eta = eta
         self.seed = seed
         self.patience = patience
+        self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
 
         self.keys: list[str] = []
         self.n: int = 1

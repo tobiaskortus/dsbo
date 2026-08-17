@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
-from typing import Any, Callable, Generator, List, Mapping, Optional, Set
+from typing import Any, Callable, Generator, List, Mapping, Optional, Set, Union
 
 
 def _is_dry_run():
@@ -131,6 +131,13 @@ class AbstractFilePath:
 
     def filename_for(self, suffix_parts: tuple[str, ...] = ()) -> str:
         filename = self._filename
+        name, extension = os.path.splitext(filename)
+        if extension:
+            from dsbo.config import get_active_file_backend
+
+            backend = get_active_file_backend()
+            if extension.lower() in backend.registered_extensions():
+                filename = f"{name}{backend.default_extension()}"
         if suffix_parts and self._unique:
             name, ext = os.path.splitext(filename)
             filename = f"{name}_{'_'.join(suffix_parts)}{ext}"

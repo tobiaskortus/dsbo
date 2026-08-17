@@ -8,7 +8,7 @@ from dsbo.workflow import (
     to_1d_tensor, candidates_from_tensor, Workflow,
 )
 from dsbo.utils.io import Input, Output, Workdir
-from dsbo.utils.io.hdf5 import HDF5File
+from dsbo.utils.io.storage.hdf5 import HDF5File
 from dsbo.modules import BatchFusedModule, Module, batch_fuse
 from dsbo.utils.io import Workdir
 from dsbo.modules.dsl import DependencyDict
@@ -883,7 +883,7 @@ class TestBatchFuse:
                 # Only resolve self.a; self.b is never touched
                 return {"out": HDF5File.open(self.a(), "cpu").sum()}
 
-        import dsbo.utils.io.hdf5 as _hdf5_module
+        import dsbo.utils.io.storage.hdf5 as _hdf5_module
         _real_reduce = HDF5File.reduce
 
         def tracking_reduce(sources, destination):
@@ -923,7 +923,7 @@ class TestBatchFuse:
                 vals = HDF5File.open(self.features(), "cpu")
                 return {"loss": vals.sum()}
 
-        import dsbo.utils.io.hdf5 as _hdf5_module2
+        import dsbo.utils.io.storage.hdf5 as _hdf5_module2
         _real_reduce2 = HDF5File.reduce
 
         def tracking_reduce(sources, destination):

@@ -5,20 +5,28 @@ import h5py
 import numpy as np
 import torch
 
-from dsbo.utils.io.autograd import AutogradFileInterface
+from dsbo.utils.io.storage.autograd import AutogradFileInterface
 from dsbo.utils.io.datasets.views import (
+    STORE_COLUMN,
+    STORE_FLAT,
+    STORE_ROW,
     DatasetView,
-    HDF5ColumnGroupDatasetView,
+    HDF5ColumnStoreDatasetView,
     HDF5DatasetView,
+    HDF5RowStoreDatasetView,
 )
 
 
 class HDF5File(AutogradFileInterface):
     DATASETS = ("primal", "tangent", "gradient")
     VDS_SOURCES_ATTRIBUTE = "dsbo_vds_sources"
-
-    # This attribute is used to reconstruct the correct order of the data when the columns argument is omitted while
-    # loading a file saved with columns.
+    PARTITION_SIZES_ATTRIBUTE = "dsbo_partition_sizes"
+    STATS_COUNT_ATTRIBUTE = "dsbo_stats_count"
+    STATS_MEAN_ATTRIBUTE = "dsbo_stats_mean"
+    STATS_SQUARED_DEVIATION_ATTRIBUTE = "dsbo_stats_squared_deviation"
+    ROW_STORE_DATASET = "__dsbo_row_store__"
+    ROW_STORE_KEYS_ATTRIBUTE = "dsbo_keys"
+    STORE_ATTRIBUTE = "dsbo_store"
     COLUMNS_ATTRIBUTE = "dsbo_columns"
 
     @classmethod
@@ -72,6 +80,7 @@ class HDF5File(AutogradFileInterface):
             return
         os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
         with h5py.File(fpath, "a", libver="latest") as file:
+            file.attrs[cls.STORE_ATTRIBUTE] = STORE_FLAT
             for path, value in datasets.items():
                 parent_path, name = os.path.split(path)
                 if not name:
@@ -82,13 +91,32 @@ class HDF5File(AutogradFileInterface):
                 cls._create_dataset(parent, name, value)
 
     @classmethod
-    def open_dataset(cls, fpath: str, prefix: str | None = None) -> DatasetView:
-        cls.validate(fpath)
-        if prefix is None:
-            with h5py.File(fpath, "r") as file:
-                if isinstance(file.get("primal"), h5py.Group):
-                    return HDF5ColumnGroupDatasetView(fpath)
-        return HDF5DatasetView(fpath, prefix=prefix)
+    def write_row_store(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        keys, values = cls._prepare_row_store(datasets)
+        os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
+        with h5py.File(fpath, "w", libver="latest") as file:
+            file.attrs[cls.STORE_ATTRIBUTE] = STORE_ROW
+            cls._create_dataset(file, cls.ROW_STORE_DATASET, values)
+            file[cls.ROW_STORE_DATASET].attrs[cls.ROW_STORE_KEYS_ATTRIBUTE] = json.dumps(keys)
+
+    @classmethod
+    def open_dataset(cls, fpath: str) -> DatasetView:
+        file = h5py.File(fpath, "r")
+        try:
+            cls._validate_vds_sources(file)
+            store = file.attrs.get(cls.STORE_ATTRIBUTE)
+            if store == STORE_ROW:
+                return HDF5RowStoreDatasetView(file)
+            if store == STORE_COLUMN:
+                return HDF5ColumnStoreDatasetView(fpath, file=file)
+            if store == STORE_FLAT:
+                return HDF5DatasetView(fpath, file=file)
+            raise ValueError(
+                f"HDF5 file '{fpath}' has no '{cls.STORE_ATTRIBUTE}' store-type tag."
+            )
+        except Exception:
+            file.close()
+            raise
 
     @classmethod
     def columns(cls, fpath: str) -> list[str]:
@@ -184,6 +212,7 @@ class HDF5File(AutogradFileInterface):
 
         os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
         with h5py.File(fpath, "w", libver="latest") as file:
+            file.attrs[cls.STORE_ATTRIBUTE] = STORE_COLUMN if columns is not None else STORE_FLAT
             for name, value in datasets.items():
                 if columns is None:
                     cls._create_dataset(file, name, value)
@@ -196,8 +225,78 @@ class HDF5File(AutogradFileInterface):
 
     @classmethod
     def _create_dataset(cls, parent: h5py.File | h5py.Group, name: str, value: np.ndarray) -> None:
-        options = {} if value.ndim == 0 else {"compression": "gzip"}
-        parent.create_dataset(name, data=value, **options)
+        dataset = parent.create_dataset(name, data=value)
+        statistics = cls._statistics(value)
+        if statistics is not None:
+            cls._write_statistics(dataset, statistics)
+
+    @classmethod
+    def _statistics(cls, value: np.ndarray) -> tuple[int, np.ndarray, np.ndarray] | None:
+        value = np.asarray(value)
+        if value.ndim not in (1, 2) or value.shape[0] == 0 or value.dtype.kind not in "biuf":
+            return None
+        values = value.astype(np.float64, copy=False)
+        mean = values.mean(axis=0)
+        return value.shape[0], mean, np.square(values - mean).sum(axis=0)
+
+    @classmethod
+    def _write_statistics(cls, dataset: h5py.Dataset, statistics: tuple[int, np.ndarray, np.ndarray]) -> None:
+        count, mean, squared_deviation = statistics
+        dataset.attrs[cls.STATS_COUNT_ATTRIBUTE] = count
+        dataset.attrs[cls.STATS_MEAN_ATTRIBUTE] = mean
+        dataset.attrs[cls.STATS_SQUARED_DEVIATION_ATTRIBUTE] = squared_deviation
+
+    @classmethod
+    def _read_statistics(cls, dataset: h5py.Dataset) -> tuple[int, np.ndarray, np.ndarray] | None:
+        attributes = dataset.attrs
+        if any(
+            name not in attributes
+            for name in (
+                cls.STATS_COUNT_ATTRIBUTE,
+                cls.STATS_MEAN_ATTRIBUTE,
+                cls.STATS_SQUARED_DEVIATION_ATTRIBUTE,
+            )
+        ):
+            return None
+        return (
+            int(attributes[cls.STATS_COUNT_ATTRIBUTE]),
+            np.asarray(attributes[cls.STATS_MEAN_ATTRIBUTE]),
+            np.asarray(attributes[cls.STATS_SQUARED_DEVIATION_ATTRIBUTE]),
+        )
+
+    @staticmethod
+    def _combine_statistics(values: list[tuple[int, np.ndarray, np.ndarray] | None]) -> tuple[int, np.ndarray, np.ndarray] | None:
+        if not values or any(value is None for value in values):
+            return None
+        count, mean, squared_deviation = values[0]
+        for batch_count, batch_mean, batch_squared_deviation in values[1:]:
+            total = count + batch_count
+            delta = batch_mean - mean
+            mean += delta * batch_count / total
+            squared_deviation += (
+                batch_squared_deviation
+                + delta * delta * count * batch_count / total
+            )
+            count = total
+        return count, mean, squared_deviation
+
+    @staticmethod
+    def _prepare_row_store(datasets: dict[str, np.ndarray]) -> tuple[list[str], np.ndarray]:
+        if not datasets:
+            raise ValueError("Row-store storage requires at least one feature.")
+        keys = list(datasets)
+        if any(not isinstance(key, str) or not key or "\x00" in key for key in keys):
+            raise ValueError("Feature keys must be non-empty strings without NUL characters.")
+        arrays = []
+        for value in datasets.values():
+            array = np.asarray(value)
+            if array.ndim > 1:
+                raise ValueError("Row-store features must be scalars or one-dimensional arrays.")
+            arrays.append(array.reshape(-1))
+        row_count = arrays[0].shape[0]
+        if any(value.shape[0] != row_count for value in arrays[1:]):
+            raise ValueError("All row-store features must contain the same number of rows.")
+        return keys, np.column_stack(arrays)
 
     @classmethod
     def _validate_columns(cls, columns: list[str], value: np.ndarray | None = None) -> list[str]:
@@ -260,10 +359,12 @@ class HDF5File(AutogradFileInterface):
         if not sources:
             raise ValueError("HDF5 reduction requires at least one source file.")
 
-        metadata = cls._collect_metadata(sources)
+        metadata, store_types = cls._collect_metadata(sources)
         dataset_names = set(metadata[0])
         if any(set(m) != dataset_names for m in metadata[1:]):
             raise ValueError("All HDF5 reduction sources must expose identical datasets.")
+        if any(store != store_types[0] for store in store_types[1:]):
+            raise ValueError("HDF5 reduction sources must share the same store type.")
 
         os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
         destination_dir = os.path.dirname(os.path.abspath(destination))
@@ -274,12 +375,17 @@ class HDF5File(AutogradFileInterface):
 
         with h5py.File(destination, "w", libver="latest") as output:
             output.attrs[cls.VDS_SOURCES_ATTRIBUTE] = json.dumps(relative_sources)
+            output.attrs[cls.STORE_ATTRIBUTE] = store_types[0]
             with h5py.File(sources[0], "r") as first_source:
                 cls._copy_group_attributes(first_source, output)
             for dataset_name in sorted(dataset_names):
                 shapes = [m[dataset_name][0] for m in metadata]
                 dtype = metadata[0][dataset_name][1]
-                cls._write_vds(output, dataset_name, relative_sources, shapes, dtype)
+                statistics = cls._combine_statistics([m[dataset_name][2] for m in metadata])
+                keys = metadata[0][dataset_name][3]
+                if any(m[dataset_name][3] != keys for m in metadata[1:]):
+                    raise ValueError(f"Cannot reduce HDF5 dataset '{dataset_name}' with incompatible keys.")
+                cls._write_vds(output, dataset_name, relative_sources, shapes, dtype, statistics, keys)
 
     @classmethod
     def _copy_group_attributes(cls, source: h5py.Group, target: h5py.Group) -> None:
@@ -292,8 +398,12 @@ class HDF5File(AutogradFileInterface):
             cls._copy_group_attributes(value, target_group)
 
     @classmethod
-    def _collect_metadata(cls, sources: list[str]) -> list[dict[str, tuple[tuple[int, ...], str]]]:
+    def _collect_metadata(
+        cls,
+        sources: list[str],
+    ) -> tuple[list[dict[str, tuple[tuple[int, ...], np.dtype, tuple | None, list[str] | None]]], list[str]]:
         metadata = []
+        store_types = []
         for source in sources:
             if not os.path.isfile(source):
                 raise FileNotFoundError(f"Missing registered batch input: {source}")
@@ -305,20 +415,30 @@ class HDF5File(AutogradFileInterface):
                 )
             try:
                 with h5py.File(source, "r") as file:
-                    source_metadata: dict[str, tuple[tuple[int, ...], str]] = {}
+                    source_metadata = {}
                     file.visititems(
-                        lambda name, obj: source_metadata.update([(name, (obj.shape, obj.dtype))])
+                        lambda name, obj: source_metadata.update(
+                            [(name, (obj.shape, obj.dtype, cls._read_statistics(obj)))]
+                        )
                         if isinstance(obj, h5py.Dataset) else None
                     )
+                    for name, item in list(source_metadata.items()):
+                        dataset = file[name]
+                        stored_keys = dataset.attrs.get(cls.ROW_STORE_KEYS_ATTRIBUTE)
+                        source_metadata[name] = (*item, json.loads(stored_keys) if stored_keys is not None else None)
                     if not source_metadata:
                         raise ValueError(f"HDF5 source '{source}' contains no datasets.")
+                    store_type = file.attrs.get(cls.STORE_ATTRIBUTE)
+                    if store_type not in (STORE_FLAT, STORE_COLUMN, STORE_ROW):
+                        raise ValueError(f"HDF5 source '{source}' has an unknown or missing store-type tag.")
                     metadata.append(source_metadata)
+                    store_types.append(store_type)
             except OSError:
                 raise TypeError(
                     f"HDF5 reduction source '{source}' is not a valid HDF5 file. "
                     f"The file may be a different format (e.g. PyTorch .pt, JSON, etc.)."
                 )
-        return metadata
+        return metadata, store_types
 
     @classmethod
     def _write_vds(
@@ -327,7 +447,9 @@ class HDF5File(AutogradFileInterface):
         dataset_name: str,
         relative_sources: list[str],
         shapes: list[tuple[int, ...]],
-        dtype: str,
+        dtype: np.dtype,
+        statistics: tuple | None,
+        keys: list[str] | None,
     ) -> None:
         parent, _ = os.path.split(dataset_name)
         if parent:
@@ -345,7 +467,14 @@ class HDF5File(AutogradFileInterface):
             for src, shape in zip(relative_sources, shapes):
                 layout[offset:offset + shape[0]] = h5py.VirtualSource(src, dataset_name, shape=shape)
                 offset += shape[0]
-        output.create_virtual_dataset(dataset_name, layout)
+        dataset = output.create_virtual_dataset(dataset_name, layout)
+        dataset.attrs[cls.PARTITION_SIZES_ATTRIBUTE] = json.dumps(
+            [1 if shape == () else shape[0] for shape in shapes]
+        )
+        if statistics is not None:
+            cls._write_statistics(dataset, statistics)
+        if keys is not None:
+            dataset.attrs[cls.ROW_STORE_KEYS_ATTRIBUTE] = json.dumps(keys)
 
     @classmethod
     def _validate_shapes(cls, dataset_name: str, shapes: list[tuple[int, ...]]) -> None:

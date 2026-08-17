@@ -53,7 +53,7 @@ class ResultRecorder(Module):
     def __call__(self, design: dict, **kwargs) -> dict:
         result = self.inner(design=design, **kwargs)
         fpath = self._record_output()
-        get_active_file_backend().write_named_datasets(
+        get_active_file_backend().write_row_store(
             fpath,
             {
                 key: value.detach().cpu().numpy()

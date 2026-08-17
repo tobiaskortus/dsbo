@@ -3,7 +3,7 @@ import torch
 import pytest
 import numpy as np
 
-from dsbo.utils.io.hdf5 import HDF5File
+from dsbo.utils.io.storage.hdf5 import HDF5File
 from dsbo.worker.dask import DaskWorkerBase
 from dsbo.workflow import Workflow
 from dsbo.utils.io.workdir import Workdir
