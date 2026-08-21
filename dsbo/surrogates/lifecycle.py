@@ -138,6 +138,14 @@ class SurrogateLifecycle:
     def uses_workflow_surrogates(self) -> bool:
         return self._workflow_surrogate != None    
 
+    @property
+    def available_module_surrogates(self) -> dict[Module, SurrogateBase]:
+        return {
+            module: surrogate
+            for module, surrogate in self.module_surrogates.items()
+            if surrogate.is_available
+        }
+
     def pending_training_sessions(self, candidate: Candidate) -> Iterator[SurrogateTrainingContext]:
         if self._workflow_surrogate is not None:
             targets = ((self._workflow_surrogate, True),)
@@ -164,12 +172,14 @@ class SurrogateLifecycle:
             yield
             return
 
-        if self.uses_workflow_surrogates:
+        workflow_surrogate = self._workflow_surrogate
+        available_modules = self.available_module_surrogates
+        if workflow_surrogate is not None and workflow_surrogate.is_available:
             state = WorkflowGraphExecutionStateState(
                 GraphMode.WORKFLOW_SURROGATE_EVAL,
-                nx.DiGraph({self._workflow_surrogate: []}),
+                nx.DiGraph({workflow_surrogate: []}),
             )
-        elif self.uses_module_surrogates:
+        elif available_modules:
             if len(candidates) > 1:
                 raise NotImplementedError("Batch execution for module surrogates is not supported yet.")
             
@@ -178,6 +188,7 @@ class SurrogateLifecycle:
                 build_module_surrogate_eval_graph(
                     self._default_graph,
                     self._dependency_groups,
+                    set(available_modules),
                 ),
             )
         else:

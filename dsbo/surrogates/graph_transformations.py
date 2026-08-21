@@ -8,8 +8,9 @@ import networkx as nx
 
 from dsbo.modules import Module
 from dsbo.utils.io import Workdir
-from dsbo.modules.dsl import ModuleDslMixin
+from dsbo.modules.dsl import DependencyGroup, ModuleDslMixin
 from dsbo.modules.utils import ResultRecorder
+from dsbo.worker.ddp import assert_ddp_supported
 from dsbo.modules.fused import BatchFusedModule, batch_fuse, is_batch_fused
 from dsbo.utils.io.workdir import AbstractFilePath, DefaultFilenames, DefaultPaths
 
@@ -59,7 +60,7 @@ def _has_surrogate(module: Module) -> bool:
     return hasattr(module, "surrogate") and module.surrogate is not None
 
 
-def _surrogate_nodes(dependency_groups: Iterable, G: nx.DiGraph) -> set[Module]:
+def _surrogate_nodes(dependency_groups: Iterable[DependencyGroup], G: nx.DiGraph) -> set[Module]:
     nodes: set[Module] = set()
     for g in dependency_groups:
         if _has_surrogate(g.template):
@@ -84,7 +85,12 @@ def _surrogate_replicator():
     return make
 
 
-def _validate_training_inputs(surrogate, training_task, candidates, *, workflow: bool):
+def _validate_training_inputs(
+    surrogate: WorkflowSurrogate | ModuleSurrogate | None,
+    training_task: Module | None,
+    candidates: CandidateBatch | None,
+    workflow: bool
+) -> None:
     if workflow:
         if surrogate is None:
             raise RuntimeError(
@@ -104,16 +110,25 @@ def _validate_training_inputs(surrogate, training_task, candidates, *, workflow:
             raise RuntimeError("Module surrogate training requires generated candidates.")
 
 
-def _batch_fuse_trainer(train_submodule, surrogate) -> BatchFusedModule:
-    train_submodule.resources = getattr(surrogate, "resources", None)
+def _batch_fuse_trainer(train_submodule: Module, surrogate: WorkflowSurrogate | ModuleSurrogate) -> BatchFusedModule:
+    resources = surrogate.resources
+    train_submodule.resources = resources
+    n_ranks = resources.n_ranks if resources is not None else 1
+    if isinstance(n_ranks, int) and n_ranks > 1:
+        assert_ddp_supported(resources, n_ranks)
     return batch_fuse(train_submodule)
 
-def _bind_candidates(train_submodule, candidates) -> None:
+def _bind_candidates(train_submodule: Module, candidates: CandidateBatch) -> Module:
     train_submodule.bind(candidates=candidates)
     return train_submodule
 
 
-def _build_module_surrogate_trainer(G, producers, training_task, candidates) -> BatchFusedModule:
+def _build_module_surrogate_trainer(
+    G: nx.DiGraph,
+    producers: list[Module],
+    training_task: Module,
+    candidates: CandidateBatch
+) -> BatchFusedModule:
     _bind_candidates(training_task, candidates)
     trainer = _batch_fuse_trainer(training_task, producers[0].surrogate)
     trainer.i = 0
@@ -124,7 +139,9 @@ def _build_module_surrogate_trainer(G, producers, training_task, candidates) -> 
 
 
 def _module_surrogate_subgraph(
-    base_graph: nx.DiGraph, dependency_groups: Iterable, target: ModuleSurrogate
+    base_graph: nx.DiGraph,
+    dependency_groups: Iterable[DependencyGroup],
+    target: ModuleSurrogate
 ) -> nx.DiGraph:
     G = base_graph.copy()
     surrogated = {
@@ -137,7 +154,7 @@ def _module_surrogate_subgraph(
     return G
 
 
-def _contract_equivalent_leaves(G: nx.DiGraph, dependency_groups: Iterable) -> nx.DiGraph:
+def _contract_equivalent_leaves(G: nx.DiGraph, dependency_groups: Iterable[DependencyGroup]) -> nx.DiGraph:
     """Only applied when the selected subgraph is a set of independent leaves: collapses
     replicates sharing a template (or type, when no template) into a single representative
     so one trainer producer remains. Algorithm preserved verbatim."""
@@ -157,13 +174,13 @@ def _contract_equivalent_leaves(G: nx.DiGraph, dependency_groups: Iterable) -> n
         partition = [set(v) for v in block_of.values() if len(v) > 1]
 
         for block in partition:
-            block = sorted(block, key=lambda x: getattr(x, "i", 0))
+            block = sorted(block, key=lambda x: x.i)
             for node in block[1:]:
                 G = nx.contracted_nodes(G, block[0], node, self_loops=False)
     return G
 
 
-def _wrap_with_recorders(base_graph: nx.DiGraph, record_path) -> tuple[nx.DiGraph, dict[Module, ResultRecorder]]:
+def _wrap_with_recorders(base_graph: nx.DiGraph, record_path: AbstractFilePath) -> tuple[nx.DiGraph, dict[Module, ResultRecorder]]:
     node_to_recorder: dict[Module, ResultRecorder] = {
         node: ResultRecorder(node, record_path)
         for node in base_graph.nodes()
@@ -172,31 +189,38 @@ def _wrap_with_recorders(base_graph: nx.DiGraph, record_path) -> tuple[nx.DiGrap
     return nx.relabel_nodes(base_graph, node_to_recorder), node_to_recorder
 
 
-def _attach_training_sink(G: nx.DiGraph, train_fused):
+def _attach_training_sink(G: nx.DiGraph, train_fused: BatchFusedModule) -> None:
     G.add_node(train_fused)
     for node in list(G.nodes()):
         if node is not train_fused and G.out_degree(node) == 0:
             G.add_edge(node, train_fused)
 
 
-def build_module_surrogate_eval_graph(base_graph: nx.DiGraph, dependency_groups: Iterable) -> nx.DiGraph:
+def build_module_surrogate_eval_graph(
+    base_graph: nx.DiGraph,
+    dependency_groups: Iterable[DependencyGroup],
+    selected_modules: set[Module] | None = None
+) -> nx.DiGraph:
     G = base_graph.copy()
+    selected_modules = set(G.nodes) if selected_modules is None else selected_modules
 
     make_surrogate = _surrogate_replicator()
     mapping: dict[Module, Module] = {}
 
-    def _map(module, nodes):
+    def _map(module: Module, nodes: Iterable[Module]) -> None:
         surrogate = make_surrogate(module.surrogate)
         surrogate.set_alias(f"{module.name} (surrogate)")
         for node in nodes:
             mapping[node] = surrogate
 
     for group in dependency_groups:
-        if _has_surrogate(group.template):
+        if _has_surrogate(group.template) and any(
+            node in selected_modules for node in group.nodes
+        ):
             _map(group.template, group.nodes)
 
     for node in G.nodes():
-        if node not in mapping and _has_surrogate(node):
+        if node in selected_modules and node not in mapping and _has_surrogate(node):
             _map(node, [node])
 
     return nx.relabel_nodes(G, mapping, copy=False)
@@ -204,11 +228,12 @@ def build_module_surrogate_eval_graph(base_graph: nx.DiGraph, dependency_groups:
 
 def build_module_surrogate_training_plan(
     base_graph: nx.DiGraph,
-    dependency_groups: Iterable,
+    dependency_groups: Iterable[DependencyGroup],
     target: ModuleSurrogate,
     training_task: Module | None,
-    candidates: CandidateBatch | None = None) -> SurrogateTrainingPlan:
-    
+    candidates: CandidateBatch | None = None
+) -> SurrogateTrainingPlan:
+
     _validate_training_inputs(target, training_task, candidates, workflow=False)
 
     G = _module_surrogate_subgraph(base_graph, dependency_groups, target)
@@ -221,10 +246,10 @@ def build_module_surrogate_training_plan(
 
 def build_workflow_surrogate_training_plan(
     base_graph: nx.DiGraph,
-    dependency_groups: Iterable,
+    dependency_groups: Iterable[DependencyGroup],
     surrogate: WorkflowSurrogate,
     training_task: Module | None,
-    candidates: CandidateBatch | None = None,
+    candidates: CandidateBatch | None = None
 ) -> SurrogateTrainingPlan:
     _validate_training_inputs(surrogate, training_task, candidates, workflow=True)
 
@@ -234,7 +259,7 @@ def build_workflow_surrogate_training_plan(
     _bind_candidates(training_task, candidates)
     train_fused = _batch_fuse_trainer(training_task, surrogate)
     train_fused.set_alias(training_task.name)
-    
+
     _attach_training_sink(G, train_fused)
     G._dependency_groups = tuple(dg.relabel(node_to_recorder) for dg in dependency_groups)
 

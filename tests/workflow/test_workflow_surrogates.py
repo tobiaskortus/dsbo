@@ -7,16 +7,20 @@ from dsbo.config import config
 from dsbo.utils.io import Workdir, Input
 from dsbo.utils.cache import CacheConfig, CachePolicy
 from dsbo.surrogates import SurrogateBase, SurrogateStrategy
+from dsbo.surrogates import LifecycleStage
+from dsbo.surrogates.trainer import TrainingConfig
 from dsbo.surrogates.graph_transformations import GraphMode
 from dsbo.workflow import Workflow, RunBatchAutogradFn
-from dsbo.surrogates.workflow_surrogate import DefaultWorkflowSurrogate
-from dsbo.surrogates.diffusion import MlpDiffusion1D
 from tests.workflow.conftest import SimpleModule, SurrogateModule, FailingModule
 from dsbo.workflow.workflow import ResultsBatch
+from tests.surrogates.conftest import (
+    TinyModelBase,
+    TinyPretrainFinetuneModel,
+    TinySurrogateModel,
+)
 
 
 class WorkflowSurrogateModule(Module):
-    _is_pretrained = True
     requires_design_tensor = True
 
     def __init__(self):
@@ -30,6 +34,10 @@ class WorkflowSurrogateModule(Module):
 
     def select_training_task(self, candidate):
         return None
+
+    @property
+    def is_available(self):
+        return True
 
     def __call__(self, design, **kwargs):
         assert isinstance(design, dict)
@@ -77,7 +85,7 @@ class TestSurrogateTrainingSessions:
         training_task = TrainOnlySurrogate().train
         surrogate.select_training_task.return_value = training_task
         surrogate.generate_training_candidates.return_value = []
-        surrogate.training_stage.return_value = "trained"
+        surrogate.training_stage.return_value = "train"
         wf.patch(surrogate)
 
         cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
@@ -107,7 +115,7 @@ class TestSurrogateTrainingSessions:
             )
             run_training_batch.assert_called_once_with([])
             surrogate.training_stage.assert_called_once_with(training_task)
-            surrogate.publish_trained_model.assert_called_once_with("model.pt", stage="trained")
+            surrogate.publish_trained_model.assert_called_once_with("model.pt", stage="train")
 
     def test_workflow_surrogate_skips_when_no_task_selected(self):
         m = SimpleModule()
@@ -127,7 +135,7 @@ class TestSurrogateTrainingSessions:
         training_task = TrainOnlySurrogate().train
         m.surrogate.select_training_task.return_value = training_task
         m.surrogate.generate_training_candidates.return_value = []
-        m.surrogate.training_stage.return_value = "trained"
+        m.surrogate.training_stage.return_value = "train"
         wf = Workflow(m)
 
         cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
@@ -157,7 +165,10 @@ class TestSurrogateTrainingSessions:
             )
             run_training_batch.assert_called_once_with([])
             m.surrogate.training_stage.assert_called_once_with(training_task)
-            m.surrogate.publish_trained_model.assert_called_once_with("model.pt", stage="trained")
+            m.surrogate.publish_trained_model.assert_called_once_with(
+                "model.pt",
+                stage="train",
+            )
 
     def test_module_surrogate_skips_when_no_task_selected(self):
         m = SimpleModule()
@@ -172,74 +183,17 @@ class TestSurrogateTrainingSessions:
 
 
 class TestRunWorkflowWithSurrogate:
-    def _tiny_diffusion_surrogate(self, objective_dim=2, parameter_dim=1, sample_count=3):
-        surrogate = DefaultWorkflowSurrogate(MagicMock())
-        surrogate.keys = [f"k{i}" for i in range(objective_dim)]
-        surrogate.n = 1
-        surrogate.sample_count = sample_count
-        surrogate.num_infer_timesteps = 4
-        surrogate._mean_x = None
-        surrogate._std_x = None
-        surrogate._mean_y = None
-        surrogate._std_y = None
-        surrogate._diffusion_model = MlpDiffusion1D(
-            objective_dim=objective_dim,
-            parameter_dim=parameter_dim,
-            emb_dim=16,
-            hidden_dim=16,
-            n_layers=2,
-        )
-        surrogate._create_schedulers()
-        return surrogate
-
-    def test_diffusion_surrogate_samples_n_values_per_key(self):
-        surrogate = self._tiny_diffusion_surrogate(objective_dim=2, sample_count=3)
-        design_tensor = torch.tensor([3.0])
-
-        with patch.object(surrogate, "get_runtime_model", side_effect=lambda: None):
-            result = surrogate({"x": torch.tensor(99.0)}, design_tensor=design_tensor)
-
-        assert result["k0"].shape == (3,)
-        assert result["k1"].shape == (3,)
-        assert torch.isfinite(result["k0"]).all() and torch.isfinite(result["k1"]).all()
-
-    def test_diffusion_surrogate_samples_are_distinct_given_distinct_conditions(self):
-        surrogate = self._tiny_diffusion_surrogate(objective_dim=1, sample_count=1)
-        d1 = torch.tensor([1.0])
-        d2 = torch.tensor([5.0])
-
-        with patch.object(surrogate, "get_runtime_model", side_effect=lambda: None):
-            y1 = surrogate({"x": torch.tensor(0.0)}, design_tensor=d1)["k0"]
-            y2 = surrogate({"x": torch.tensor(0.0)}, design_tensor=d2)["k0"]
-
-        assert torch.isfinite(y1).all() and torch.isfinite(y2).all()
-
-    def test_diffusion_surrogate_backward_flows_gradient_to_design(self):
-        surrogate = self._tiny_diffusion_surrogate(objective_dim=1, parameter_dim=1, sample_count=1)
-        design_tensor = torch.tensor([3.0], requires_grad=True)
-
-        with patch.object(surrogate, "get_runtime_model", side_effect=lambda: None):
-            surrogate.backward(
-                {"x": torch.tensor(0.0)},
-                {"k0": torch.tensor([1.0])},
-                design_tensor=design_tensor,
-            )
-
-        assert design_tensor.grad is not None
-        assert design_tensor.grad.shape == (1,)
-        assert torch.isfinite(design_tensor.grad)
-
     def test_workflow_surrogate(self, single_module_workflow, candidate):
         surrogate = WorkflowSurrogateModule()
         surrogate._is_pretrained = True
-        single_module_workflow.patch(surrogate)
+        single_module_workflow.surrogate_execution.set_workflow_surrogate(surrogate)
         result = single_module_workflow.run(candidate)
         assert torch.allclose(result["out"], torch.tensor(42.0))
 
     def test_workflow_surrogate_batch(self, single_module_workflow, candidates):
         surrogate = WorkflowSurrogateModule()
         surrogate._is_pretrained = True
-        single_module_workflow.patch(surrogate)
+        single_module_workflow.surrogate_execution.set_workflow_surrogate(surrogate)
 
         with single_module_workflow.surrogate_execution.use_surrogates_if_available(len(candidates)):
             results = single_module_workflow.run_batch(candidates)
@@ -250,7 +204,7 @@ class TestRunWorkflowWithSurrogate:
     def test_workflow_surrogate_backward_routes_through_saved_context(self, single_module_workflow, candidate):
         surrogate = WorkflowSurrogateModule()
         surrogate._is_pretrained = True
-        single_module_workflow.patch(surrogate)
+        single_module_workflow.surrogate_execution.set_workflow_surrogate(surrogate)
 
         seen_modes = []
 
@@ -355,20 +309,32 @@ class _StubStrategy(SurrogateStrategy):
         return [candidate]
 
 
+_TrainingConfig = TrainingConfig(
+    max_epochs=1,
+    grad_clip=1.0,
+    batch_size=2,
+    val_split=0.0,
+)
+
+
 class NoOpSurrogate(SurrogateBase):
-    def __init__(self):
-        super().__init__(strategy=_StubStrategy())
+    def __init__(self, model=None):
+        super().__init__(
+            model=model or TinyModelBase(),
+            strategy=_StubStrategy(),
+            training_config=_TrainingConfig,
+        )
         self.calls: list[str] = []
         self.data_file = Input(Workdir.register_file("simulation", "events.h5"))
 
-    def state_dict(self) -> dict:
-        return {}
-
-    def from_state_dict(self, state: dict) -> None:
-        pass
+    def build_training_data(self, stage, design, candidates):
+        raise AssertionError("NoOpSurrogate training should not execute in these tests.")
 
 
 class TrainOnlySurrogate(NoOpSurrogate):
+    def __init__(self):
+        super().__init__(model=TinySurrogateModel())
+
     @dynamic_submodule
     def train(self, design, **kwargs):
         self.calls.append("train")
@@ -376,6 +342,9 @@ class TrainOnlySurrogate(NoOpSurrogate):
 
 
 class PretrainFinetuneSurrogate(NoOpSurrogate):
+    def __init__(self):
+        super().__init__(model=TinyPretrainFinetuneModel())
+
     @dynamic_submodule
     def pretrain(self, design, **kwargs):
         self.calls.append("pretrain")
@@ -390,31 +359,29 @@ class PretrainFinetuneSurrogate(NoOpSurrogate):
 class TestTrainingTaskSelection:
     candidate = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
 
-    def test_implements_reads_lifecycle_not_descriptor(self):
+    def test_overridden_stage_methods_register_lifecycle_tasks(self):
         single = TrainOnlySurrogate()
-        assert single.implements_train
-        assert not single.implements_pretrain
-        assert not single.implements_finetune
-        assert not single.implements_pretrain_and_finetune
+        assert set(single._lifecycle_tasks) == {LifecycleStage.TRAIN}
 
         two = PretrainFinetuneSurrogate()
-        assert not two.implements_train
-        assert two.implements_pretrain
-        assert two.implements_finetune
-        assert two.implements_pretrain_and_finetune
+        assert set(two._lifecycle_tasks) == {
+            LifecycleStage.PRETRAIN,
+            LifecycleStage.FINETUNE,
+        }
 
     def test_no_lifecycle_implemented_rejected_at_construction(self):
-        with pytest.raises(NotImplementedError, match="must implement train or pretrain"):
+        with pytest.raises(ValueError, match="exactly one initial"):
             NoOpSurrogate()
 
     def test_selects_single_shot_train_task(self):
         s = TrainOnlySurrogate()
-        with patch.object(SurrogateBase, "_use_cached_models", return_value=False):
+        Workflow(SimpleModule()).patch(s)
+        with patch("dsbo.surrogates._use_cached_models", return_value=False):
             task = s.select_training_task(self.candidate)
         assert task is s.train
         with pytest.raises(KeyError):
             task.binding("candidates")
-        assert s.training_stage(task) == "trained"
+        assert s.training_stage(task) == "train"
         assert s.strategy.finetune_flags == []
         assert s.calls == []
 
@@ -422,7 +389,7 @@ class TestTrainingTaskSelection:
         s = TrainOnlySurrogate()
         wf = Workflow(SimpleModule())
         wf.patch(s)
-        with patch.object(SurrogateBase, "_use_cached_models", return_value=False):
+        with patch("dsbo.surrogates._use_cached_models", return_value=False):
             task = s.select_training_task(self.candidate)
         with patch.object(s, "publish_trained_model"):
             session = next(wf.surrogate_execution.pending_training_sessions(self.candidate))
@@ -440,8 +407,12 @@ class TestTrainingTaskSelection:
     def test_training_invocations_build_and_execute_distinct_plans(self):
         workflow = Workflow(SimpleModule())
         surrogate = MagicMock()
-        first_task = TrainOnlySurrogate().train
-        second_task = TrainOnlySurrogate().train
+        first_trainer = TrainOnlySurrogate()
+        second_trainer = TrainOnlySurrogate()
+        Workflow(SimpleModule()).patch(first_trainer)
+        Workflow(SimpleModule()).patch(second_trainer)
+        first_task = first_trainer.train
+        second_task = second_trainer.train
         first_candidate = self.candidate
         second_candidate = Candidate(
             self.candidate.space,
@@ -451,7 +422,7 @@ class TestTrainingTaskSelection:
             [first_candidate],
             [second_candidate],
         ]
-        surrogate.training_stage.return_value = "trained"
+        surrogate.training_stage.return_value = "train"
         surrogate.select_training_task.side_effect = [first_task, second_task]
         workflow.patch(surrogate)
 
@@ -479,9 +450,11 @@ class TestTrainingTaskSelection:
             conditional_file=None,
         )
         module.surrogate = target
-        target.select_training_task.return_value = task = TrainOnlySurrogate().train
+        trainer = TrainOnlySurrogate()
+        Workflow(SimpleModule()).patch(trainer)
+        target.select_training_task.return_value = task = trainer.train
         target.generate_training_candidates.return_value = [self.candidate]
-        target.training_stage.return_value = "trained"
+        target.training_stage.return_value = "train"
         workflow = Workflow(module)
 
         session = next(workflow.surrogate_execution.pending_training_sessions(self.candidate))
@@ -495,13 +468,13 @@ class TestTrainingTaskSelection:
 
     def test_two_phase_selects_pretrain_when_not_pretrained(self):
         s = PretrainFinetuneSurrogate()
-        with patch.object(SurrogateBase, "_use_cached_models", return_value=False), \
-             patch.object(SurrogateBase, "is_pretrained", new=False):
+        with patch("dsbo.surrogates._use_cached_models", return_value=False), \
+             patch.object(SurrogateBase, "has_initial_model", new=False):
             task = s.select_training_task(self.candidate)
         assert task is s.pretrain
         with pytest.raises(KeyError):
             task.binding("candidates")
-        assert s.training_stage(task) == "pretrained"
+        assert s.training_stage(task) == "pretrain"
         assert s.strategy.finetune_flags == []
         assert s.generate_training_candidates(self.candidate, task) == [self.candidate]
         assert s.strategy.finetune_flags == [False]
@@ -509,14 +482,14 @@ class TestTrainingTaskSelection:
 
     def test_two_phase_selects_finetune_when_not_finetuned(self):
         s = PretrainFinetuneSurrogate()
-        with patch.object(SurrogateBase, "_use_cached_models", return_value=False), \
-             patch.object(SurrogateBase, "is_pretrained", new=True), \
+        with patch("dsbo.surrogates._use_cached_models", return_value=False), \
+             patch.object(SurrogateBase, "has_initial_model", new=True), \
              patch.object(SurrogateBase, "is_finetuned", new=False):
             task = s.select_training_task(self.candidate)
         assert task is s.finetune
         with pytest.raises(AttributeError):
             task.candidates
-        assert s.training_stage(task) == "finetuned"
+        assert s.training_stage(task) == "finetune"
         assert s.strategy.finetune_flags == []
         assert s.generate_training_candidates(self.candidate, task) == [self.candidate]
         assert s.strategy.finetune_flags == [True]
@@ -527,7 +500,7 @@ class TestTrainingTaskSelection:
         s.strategy.is_in_trust_region = lambda c: True
         cfg = CacheConfig(cache_policy=CachePolicy.CACHE_EVERYTHING)
         with config.use(cache_config=cfg), \
-             patch.object(SurrogateBase, "is_pretrained", new=True), \
+             patch.object(SurrogateBase, "has_initial_model", new=True), \
              patch.object(SurrogateBase, "is_finetuned", new=True):
             d = s.select_training_task(self.candidate)
         assert d is None
@@ -536,8 +509,8 @@ class TestTrainingTaskSelection:
     def test_two_phase_retrains_finetuned_model_when_retrain_forced(self):
         s = PretrainFinetuneSurrogate()
         s.strategy.is_in_trust_region = lambda c: True
-        with patch.object(SurrogateBase, "_use_cached_models", return_value=False), \
-             patch.object(SurrogateBase, "is_pretrained", new=True), \
+        with patch("dsbo.surrogates._use_cached_models", return_value=False), \
+             patch.object(SurrogateBase, "has_initial_model", new=True), \
              patch.object(SurrogateBase, "is_finetuned", new=True):
             task = s.select_training_task(self.candidate)
         assert task is s.finetune
@@ -548,7 +521,7 @@ class TestTrainingTaskSelection:
         s.strategy.is_in_trust_region = lambda c: False
         cfg = CacheConfig(cache_policy=CachePolicy.CACHE_EVERYTHING)
         with config.use(cache_config=cfg), \
-             patch.object(SurrogateBase, "is_pretrained", new=True), \
+             patch.object(SurrogateBase, "has_initial_model", new=True), \
              patch.object(SurrogateBase, "is_finetuned", new=True):
             task = s.select_training_task(self.candidate)
         assert task is s.finetune

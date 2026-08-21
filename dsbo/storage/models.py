@@ -50,6 +50,14 @@ class Execution(SQLModel, table=True):
 
 
 class JobTrace(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint(
+            "execution_id",
+            "task_key",
+            name="uq_job_trace_execution_task",
+        ),
+    )
+
     id:           Optional[int] = Field(default=None, primary_key=True)
     execution_id: str           = Field(foreign_key="execution.id")
     task_key:     str

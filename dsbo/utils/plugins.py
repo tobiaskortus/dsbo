@@ -34,17 +34,20 @@ class TaskStreamPlugin(SchedulerPlugin):
         self._name_map: Dict[str, str] = name_map
         self._log_buffer: Dict[str, list] = {}
         self._scheduler = None
+        self._write_futures: list[Future] = []
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsbo-task-stream")
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state.pop("_executor", None)
+        state.pop("_write_futures", None)
         state.pop("scheduler", None)
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsbo-task-stream")
+        self._write_futures = []
         self._scheduler = None
 
     def start(self, scheduler):
@@ -53,14 +56,14 @@ class TaskStreamPlugin(SchedulerPlugin):
     async def close(self):
         await asyncio.to_thread(self._executor.shutdown, wait=True)
 
-    @staticmethod
-    def _report_write_error(future: Future) -> None:
-        error = future.exception()
-        if error is not None:
-            print(f"[TaskStreamPlugin] write error: {error}")
-
     def _write_async(self, *args) -> None:
-        self._executor.submit(self._writer, *args).add_done_callback(self._report_write_error)
+        self._write_futures.append(self._executor.submit(self._writer, *args))
+
+    def flush(self) -> None:
+        futures, self._write_futures = self._write_futures, []
+        self._executor.submit(lambda: None).result()
+        for future in futures:
+            future.result()
 
     def update(self, writer, task_map, name_map, tag: str = "") -> None:
         self._tag = tag
@@ -94,8 +97,13 @@ class TaskStreamPlugin(SchedulerPlugin):
                         self._write_async(key, name, worker.name if worker != None else "unknown", approx_start, -1, exec_id, "", status, self._tag)
                     return
 
-                worker = self._scheduler.workers[kwargs["worker"]]
-                startstop = kwargs["startstops"][0]
+                worker = self._scheduler.workers.get(kwargs["worker"]) if "worker" in kwargs else None
+                worker_name = worker.name if worker is not None else "unknown"
+
+                startstop = (kwargs.get("startstops") or [{}])[0]
+                start = startstop.get("start", -1)
+                stop = startstop.get("stop", -1)
+
                 name = self._name_map.get(key, key)
                 messages = self._log_buffer.pop(key, [])
                 log = "\n".join(messages)
@@ -104,7 +112,7 @@ class TaskStreamPlugin(SchedulerPlugin):
                 if isinstance(exec_ids, str):
                     exec_ids = (exec_ids,)
                 for exec_id in exec_ids:
-                    self._write_async(key, name, worker.name, startstop["start"], startstop["stop"], exec_id, log, status, self._tag)
+                    self._write_async(key, name, worker_name, start, stop, exec_id, log, status, self._tag)
             except Exception as e:
                 print(f"[TaskStreamPlugin] transition error: {e}")
 

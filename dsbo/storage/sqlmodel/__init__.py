@@ -9,10 +9,10 @@ import torch
 import numpy as np
 import dataclasses
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 import networkx as nx
-from sqlalchemy import Engine, event as sa_event, inspect
+from sqlalchemy import Engine, event as sa_event, func, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -65,8 +65,9 @@ class SQLModelTransitionWriter(TransitionWriter):
     ) -> None:
         engine = create_engine(self.url, poolclass=NullPool)
         with Session(engine) as session:
-            execution = session.exec(select(Execution).where(Execution.exec_id == exec_id)).one()
-            wf = session.get(Workflow, execution.workflow_id)
+            execution = session.exec(
+                select(Execution).where(Execution.exec_id == exec_id)
+            ).one()
 
             if status in (JobStatus.RUNNING, JobStatus.QUEUED):
                 query = select(JobTrace).where(
@@ -106,23 +107,32 @@ class SQLModelTransitionWriter(TransitionWriter):
                 job_trace.tag = tag
 
             session.add(job_trace)
+            session.flush()
 
             if execution.start < 0: execution.start = start
 
-            match status:
-                case JobStatus.SUCCESS:
-                    execution.num_successful_jobs += 1
-                case JobStatus.FAILED:
-                    execution.status = JobStatus.FAILED
-                case JobStatus.RUNNING:
-                    execution.status = JobStatus.RUNNING 
-                case JobStatus.QUEUED:
-                    execution.status = JobStatus.QUEUED
-                case _:
-                    execution.status = JobStatus.PENDING
-            
-            #Mark execution as SUCCESS if all jobs are done and none have failed
-            if execution.num_successful_jobs >= wf.num_tasks and execution.status != JobStatus.FAILED:
+            successful_jobs = session.exec(
+                select(func.count())
+                .select_from(JobTrace)
+                .where(
+                    JobTrace.execution_id == execution.id,
+                    JobTrace.status == JobStatus.SUCCESS,
+                )
+            ).one()
+            execution.num_successful_jobs = successful_jobs
+
+            if status == JobStatus.FAILED:
+                execution.status = JobStatus.FAILED
+            elif execution.status != JobStatus.FAILED and status in (
+                JobStatus.RUNNING,
+                JobStatus.QUEUED,
+            ):
+                execution.status = status
+
+            if (
+                successful_jobs >= execution.num_jobs
+                and execution.status != JobStatus.FAILED
+            ):
                 execution.status = JobStatus.SUCCESS
                 execution.stop = stop
 
@@ -158,7 +168,13 @@ class WorkflowStorage(WorkflowStorageBase):
         return wf
 
 
-    def add_runs(self, wf: Workflow, exec_ids: list[str], batch_id: str) -> Batch:
+    def add_runs(
+        self,
+        wf: Workflow,
+        exec_ids: list[str],
+        batch_id: str,
+        num_jobs: Mapping[str, int],
+    ) -> Batch:
         if self._readonly:
             raise RuntimeError("Cannot register runs to readonly StudyStorage.")
         
@@ -172,8 +188,14 @@ class WorkflowStorage(WorkflowStorageBase):
                 session.flush()
 
             for exec_id in exec_ids:
-                session.add(Execution(workflow_id=wf.id, batch_id=batch.id if batch is not None else None, 
-                                      exec_id=exec_id, num_jobs=wf.num_tasks))
+                session.add(
+                    Execution(
+                        workflow_id=wf.id,
+                        batch_id=batch.id if batch is not None else None,
+                        exec_id=exec_id,
+                        num_jobs=num_jobs[exec_id],
+                    )
+                )
             
             session.commit()
             if batch is not None:

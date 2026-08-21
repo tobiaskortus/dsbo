@@ -56,12 +56,25 @@ def _update_task_stream_plugin(name, writer, task_map, name_map, tag, dask_sched
     return True
 
 
+def _flush_task_stream_plugin(name, dask_scheduler=None):
+    plugin = dask_scheduler.plugins.get(name)
+    if plugin is not None:
+        plugin.flush()
+
+
 def register_task_stream(worker, graph, exec_ids, batch_path, task_map, name_map, name, tag=""):
     storage = get_current_storage()
     if storage is None:
         return
     workflow_record = storage.workflow.add_workflow(graph)
-    storage.workflow.add_runs(workflow_record, exec_ids, batch_path)
+    num_jobs = {exec_id: 0 for exec_id in exec_ids}
+    # DDP ranks count as separate scheduler jobs for completion.
+    for mapped_exec_ids in task_map.values():
+        if isinstance(mapped_exec_ids, str):
+            mapped_exec_ids = (mapped_exec_ids,)
+        for exec_id in mapped_exec_ids:
+            num_jobs[exec_id] += 1
+    storage.workflow.add_runs(workflow_record, exec_ids, batch_path, num_jobs)
     writer = storage.workflow._make_transition_writer()
     if worker.client.run_on_scheduler(_update_task_stream_plugin, name, writer, task_map, name_map, tag):
         return
@@ -147,27 +160,28 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
             overlays = file_overlays(task_graph, task, index, subdirs)
 
             with Workdir.create_subdir(subdir) if subdir else nullcontext():
-                task_id, delayed = worker.schedule(
-                    task,
-                    candidates[0 if index is None else index].values,
-                    deps,
+                base = candidates[0 if index is None else index]
+                schedule_kwargs = dict(
+                    design=base.values,
+                    dependencies=deps,
                     design_tensor=(
-                        candidates[0 if index is None else index].tensor
-                        if task.requires_design_tensor
-                        else None
+                        base.tensor if task.requires_design_tensor else None
                     ),
                     priority=depth,
                     file_overlays=overlays,
                 )
+                scheduled_pairs = worker.schedule(task, **schedule_kwargs)
 
-            delayed_map[(task, index)] = delayed
-            scheduled_tasks.append((task_id, task, index, delayed))
-            for t in targets:
-                batch_task_ids[t].append(task_id)
+            for task_id, delayed in scheduled_pairs:
+                delayed_map[(task, index)] = delayed
+                scheduled_tasks.append((task_id, task, index, delayed))
+                if not is_batch_fused(task):
+                    for t in targets:
+                        batch_task_ids[t].append(task_id)
 
-            eids = tuple(exec_ids[t] for t in targets)
-            task_map[delayed.key] = eids[0] if len(eids) == 1 else eids
-            name_map[delayed.key] = task.name
+                eids = tuple(exec_ids[t] for t in targets)
+                task_map[delayed.key] = eids[0] if len(eids) == 1 else eids
+                name_map[delayed.key] = task.name
 
         register_task_stream(worker, task_graph, exec_ids, batch_path, 
                              task_map, name_map, "dsbo_task_stream", 
@@ -179,12 +193,16 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
         for f in futures:
             f.add_done_callback(lambda _: progress.update())
 
-        results_flat = worker.gather(futures, catch=catch)
-        progress.close()
+        try:
+            results_flat = worker.gather(futures, catch=catch)
+        finally:
+            progress.close()
+            worker.client.run_on_scheduler(_flush_task_stream_plugin, "dsbo_task_stream")
+            
         lookup = {task_id: result for task_id, result in results_flat}
 
         for _, task, _, _ in scheduled_tasks:
-            if is_batch_fused(task):
+            if is_batch_fused(task) and workflow.graph_context.training_plan is None:
                 create_candidate_symlinks(task, subdirs)
 
         return [dict(chain.from_iterable(lookup.get(tid, {}).items() for tid in tids))
@@ -282,9 +300,15 @@ def run_batch_reverse_autograd(
         futures_computed = worker.compute(batch_delays)
         for f in futures_computed:
             f.add_done_callback(lambda _: progress.update())
-            
-        results_flat = worker.gather(futures_computed, catch=catch)
-        progress.close()
+
+        try:
+            results_flat = worker.gather(futures_computed, catch=catch)
+        finally:
+            progress.close()
+            worker.client.run_on_scheduler(
+                _flush_task_stream_plugin,
+                "dsbo_task_stream_bwd",
+            )
         lookup = {tid: grad for tid, grad in results_flat if grad is not None}
 
         gradients = []
@@ -380,11 +404,14 @@ def implements_backward(module: Module) -> bool:
            (getattr(module, "_backward", None) is not None)
 
 
-def assert_workflow_supports_backward_ad(workflow: Workflow) -> None:
+def assert_workflow_supports_backward_ad(workflow: Workflow, silent: bool = False) -> bool:
     unsupported = [m for m in workflow.task_graph.nodes()
                    if isinstance(m, Module) and not implements_backward(m) if not m._no_grad_op]
     if unsupported:
+        if silent:
+            return False
         raise AssertionError(
             f"Modules {unsupported} do not implement backward(), "
             "which is required for reverse-mode AD."
         )
+    return True

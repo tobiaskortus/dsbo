@@ -106,6 +106,12 @@ class Workflow:
         assert_no_duplicate_nodes(self.task_graph)
 
     def patch(self, surrogate: WorkflowSurrogate):
+        from dsbo.utils.cache import compute_workflow_hash
+
+        surrogate.bind_artifact_name(
+            type(self).__name__,
+            compute_workflow_hash(self),
+        )
         self.surrogate_execution.set_workflow_surrogate(surrogate)
 
     def run(self, design: Candidate, catch: tuple[type[Exception], ...] = (), use_surrogates: bool = True) -> dict[str, float]:

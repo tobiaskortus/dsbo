@@ -19,7 +19,6 @@ from dsbo.utils.io import (
     get_workdir,
     with_remote_workdir,
 )
-from dsbo.utils.io.workdir import DefaultPaths
 
 if TYPE_CHECKING:
     from dsbo.worker.spec import WorkerSpec
@@ -101,13 +100,12 @@ class Module(ModuleDslMixin, ABC):
 
     def patch(self, surrogate: ModuleSurrogate):
         surrogate.register_contract(self.surrogate_contract)
-        self.surrogate = surrogate
-        surrogate.model_file_path = Output(
-            Workdir.register_file(
-                DefaultPaths.SURROGATE,
-                f"{surrogate._artifact_name}_{self.name}.pt",
-            )
+        module_type = f"{type(self).__module__}.{type(self).__qualname__}"
+        surrogate.bind_artifact_name(
+            type(self).__name__,
+            f"{module_type}|{self.name}",
         )
+        self.surrogate = surrogate
         return self
 
     @property

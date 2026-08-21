@@ -1,9 +1,12 @@
 import pytest
 import torch
 import networkx as nx
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from dsbo.workflow import Workflow
 from dsbo.modules.dsl import DependencyDict
+from dsbo.surrogates import SurrogateStrategy
+from dsbo.surrogates.workflow_surrogate import WorkflowSurrogate
+from dsbo.surrogates.trainer import TrainingConfig
 from dsbo.surrogates.graph_transformations import (
     GraphMode,
     build_module_surrogate_training_plan,
@@ -12,6 +15,7 @@ from dsbo.surrogates.graph_transformations import (
 from dsbo.workflow.graph_context import WorkflowGraphExecutionStateState
 from dsbo.worker.spec import WorkerSpec
 from tests.workflow.conftest import SimpleModule
+from tests.surrogates.conftest import TinySurrogateModel
 
 
 class TestWorkflowConstruction:
@@ -61,15 +65,28 @@ class TestWorkflowTaskGraph:
             assert G.number_of_nodes() == 1
 
     def test_graph_reads_do_not_implicitly_select_workflow_surrogate(self):
-        class StorageBackedSurrogate(SimpleModule):
+        class _Strategy(SurrogateStrategy):
+            def is_in_trust_region(self, candidate):
+                return False
+
+            def generate_candidates(self, candidate, space, finetune=False):
+                return [candidate]
+
+        class StorageBackedSurrogate(WorkflowSurrogate):
             @property
-            def _is_pretrained(self):
+            def has_initial_model(self):
                 raise AssertionError("Graph reads must not query artifact storage.")
 
         m = SimpleModule()
         wf = Workflow(m)
-        surrogate = StorageBackedSurrogate()
-        wf.patch(surrogate)
+        surrogate = StorageBackedSurrogate(
+            TinySurrogateModel(),
+            _Strategy(),
+            TrainingConfig(max_epochs=1, grad_clip=1.0, batch_size=2, val_split=0.0),
+        )
+        with patch.object(type(surrogate), "bind_artifact_name", MagicMock()) as bind:
+            wf.patch(surrogate)
+        bind.assert_called_once()
         assert wf.graph_context.mode == GraphMode.DEFAULT
         assert list(wf.task_graph) == [m]
 

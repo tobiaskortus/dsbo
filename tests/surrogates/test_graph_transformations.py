@@ -9,13 +9,14 @@ They are intentionally construction-level (no execution), so they stay fast.
 import torch
 
 from dsbo.parameters import ParameterSpace, Continuous, Candidate
-from dsbo.modules import dynamic_submodule, batch_fuse
+from dsbo.modules import batch_fuse
 from dsbo.workflow import Workflow
 from dsbo.utils.io import Workdir, Input
 from dsbo.utils.io.workdir import DefaultPaths, DefaultFilenames
 from dsbo.surrogates import SurrogateStrategy
 from dsbo.surrogates.module_surrogate import ModuleSurrogate
 from dsbo.surrogates.workflow_surrogate import WorkflowSurrogate
+from dsbo.surrogates.trainer import TrainingConfig
 from dsbo.worker.spec import LocalWorkerSpec
 from dsbo.surrogates.graph_transformations import (
     build_module_surrogate_training_plan,
@@ -23,6 +24,7 @@ from dsbo.surrogates.graph_transformations import (
 )
 
 from tests.surrogates.conftest import SimpleModule
+from tests.surrogates.conftest import TinySurrogateModel
 
 
 class Strategy(SurrogateStrategy):
@@ -38,37 +40,25 @@ class _ModuleSurrogate(ModuleSurrogate):
     surrogates expose their lifecycle task."""
 
     def __init__(self):
-        super().__init__(strategy=Strategy())
+        super().__init__(TinySurrogateModel(), Strategy(), _TrainingConfig)
         self.data_file = Input(Workdir.register_file("simulation", "events.h5"))
-
-    @dynamic_submodule
-    def train(self, design, **kwargs):
-        return {}
-
-    def state_dict(self):
-        return {}
-
-    def from_state_dict(self, state):
-        return None
 
 
 class _WorkflowSurrogate(WorkflowSurrogate):
     def __init__(self):
-        super().__init__(strategy=Strategy())
-
-    @dynamic_submodule
-    def train(self, design, **kwargs):
-        return {}
-
-    def state_dict(self):
-        return {}
-
-    def from_state_dict(self, state):
-        return None
+        super().__init__(TinySurrogateModel(), Strategy(), _TrainingConfig)
 
 
 def _candidate(value=1.0):
     return Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([value]))
+
+
+_TrainingConfig = TrainingConfig(
+    max_epochs=1,
+    grad_clip=1.0,
+    batch_size=2,
+    val_split=0.0,
+)
 
 
 class TestModuleSurrogateTrainingPlan:

@@ -90,7 +90,13 @@ class WorkflowStorageBase(ABC):
         pass
         
     @abstractmethod
-    def add_runs(self, wf: Workflow, exec_ids: list[str], batch_id: str) -> "Batch":
+    def add_runs(
+        self,
+        wf: Workflow,
+        exec_ids: list[str],
+        batch_id: str,
+        num_jobs: Mapping[str, int],
+    ) -> "Batch":
         pass
 
     @abstractmethod

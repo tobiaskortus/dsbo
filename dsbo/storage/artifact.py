@@ -44,6 +44,10 @@ class Artifact:
         return self._version
 
     @property
+    def stage(self) -> str | None:
+        return self._stage
+
+    @property
     def metadata(self) -> dict[str, Any]:
         return dict(self._metadata)
 

@@ -1,6 +1,7 @@
 import pytest
 import os
 import torch
+from sqlalchemy.exc import NoResultFound
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
@@ -17,6 +18,9 @@ from tests.workflow.conftest import (
     FailingBackwardModule, DataProducer, FileTrainer, DataConsumer,
 )
 from dsbo.modules.fused import BatchFusedModule
+from dsbo.storage import get_current_storage
+from dsbo.storage.models import JobStatus
+from dsbo.utils.plugins import TaskStreamPlugin
 
 
 class TestDistributedRunBatch:
@@ -37,12 +41,12 @@ class TestDistributedRunBatch:
         original_schedule = worker.schedule
         def tracking_schedule(module, design, dependencies=(), design_tensor=None,
                               priority=None, file_overlays=None):
-            tid, delayed = original_schedule(
+            (tid, delayed), = original_schedule(
                 module, design, dependencies, design_tensor=design_tensor,
                 priority=priority, file_overlays=file_overlays,
             )
             schedule_calls.append((module, list(dependencies), priority, delayed))
-            return tid, delayed
+            return [(tid, delayed)]
         worker.schedule = tracking_schedule
 
         with WorkerContext.use_worker(worker):
@@ -83,12 +87,12 @@ class TestDistributedRunBatch:
         original_schedule = worker.schedule
         def tracking_schedule(module, design, dependencies=(), design_tensor=None,
                               priority=None, file_overlays=None):
-            tid, delayed = original_schedule(
+            (tid, delayed), = original_schedule(
                 module, design, dependencies, design_tensor=design_tensor,
                 priority=priority, file_overlays=file_overlays,
             )
             schedule_calls.append((module, list(dependencies)))
-            return tid, delayed
+            return [(tid, delayed)]
         
         worker.schedule = tracking_schedule
 
@@ -125,8 +129,82 @@ class TestDistributedRunBatch:
 
         mock_storage.workflow.add_workflow.assert_called_once()
         mock_storage.workflow.add_runs.assert_called_once()
+        _, exec_ids, _, num_jobs = mock_storage.workflow.add_runs.call_args.args
+        assert num_jobs == {exec_ids[0]: 1}
         mock_storage.workflow.create_task_stream_plugin.assert_called_once()
         worker.client.register_plugin.assert_called_once_with("plugin", name="dsbo_task_stream")
+
+    def test_transition_writer_counts_unique_successes(self):
+        storage = get_current_storage()
+        workflow = Workflow(SimpleModule())
+        workflow_record = storage.workflow.add_workflow(workflow.task_graph)
+        exec_id = "execution"
+        storage.workflow.add_runs(
+            workflow_record,
+            [exec_id],
+            "batch",
+            {exec_id: 2},
+        )
+        writer = storage.workflow._make_transition_writer()
+
+        writer("task-1", "one", "worker", 1.0, -1.0, exec_id, "", JobStatus.RUNNING)
+        writer("task-1", "one", "worker", 1.0, 2.0, exec_id, "", JobStatus.SUCCESS)
+        writer("task-1", "one", "worker", 1.0, 2.0, exec_id, "", JobStatus.SUCCESS)
+
+        execution = storage.workflow.get_executions()[0]
+        assert execution.num_successful_jobs == 1
+        assert execution.status == JobStatus.RUNNING
+
+        writer("task-2", "two", "worker", 2.0, -1.0, exec_id, "", JobStatus.RUNNING)
+        writer("task-2", "two", "worker", 2.0, 3.0, exec_id, "", JobStatus.SUCCESS)
+
+        execution = storage.workflow.get_executions()[0]
+        assert execution.num_successful_jobs == 2
+        assert execution.status == JobStatus.SUCCESS
+
+    def test_transition_writer_requires_registered_execution(self):
+        writer = get_current_storage().workflow._make_transition_writer()
+
+        with pytest.raises(NoResultFound):
+            writer(
+                "task",
+                "task",
+                "worker",
+                1.0,
+                -1.0,
+                "missing",
+                "",
+                JobStatus.RUNNING,
+            )
+
+    def test_task_stream_flush_propagates_write_errors(self):
+        writer = MagicMock(side_effect=RuntimeError("write failed"))
+        plugin = TaskStreamPlugin(writer, {}, {})
+        try:
+            plugin._write_async()
+            with pytest.raises(RuntimeError, match="write failed"):
+                plugin.flush()
+        finally:
+            plugin._executor.shutdown(wait=True)
+
+    def test_task_stream_records_failed_transition_without_worker_metadata(self):
+        writer = MagicMock()
+        plugin = TaskStreamPlugin(writer, {"task": "execution"}, {"task": "module"})
+        scheduler = MagicMock()
+        scheduler.tasks = {
+            "task": MagicMock(processing_on=None, startstops=[]),
+        }
+        scheduler.workers = {}
+        plugin.start(scheduler)
+        try:
+            plugin.transition("task", "processing", "erred")
+            plugin.flush()
+        finally:
+            plugin._executor.shutdown(wait=True)
+
+        args = writer.call_args.args
+        assert args[2] == "unknown"
+        assert args[7] == JobStatus.FAILED
 
     def test_batch_fused_module_warns_on_non_empty_result(self):
 

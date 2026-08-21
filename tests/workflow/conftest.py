@@ -28,20 +28,32 @@ class MockDaskWorker(DaskWorkerBase):
         self.cluster = MagicMock()
         self.task_counter = 0
         self.scheduled = []
+        self.ddp_scheduled = []
         self.backward_scheduled = []
         self._gather_results = None
         self._gather_forward_results = True  # if True, gather returns dicts
 
     def schedule(
         self, module, design, dependencies=(), design_tensor=None,
-        priority=None, file_overlays=None,
+        priority=None, file_overlays=None, world_size=None, accelerator="auto",
     ):
-        tid = UUID(int=self.task_counter, version=4)
-        self.task_counter += 1
-        delayed = MagicMock()
-        delayed.key = f"mock-{tid}"
-        self.scheduled.append((tid, delayed, module, priority))
-        return tid, delayed
+        spec = getattr(module, "resources", None)
+        world_size = world_size or getattr(spec, "n_ranks", 1) or 1
+        pairs = []
+        for rank in range(world_size):
+            tid = UUID(int=self.task_counter, version=4)
+            self.task_counter += 1
+            delayed = MagicMock()
+            if world_size > 1:
+                delayed.key = f"mock-ddp-{tid}"
+                self.ddp_scheduled.append(
+                    (tid, delayed, module, priority, rank, world_size)
+                )
+            else:
+                delayed.key = f"mock-{tid}"
+                self.scheduled.append((tid, delayed, module, priority))
+            pairs.append((tid, delayed))
+        return pairs
 
     def schedule_backward(self, module, candidate, grad_output=None,
                           dependencies=(), priority=None):
@@ -61,7 +73,7 @@ class MockDaskWorker(DaskWorkerBase):
         # Default: return a dict with "out" for each scheduled task
         if self._gather_forward_results:
             return [(tid, {"out": torch.tensor(10.0)})
-                    for tid, _, _, _ in self.scheduled]
+                    for tid, *_ in self.scheduled + self.ddp_scheduled]
         else:
             return [(tid, torch.tensor([10.0]))
                     for tid, _, _, _ in self.backward_scheduled]

@@ -156,5 +156,14 @@ class HDF5ColumnStoreDatasetView(ColumnStoreDatasetView):
             return np.asarray(dataset[()]).reshape(1)[index]
         return np.asarray(dataset[index])
 
+    def read_indices(self, keys: list[str], indices: list[int]) -> np.ndarray:
+        requested = np.asarray(indices, dtype=np.int64)
+        requested = np.where(requested < 0, requested + self.num_samples, requested)
+        if np.any((requested < 0) | (requested >= self.num_samples)):
+            raise IndexError("HDF5 dataset index is out of range.")
+        unique, inverse = np.unique(requested, return_inverse=True)
+        rows = self.read(self._group_name, unique)[inverse]
+        return np.repeat(rows[:, np.newaxis], len(keys), axis=1)
+
     def close(self) -> None:
         self._file.close()
