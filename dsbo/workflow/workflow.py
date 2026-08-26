@@ -165,11 +165,14 @@ class Workflow:
 
 
     def get_unique_workers(self) -> set[WorkerSpec]:
-        workers = set()
-        for node in self.task_graph.nodes():
-            if node.resources is not None:
-                workers.add(node.resources)
-        return workers
+        surrogates = self.surrogate_execution.module_surrogates.values()
+        if (ws := self.surrogate_execution.workflow_surrogate) is not None:
+            surrogates = (*surrogates, ws)
+        return {
+            node.resources
+            for node in (*self.task_graph.nodes, *surrogates)
+            if node.resources is not None
+        }
 
     def visualize(self, filename=None, format='png'):
         from dsbo.utils.visualize import visualize_workflow
