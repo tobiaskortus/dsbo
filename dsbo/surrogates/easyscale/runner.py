@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import socket
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from datetime import timedelta
 
@@ -13,11 +14,15 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from lightning.pytorch.callbacks import EarlyStopping
 
-from dsbo.elastic import EasyScaleSchedulerConfig
+from dsbo.logger import WorkflowTaskLogger
 from dsbo.surrogates.easyscale.strategy import EasyScaleStrategy
 from dsbo.surrogates.easyscale.virtual_dataset import build_virtual_dataloader
-from dsbo.surrogates.easyscale.checkpoint import EasyScaleCheckpointCallback
+from dsbo.surrogates.easyscale.callbacks import (
+    EasyScaleCheckpointCallback,
+    EasyScaleControlCallback,
+)
 from dsbo.surrogates.easyscale.generation import (
+    GenerationAction,
     GenerationPlan,
     GenerationResult,
     GenerationState,
@@ -28,13 +33,20 @@ from dsbo.surrogates.easyscale.random import (
     _restore_random_state,
     seed_everything,
 )
-def connect_dask():
-    try:
-        from distributed import get_client, get_worker
 
-        return get_client(), get_worker()
+
+def connect_dask():
+    from distributed import get_client, get_worker
+
+    try:
+        client = get_client()
     except ValueError:
-        return None, None
+        client = None
+    try:
+        worker = get_worker()
+    except ValueError:
+        worker = None
+    return client, worker
 
 
 def allocation_timeout(training_config) -> float:
@@ -68,7 +80,15 @@ def framework_state_preserved(device: torch.device):
 
 
 @contextmanager
-def process_group(plan: GenerationPlan, client, worker, timeout: float):
+def process_group(
+    plan: GenerationPlan,
+    client,
+    worker,
+    timeout: float,
+    rendezvous_store: dist.TCPStore | None = None,
+):
+    timings = {}
+    rendezvous_started = time.perf_counter()
     rendezvous_host = plan.rendezvous_host
     rendezvous_port = plan.rendezvous_port
     rendezvous_variable = None
@@ -76,6 +96,16 @@ def process_group(plan: GenerationPlan, client, worker, timeout: float):
     try:
         if dist.is_initialized():
             raise RuntimeError("EasyScale generation found an existing process group.")
+        if plan.physical_world_size == 1:
+            timings.update(
+                endpoint=0.0,
+                store=0.0,
+                rank_alignment=0.0,
+                process_group_init=0.0,
+                rendezvous=0.0,
+            )
+            yield rendezvous_host, rendezvous_port, timings
+            return
         if plan.physical_world_size > 1 and rendezvous_host is None:
             if client is None:
                 raise RuntimeError(
@@ -87,13 +117,14 @@ def process_group(plan: GenerationPlan, client, worker, timeout: float):
                 f"dsbo-easyscale-rendezvous-{plan.job_id}-{plan.generation}",
                 client=client,
             )
+        endpoint_started = time.perf_counter()
         if plan.physical_rank == 0:
             rendezvous_host = (
                 rendezvous_host
                 or (getattr(worker, "host", None) if worker is not None else None)
                 or socket.gethostbyname(socket.gethostname())
             )
-            store = dist.TCPStore(
+            store = rendezvous_store or dist.TCPStore(
                 rendezvous_host,
                 rendezvous_port or 0,
                 plan.physical_world_size,
@@ -101,17 +132,23 @@ def process_group(plan: GenerationPlan, client, worker, timeout: float):
                 timedelta(seconds=timeout),
                 wait_for_workers=False,
             )
+            timings["store"] = time.perf_counter() - endpoint_started
             rendezvous_port = store.port
             if rendezvous_variable is not None:
+                publish_started = time.perf_counter()
                 rendezvous_variable.set(
                     (rendezvous_host, rendezvous_port),
                     timeout=timeout,
                 )
+                timings["endpoint"] = time.perf_counter() - publish_started
         else:
             if rendezvous_host is None or rendezvous_port is None:
+                endpoint_started = time.perf_counter()
                 rendezvous_host, rendezvous_port = rendezvous_variable.get(
                     timeout=timeout
                 )
+                timings["endpoint"] = time.perf_counter() - endpoint_started
+            store_started = time.perf_counter()
             store = dist.TCPStore(
                 rendezvous_host,
                 int(rendezvous_port),
@@ -119,6 +156,19 @@ def process_group(plan: GenerationPlan, client, worker, timeout: float):
                 False,
                 timedelta(seconds=timeout),
             )
+            timings["store"] = time.perf_counter() - store_started
+        rank_alignment_started = time.perf_counter()
+        store.set(f"rank-{plan.physical_rank}-ready", "1")
+        if plan.physical_rank == 0:
+            store.wait(
+                [f"rank-{rank}-ready" for rank in range(plan.physical_world_size)],
+                timedelta(seconds=timeout),
+            )
+            store.set("ranks-ready", "1")
+        else:
+            store.wait(["ranks-ready"], timedelta(seconds=timeout))
+        timings["rank_alignment"] = time.perf_counter() - rank_alignment_started
+        process_group_started = time.perf_counter()
         dist.init_process_group(
             backend=plan.backend,
             store=store,
@@ -126,8 +176,10 @@ def process_group(plan: GenerationPlan, client, worker, timeout: float):
             world_size=plan.physical_world_size,
             timeout=timedelta(seconds=timeout),
         )
+        timings["process_group_init"] = time.perf_counter() - process_group_started
+        timings["rendezvous"] = time.perf_counter() - rendezvous_started
         started = True
-        yield rendezvous_host, rendezvous_port
+        yield rendezvous_host, rendezvous_port, timings
     finally:
         try:
             if started and dist.is_initialized():
@@ -148,12 +200,9 @@ def _run_generation_body(
     rendezvous_host: str | None,
     rendezvous_port: int | None,
     device: torch.device,
+    boundary_decision: Callable[[int, float, bool], GenerationAction] | None,
 ) -> GenerationResult:
-    scheduler_config = getattr(
-        training_config,
-        "easyscale_scheduler",
-        EasyScaleSchedulerConfig(),
-    )
+    body_started = time.perf_counter()
     seed = int(getattr(training_config, "seed", 0))
     virtual_world_size = len(state.contexts)
     if device.type == "cuda":
@@ -177,7 +226,6 @@ def _run_generation_body(
         physical_world_size=plan.physical_world_size,
         device=device,
         backend=plan.backend,
-        allow_cpu=scheduler_config.allow_cpu,
     )
     virtual_loader = build_virtual_dataloader(
         train_loader,
@@ -186,9 +234,11 @@ def _run_generation_body(
         assigned_ranks=plan.assigned_ests,
         contexts=assigned_contexts,
     )
+    control_callback = EasyScaleControlCallback(strategy, boundary_decision)
     checkpoint_callback = EasyScaleCheckpointCallback(
         strategy,
         plan.checkpoint_path,
+        control_callback,
         rank_zero_state=state.rank_zero_state,
     )
     callbacks: list[L.Callback] = copy.deepcopy(list(external_callbacks))
@@ -196,10 +246,8 @@ def _run_generation_body(
     if patience is not None:
         if val_loader is None:
             raise ValueError("EasyScale patience requires a validation loader.")
-        callbacks.append(
-            EarlyStopping(monitor="val_loss", patience=patience, mode="min")
-        )
-    callbacks.append(checkpoint_callback)
+        callbacks.append(EarlyStopping(monitor="val_loss", patience=patience, mode="min"))
+    callbacks.extend((control_callback, checkpoint_callback))
 
     trainer = L.Trainer(
         max_epochs=plan.target_epoch,
@@ -215,32 +263,20 @@ def _run_generation_body(
         use_distributed_sampler=False,
         precision="32-true",
     )
-    training_started = time.perf_counter()
+    fit_started = time.perf_counter()
     trainer.fit(
         model,
         train_dataloaders=virtual_loader,
         val_dataloaders=val_loader,
         ckpt_path=state.checkpoint_path,
     )
-    training_elapsed = max(
-        time.perf_counter() - training_started,
-        torch.finfo(torch.float64).eps,
-    )
+    fit_seconds = time.perf_counter() - fit_started
     if not checkpoint_callback.saved:
-        checkpoint_callback.save(trainer)
+        raise RuntimeError("EasyScale generation stopped without a state checkpoint.")
 
     contexts = strategy.all_contexts
     if contexts is None:
         raise RuntimeError("EasyScale generation did not gather EST contexts.")
-    completed = torch.tensor(
-        [strategy.est_steps, training_elapsed],
-        dtype=torch.float64,
-        device=device,
-    )
-    if plan.physical_world_size > 1:
-        dist.all_reduce(completed[:1], op=dist.ReduceOp.SUM)
-        dist.all_reduce(completed[1:], op=dist.ReduceOp.MAX)
-
     rank_zero_state = None
     if strategy.is_global_zero:
         rank_zero_state = {
@@ -260,13 +296,27 @@ def _run_generation_body(
         physical_world_size=plan.physical_world_size,
         assigned_ests=plan.assigned_ests,
         checkpoint_path=plan.checkpoint_path,
-        target_epoch=plan.target_epoch,
-        throughput=float(completed[0].item() / completed[1].item()),
+        target_epoch=control_callback.completed_epoch,
+        throughput=control_callback.throughput,
         contexts=contexts,
         should_stop=bool(trainer.should_stop),
+        action=control_callback.action,
         rendezvous_host=rendezvous_host,
         rendezvous_port=rendezvous_port,
         rank_zero_state=rank_zero_state,
+        timings={
+            "worker_setup": fit_started - body_started,
+            "trainer_fit": fit_seconds,
+            "boundary_control": control_callback.control_seconds,
+            "checkpoint": checkpoint_callback.save_seconds,
+            "useful_fit": max(
+                fit_seconds
+                - control_callback.control_seconds
+                - checkpoint_callback.save_seconds,
+                0.0,
+            ),
+            "generation_body": time.perf_counter() - body_started,
+        },
     )
 
 
@@ -279,8 +329,17 @@ def run_easyscale_generation(
     training_config,
     model_tag: str | None = None,
     external_callbacks: Sequence[L.Callback] = (),
+    boundary_decision: Callable[[int, float, bool], GenerationAction] | None = None,
+    rendezvous_store: dist.TCPStore | None = None,
 ) -> GenerationResult:
+    task_started = time.perf_counter()
+    wall_started = time.time()
     client, worker = connect_dask()
+    if worker is not None:
+        WorkflowTaskLogger.get_current().log(
+            f"EasyScale generation {plan.generation} rank {plan.physical_rank} "
+            f"running on worker {worker.address}"
+        )
     timeout = allocation_timeout(training_config)
     if plan.backend == "nccl" and torch.cuda.device_count() != 1:
         raise RuntimeError(
@@ -293,11 +352,14 @@ def run_easyscale_generation(
     )
 
     with framework_state_preserved(device):
-        with process_group(plan, client, worker, timeout) as (
+        rendezvous_started = time.perf_counter()
+        with process_group(plan, client, worker, timeout, rendezvous_store) as (
             rendezvous_host,
             rendezvous_port,
+            rendezvous_timings,
         ):
-            return _run_generation_body(
+            rendezvous_seconds = time.perf_counter() - rendezvous_started
+            result = _run_generation_body(
                 plan,
                 state,
                 model,
@@ -308,4 +370,20 @@ def run_easyscale_generation(
                 rendezvous_host,
                 rendezvous_port,
                 device,
+                boundary_decision,
             )
+        process_group_teardown = (
+            time.perf_counter() - rendezvous_started - rendezvous_seconds
+            - result.timings["generation_body"]
+        )
+    return dataclasses.replace(
+        result,
+        timings={
+            **result.timings,
+            **rendezvous_timings,
+            "process_group_teardown": max(process_group_teardown, 0.0),
+            "task_total": time.perf_counter() - task_started,
+            "wall_started": wall_started,
+            "wall_finished": time.time(),
+        },
+    )

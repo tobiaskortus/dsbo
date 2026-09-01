@@ -10,7 +10,6 @@ from dsbo.modules import Module
 from dsbo.utils.io import Workdir
 from dsbo.modules.dsl import DependencyGroup, ModuleDslMixin
 from dsbo.modules.utils import ResultRecorder
-from dsbo.worker.ddp import assert_ddp_supported
 from dsbo.modules.fused import BatchFusedModule, batch_fuse, is_batch_fused
 from dsbo.utils.io.workdir import AbstractFilePath, DefaultFilenames, DefaultPaths
 
@@ -111,11 +110,7 @@ def _validate_training_inputs(
 
 
 def _batch_fuse_trainer(train_submodule: Module, surrogate: WorkflowSurrogate | ModuleSurrogate) -> BatchFusedModule:
-    resources = surrogate.resources
-    train_submodule.resources = resources
-    n_ranks = resources.n_ranks if resources is not None else 1
-    if isinstance(n_ranks, int) and n_ranks > 1:
-        assert_ddp_supported(resources, n_ranks)
+    train_submodule.resources = surrogate.resources
     return batch_fuse(train_submodule)
 
 def _bind_candidates(train_submodule: Module, candidates: CandidateBatch) -> Module:

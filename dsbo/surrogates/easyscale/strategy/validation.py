@@ -11,20 +11,15 @@ from dsbo.surrogates.easyscale.random import VirtualRankContext
 from dsbo.surrogates.easyscale.virtual_dataset import VirtualBatch
 
 
-def resolve_device(device: torch.device | str | None, backend: str, allow_cpu: bool,) -> torch.device:
+def resolve_device(device: torch.device | str | None) -> torch.device:
     if device is None:
         device = (
             torch.device("cuda", torch.cuda.current_device())
             if torch.cuda.is_available()
             else torch.device("cpu")
         )
-        
-    device = torch.device(device)
-    if device.type == "cpu" and not (allow_cpu or backend == "gloo"):
-        raise ValueError("CPU EasyScale requires allow_cpu=True or backend='gloo'.")
-    if device.type == "cuda" and backend == "gloo" and not allow_cpu:
-        raise ValueError("Gloo GPU execution is only enabled by allow_cpu=True.")
-    return device
+
+    return torch.device(device)
 
 
 def coerce_metric_value(value: Any) -> float:

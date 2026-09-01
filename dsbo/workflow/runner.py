@@ -65,10 +65,9 @@ def _flush_task_stream_plugin(name, dask_scheduler=None):
 def register_task_stream(worker, graph, exec_ids, batch_path, task_map, name_map, name, tag=""):
     storage = get_current_storage()
     if storage is None:
-        return
+        return None
     workflow_record = storage.workflow.add_workflow(graph)
     num_jobs = {exec_id: 0 for exec_id in exec_ids}
-    # DDP ranks count as separate scheduler jobs for completion.
     for mapped_exec_ids in task_map.values():
         if isinstance(mapped_exec_ids, str):
             mapped_exec_ids = (mapped_exec_ids,)
@@ -77,9 +76,10 @@ def register_task_stream(worker, graph, exec_ids, batch_path, task_map, name_map
     storage.workflow.add_runs(workflow_record, exec_ids, batch_path, num_jobs)
     writer = storage.workflow._make_transition_writer()
     if worker.client.run_on_scheduler(_update_task_stream_plugin, name, writer, task_map, name_map, tag):
-        return
+        return writer
     plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map, tag=tag)
     worker.client.register_plugin(plugin, name=name)
+    return writer
 
 
 def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[type[Exception], ...] = ()) -> List[dict]:
@@ -93,7 +93,6 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
         count = len(candidates)
         task_graph = workflow.task_graph
         subdirs = candidate_subdirs(count)
-
         task_groups = list(get_dependent_task_groups(task_graph))
         progress = tqdm(total=num_tasks_for_batch(workflow, count), desc=f"Running workflow [{workflow.graph_context.mode.value}]", unit="tasks")
         get_random_engine().seed_all(workflow)

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import time
 from distributed import Client
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-from dsbo.surrogates.easyscale.protocol import LeaseResponse, Proposal
+from dsbo.surrogates.easyscale.protocol import Proposal
 
 
 def scheduler_rpc(client: Client, name: str, **kwargs) -> Any:
@@ -19,13 +18,23 @@ class Registration:
     generation: int
     allocation: dict[str, int]
     provision_limits: dict[str, int]
+    allocation_revision: int
 
 
 @dataclass(frozen=True)
-class Leases:
+class AllocationDecision:
     allocation: dict[str, int]
-    workers_by_type: dict[str, tuple[str, ...]]
-    worker_physical_ranks: dict[str, int]
+    allocation_revision: int
+
+
+@dataclass(frozen=True)
+class Capacity:
+    live: dict[str, int]
+    approved_total: dict[str, int]
+    approved_allocation: dict[str, int]
+    allocation_revision: int
+    ready: bool
+    ready_live: dict[str, int] = field(default_factory=dict, kw_only=True)
 
 
 class ClientResourceAllocator:
@@ -48,6 +57,7 @@ class ClientResourceAllocator:
             generation=int(response.get("generation", 0)),
             allocation=dict(response["allocation"]),
             provision_limits=dict(response["provision_limits"]),
+            allocation_revision=int(response["allocation_revision"]),
         )
 
     def submit_proposals(self, job_id: str, proposals: Sequence[Proposal]) -> int:
@@ -59,7 +69,7 @@ class ClientResourceAllocator:
         )
         return submission["round"]
 
-    def poll_allocation(self, job_id: str, round_id: int) -> dict[str, int] | None:
+    def poll_allocation(self, job_id: str, round_id: int) -> AllocationDecision | None:
         decision = scheduler_rpc(
             self.client,
             "dsbo_easyscale_decision",
@@ -68,35 +78,10 @@ class ClientResourceAllocator:
         )
         if decision.get("pending", False):
             return None
-        return dict(decision["allocation"])
-
-    def wait_for_minimum_worker_lease(
-        self,
-        job_id: str,
-        generation: int,
-        preferred_allocation: Mapping[str, int],
-        minimum_allocation: Mapping[str, int],
-        timeout: float,
-    ) -> Leases:
-        deadline = time.monotonic() + timeout
-        while True:
-            response = scheduler_rpc(
-                self.client,
-                "dsbo_easyscale_lease",
-                job_id=job_id,
-                generation=generation,
-                allocation=dict(preferred_allocation),
-                minimum_allocation=dict(minimum_allocation),
-            )
-            leases = self._parse_leases(response)
-            if leases is not None and all(
-                leases.allocation.get(resource_type, 0) >= count
-                for resource_type, count in minimum_allocation.items()
-            ):
-                return leases
-            if time.monotonic() >= deadline:
-                raise TimeoutError("timed out waiting for EasyScale worker lease.")
-            time.sleep(0.05)
+        return AllocationDecision(
+            allocation=dict(decision["allocation"]),
+            allocation_revision=int(decision["allocation_revision"]),
+        )
 
     def complete_generation(self, job_id: str, generation: int, throughput: float) -> None:
         scheduler_rpc(
@@ -115,35 +100,58 @@ class ClientResourceAllocator:
             generation=generation,
         )
 
-    def trigger_fallback(self, job_id: str, allocation: Mapping[str, int]) -> None:
-        scheduler_rpc(
+    def trigger_fallback(
+        self,
+        job_id: str,
+        allocation: Mapping[str, int],
+        expected_revision: int,
+    ) -> AllocationDecision:
+        response = scheduler_rpc(
             self.client,
             "dsbo_easyscale_fallback",
             job_id=job_id,
             allocation=dict(allocation),
+            expected_revision=expected_revision,
+        )
+        return AllocationDecision(
+            allocation=dict(response["allocation"]),
+            allocation_revision=int(response["allocation_revision"]),
+        )
+
+    def release_allocation(
+        self,
+        job_id: str,
+        allocation: Mapping[str, int],
+        expected_revision: int,
+        reason: str,
+    ) -> AllocationDecision:
+        response = scheduler_rpc(
+            self.client,
+            "dsbo_easyscale_release_allocation",
+            job_id=job_id,
+            allocation=dict(allocation),
+            expected_revision=expected_revision,
+            reason=reason,
+        )
+        return AllocationDecision(
+            allocation=dict(response["allocation"]),
+            allocation_revision=int(response["allocation_revision"]),
+        )
+
+    def capacity(self, job_id: str) -> Capacity:
+        response = scheduler_rpc(
+            self.client,
+            "dsbo_easyscale_capacity",
+            job_id=job_id,
+        )
+        return Capacity(
+            live=dict(response["live"]),
+            ready_live=dict(response["ready_live"]),
+            approved_total=dict(response["approved_total"]),
+            approved_allocation=dict(response["approved_allocation"]),
+            allocation_revision=int(response["allocation_revision"]),
+            ready=bool(response["ready"]),
         )
 
     def close_job(self, job_id: str) -> None:
         scheduler_rpc(self.client, "dsbo_easyscale_close", job_id=job_id)
-
-    @staticmethod
-    def _parse_leases(lease: LeaseResponse | None) -> Leases | None:
-        if lease is None or lease["phase"] == "SIZING":
-            return None
-        
-        grouped: dict[str, list[str]] = {}
-        ranks: dict[str, int] = {}
-
-        for worker in lease["workers"]:
-            address = worker["address"]
-            worker_type = worker["resource_type"]
-            grouped.setdefault(worker_type, []).append(address)
-            ranks[address] = worker["rank"]
-
-        return Leases(
-            allocation=dict(lease["allocation"]),
-            workers_by_type={
-                name: tuple(addresses) for name, addresses in grouped.items()
-            },
-            worker_physical_ranks=ranks,
-        )

@@ -61,11 +61,10 @@ class EasyScaleStrategy(SingleDeviceStrategy):
         physical_world_size: int = 1,
         device: torch.device | str | None = None,
         backend: str = "nccl",
-        allow_cpu: bool = False,
     ) -> None:
         assigned = tuple(sorted(assigned_ests))
         context_by_rank = contexts_by_rank(contexts)
-        super().__init__(device=resolve_device(device, backend, allow_cpu))
+        super().__init__(device=resolve_device(device))
         self.local_rank = 0
         self.backend = backend
         self.assigned_ests = assigned

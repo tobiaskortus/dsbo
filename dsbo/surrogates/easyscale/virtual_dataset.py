@@ -19,7 +19,7 @@ from torch.utils.data import (
 
 from dsbo.surrogates.easyscale.random import (
     VirtualRankContext,
-    _initial_context,
+    initial_context,
     seed_everything,
     seed_scope,
 )
@@ -174,7 +174,7 @@ def build_virtual_dataloader(
     assigned = tuple(range(virtual_world_size) if assigned_ranks is None else assigned_ranks)
     if contexts is None:
         context_by_rank = {
-            rank: _initial_context(rank, seed) for rank in range(virtual_world_size)
+            rank: initial_context(rank, seed) for rank in range(virtual_world_size)
         }
     elif isinstance(contexts, Mapping):
         context_by_rank = dict(contexts)

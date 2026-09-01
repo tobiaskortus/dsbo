@@ -25,7 +25,7 @@ def ranked_candidates(
         candidates,
         key=lambda item: (
             -item[1].proposal_score,
-            -item[1].incremental_gpu_count,
+            -item[1].incremental_resource_count,
             -item[0].priority,
             item[0].job_id,
             item[1].proposal_id,

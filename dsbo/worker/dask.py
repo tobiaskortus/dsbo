@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import dask
 import uuid
-import time
 import torch
 import contextvars
-import torch.distributed as dist
 import torch.autograd.forward_ad as fw
 
 from collections import ChainMap
@@ -16,15 +14,14 @@ import dsbo
 from contextlib import contextmanager
 from dsbo.storage import get_current_storage, use_storage
 from dsbo.autograd import _pack, _unpack
-from dsbo.worker.ddp import (
-    get_worker_info,
-    configure_rank_env,
-    assert_ddp_supported,
-    init_rendezvous,
-    DDPDispatchError,
-    DDP_RENDEZVOUS_TIMEOUT_SECONDS,
-)
 from dask_heterogeneous.hybrid import HybridCluster
+from dask_heterogeneous.scheduler import HeterogeneousScheduler
+from dsbo.surrogates.easyscale.scheduler import (
+    EASYSCALE_PLUGIN_NAME,
+    EASYSCALE_RUNTIME_PLUGIN_NAME,
+    EasyScaleSchedulerPlugin,
+    EasyScaleRuntimePlugin,
+)
 from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 
@@ -44,6 +41,7 @@ dask.config.set({
 
 class DaemonicWorkerError(RuntimeError):
     """A task attempted nested multiprocessing from a daemonic Dask worker."""
+
 
 
 @contextmanager
@@ -158,32 +156,6 @@ class DaskWorkerBase:
                 raise
         return results
 
-    def _scale_rank_workers(self, resource_key: str, world_size: int, accelerator: str = "auto") -> list[dict[str, Any]]:
-        # TODO: This is a bit messy and questionable at least, replace with elastic dddp scaling 
-        # and the automatic adapt provided by dask.
-        self.cluster.scale({resource_key: world_size})
-        deadline = time.monotonic() + DDP_RENDEZVOUS_TIMEOUT_SECONDS
-        while True:
-            available = sum(
-                1
-                for metadata in self.client.scheduler_info()
-                .get("workers", {})
-                .values()
-                if metadata.get("resources", {}).get(resource_key, 0) >= 1
-            )
-            if available >= world_size:
-                break
-            if time.monotonic() >= deadline:
-                raise DDPDispatchError(
-                    f"DDP dispatch requested {world_size} rank slots but only "
-                    f"{available} workers with resource '{resource_key}' appeared "
-                    f"within {DDP_RENDEZVOUS_TIMEOUT_SECONDS}s of scaling."
-                )
-            time.sleep(0.5)
-        return get_worker_info(
-            self.client, world_size, accelerator=accelerator, resource_key=resource_key
-        )
-
     def schedule(
         self,
         module: Module,
@@ -192,77 +164,29 @@ class DaskWorkerBase:
         design_tensor: torch.Tensor | None = None,
         priority: int | None = None,
         file_overlays=None,
-        world_size: int | None = None,
-        accelerator: str = "auto",
     ) -> list[tuple[uuid.UUID, Delayed]]:
-        """Schedule ``module``'s task on a worker.
-
-        Returns a list of ``(task_id, delayed)`` pairs: a single pair for normal
-        execution, or one pair per rank when the module carries ``n_ranks > 1``
-        (DDP). DDP rank tasks are each pinned to a distinct matching worker
-        address and initialize ``torch.distributed`` around ``module.run``.
-        """
-        spec = module.resources
-        resource_key = getattr(spec, "resource_key", None)
-        world_size = world_size or getattr(spec, "n_ranks", 1) or 1
-
         state = _capture_schedule_state(design, design_tensor)
+        resources = dict(getattr(module.resources, "resources", None) or {})
+        task_id = uuid.uuid4()
 
-        if world_size <= 1:
-            #default execution without ddp scaling‚
-            resources = getattr(module.resources, "resources", None)
-            task_id = uuid.uuid4()
+        def _module_wrapper(module, design_arg, design_tensor_arg, *dependencies):
+            return _run_module(
+                module,
+                design_arg,
+                design_tensor_arg,
+                state,
+                file_overlays,
+                task_id,
+            )
 
-            def _module_wrapper(module, design_arg, design_tensor_arg, *dependencies):
-                return _run_module(module, design_arg, design_tensor_arg, state, file_overlays, task_id)
-
-            with dask.annotate(resources=(resources or {}), priority=priority):
-                delayed_obj = delayed(_module_wrapper, name=module.name)(
-                    module, 
-                    state["packed_design"], 
-                    state["packed_design_tensor"],
-                    *dependencies,
-                )
-            return [(task_id, delayed_obj)]
-
-
-        assert_ddp_supported(spec, world_size)
-
-        worker_infos = self._scale_rank_workers(resource_key, world_size, accelerator=accelerator)
-        scheduled: list[tuple[uuid.UUID, Delayed]] = []
-
-        for info in worker_infos:
-            task_id = uuid.uuid4()
-
-            def _ddp_rank_module_wrapper(module, design_arg, design_tensor_arg, info, rank_task_id, *dependencies):
-                configure_rank_env(info)
-                init_rendezvous(info)
-                try:
-                    return _run_module(module, design_arg, design_tensor_arg,
-                                       state, file_overlays, rank_task_id)
-                finally:
-                    if dist.is_initialized():
-                        dist.destroy_process_group()
-
-            annotations = {
-                "resources": {resource_key: 1} if resource_key else None,
-                "workers": [info["worker"]],
-                **({"priority": priority} if priority is not None else {}),
-            }
-
-            with dask.annotate(**annotations):
-                delayed_fn = delayed(_ddp_rank_module_wrapper, name=f"{module.name}_rank{info['rank']}")
-                delayed_obj = delayed_fn(
-                    module, 
-                    state["packed_design"], 
-                    state["packed_design_tensor"],
-                    info, task_id, 
-                    *dependencies,
-                )
-            scheduled.append((task_id, delayed_obj))
-
-        return scheduled
-
+        with dask.annotate(resources=resources, priority=priority):
+            delayed_obj = delayed(_module_wrapper, name=module.name)(
+                module,
+                state["packed_design"],
+                state["packed_design_tensor"],
+                *dependencies,
+            )
+        return [(task_id, delayed_obj)]
 
     def schedule_backward(self, module: Module, candidate, grad_output=None, dependencies: Iterable = (), priority: int | None = None) -> tuple[uuid.UUID, Delayed]:
         suffix = get_file_suffix()
@@ -309,8 +233,31 @@ class WorkerContext:
         return cls._current_worker.get()
 
 
+class EasyScaleIntegratedHeterogeneousScheduler(HeterogeneousScheduler):
+    def adaptive_target(self, worker_types=None, target_duration=None):
+        target = super().adaptive_target(
+            worker_types=worker_types,
+            target_duration=target_duration,
+        )
+        
+        plugin = self.plugins.get(EASYSCALE_PLUGIN_NAME)
+        if plugin is None:
+            return target
+        
+        approved = plugin.registry.total_approved(plugin.provision_limits).to_dict()
+        for resource_type in target:
+            target[resource_type] = max(target[resource_type], approved.get(resource_type, 0))
+
+        return target
+
+
 class HeterogeneousDaskWorker(DaskWorkerBase):
-    def __init__(self, job_specs: Iterable[WorkerSpec], logdir: str = "logs"):
+    def __init__(
+        self,
+        job_specs: Iterable[WorkerSpec],
+        logdir: str = "logs",
+        easyscale_runtime_ready: bool = True,
+    ):
         self.logdir = logdir
         job_specs = tuple(job_specs)
         cluster_spec = dict(ChainMap(*[s.get_spec_dict() for s in job_specs]))
@@ -318,7 +265,7 @@ class HeterogeneousDaskWorker(DaskWorkerBase):
         adapt_config = dict()
 
         for spec in job_specs:
-            assert (spec.min_worker is not None and 
+            assert (spec.min_worker is not None or 
                     spec.max_worker is not None), "Define static or adaptive scaling with .scale() or .adapt()"
 
             #TODO: enable constant scaling of workers + combinations of adapt and scale
@@ -328,12 +275,28 @@ class HeterogeneousDaskWorker(DaskWorkerBase):
                 max(maximum, spec.max_worker),
             )
 
-        self.cluster = HybridCluster(spec=cluster_spec, log_directory=logdir)
+        self.cluster = HybridCluster(
+            spec=cluster_spec,
+            log_directory=logdir,
+            scheduler_cls=EasyScaleIntegratedHeterogeneousScheduler,
+        )
         if all(minimum == maximum for minimum, maximum in adapt_config.values()):
             self.cluster.scale({key: minimum for key, (minimum, _) in adapt_config.items()})
         else:
             self.cluster.adapt(adapt_config)
+
         super().__init__(self.cluster)
+
+
+        args = {resource_type: maximum for resource_type, (_, maximum) in adapt_config.items()}
+        scheduler_plugin = EasyScaleSchedulerPlugin(args, require_runtime_ready=easyscale_runtime_ready)
+        self.client.register_plugin(scheduler_plugin, name=EASYSCALE_PLUGIN_NAME)
+
+        if easyscale_runtime_ready:
+            self.client.register_plugin(
+                EasyScaleRuntimePlugin(), 
+                name=EASYSCALE_RUNTIME_PLUGIN_NAME
+            )
 
     @classmethod
     def from_workflow(cls, workflow: Workflow, logdir: str = "logs") -> "HeterogeneousDaskWorker":

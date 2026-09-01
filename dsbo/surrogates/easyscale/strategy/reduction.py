@@ -74,8 +74,8 @@ def aggregate_metrics(
             schema = item.metrics
 
     names = sorted(names)
-    presence = torch.zeros_like(values)
     values = torch.zeros((virtual_world_size, len(names)), dtype=torch.float32, device=device)
+    presence = torch.zeros_like(values)
 
     for item in pending:
         for index, name in enumerate(names):

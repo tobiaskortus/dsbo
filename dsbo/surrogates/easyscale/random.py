@@ -17,7 +17,7 @@ class VirtualRankContext:
     sampler_position: int = 0
 
 
-def _initial_context(
+def initial_context(
     rank: int,
     seed: int,
     device: torch.device = torch.device("cpu"),
