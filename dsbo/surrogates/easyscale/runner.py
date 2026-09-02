@@ -289,6 +289,22 @@ def _run_generation_body(
     if not strategy.is_global_zero:
         contexts = tuple(assigned_contexts.values())
 
+    profile_steps = strategy.profile_steps
+    profile_means = {
+        f"profile_mean_{name}": total / profile_steps
+        for name, total in strategy.profile_totals.items()
+        if profile_steps
+        and name not in {"est_count", "parameter_count"}
+    }
+    control_events = control_callback.control_profile_events
+    if control_events:
+        profile_means.update(
+            {
+                f"profile_mean_{name}": total / control_events
+                for name, total in control_callback.control_profile_totals.items()
+            }
+        )
+
     return GenerationResult(
         job_id=plan.job_id,
         generation=plan.generation,
@@ -316,6 +332,8 @@ def _run_generation_body(
                 0.0,
             ),
             "generation_body": time.perf_counter() - body_started,
+            "profile_steps": float(profile_steps),
+            **profile_means,
         },
     )
 

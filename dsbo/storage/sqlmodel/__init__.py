@@ -63,7 +63,11 @@ class SQLModelTransitionWriter(TransitionWriter):
         status: JobStatus,
         tag: str = "",
     ) -> None:
-        engine = create_engine(self.url, poolclass=NullPool)
+        engine = create_engine(
+            self.url,
+            poolclass=NullPool,
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
         with Session(engine) as session:
             execution = session.exec(
                 select(Execution).where(Execution.exec_id == exec_id)

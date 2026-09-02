@@ -74,7 +74,7 @@ class MetricCallback(L.Callback):
 
 class PerfCallback(L.Callback):
     """Measures per-batch data loading and training step time."""
-    LOG_EVERY_N = 100
+    LOG_EVERY_N = 10
 
     def __init__(self, log_every_n: int = LOG_EVERY_N):
         super().__init__()
@@ -108,6 +108,33 @@ class PerfCallback(L.Callback):
             WorkflowTaskLogger.get_current().log(
                 f"perf step {batch_idx + 1}: train_step={step:.2f}ms"
             )
+            profile = getattr(trainer.strategy, "last_step_profile", None)
+            if profile:
+                strategy = trainer.strategy
+                profile_fields = (
+                    ("est_data_transfer", "data_transfer"),
+                    ("est_compute", "est_compute"),
+                    ("gradient_metadata_all_reduce", "gradient_metadata_all_reduce"),
+                    ("gradient_tensor_all_reduce", "gradient_tensor_all_reduce"),
+                    ("gradient_aggregation_total", "gradient_aggregation"),
+                    ("metric_all_reduce", "metric_all_reduce"),
+                    ("metric_aggregation_total", "metric_aggregation"),
+                    ("gradient_assignment", "gradient_assignment"),
+                    ("backward_total", "backward"),
+                    ("step_total", "step_total"),
+                )
+                details = " ".join(
+                    f"{label}={profile.get(name, 0.0) * 1000.0:.2f}ms"
+                    for name, label in profile_fields
+                )
+                WorkflowTaskLogger.get_current().log(
+                    f"easyscale profile step={batch_idx + 1} "
+                    f"rank={getattr(strategy, 'physical_rank', '?')} "
+                    f"world={getattr(strategy, 'physical_world_size', '?')} "
+                    f"ests={getattr(strategy, 'assigned_ests', ())} "
+                    f"gradient_mb={profile.get('gradient_elements', 0.0) * 4.0 / 1e6:.2f} "
+                    f"{details}"
+                )
 
     def on_train_epoch_end(self, trainer, pl_module):
         if not trainer.is_global_zero:

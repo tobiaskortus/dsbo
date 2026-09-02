@@ -24,6 +24,7 @@ from dsbo.surrogates.easyscale.generation import (
 from dsbo.surrogates.easyscale.protocol import ESTPlan, PlanDatabase, assign_virtual_ranks
 from dsbo.surrogates.easyscale.random import VirtualRankContext, initial_context
 from dsbo.surrogates.easyscale.runner import run_easyscale_generation
+from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import Workdir
 from dsbo.worker.spec import WorkerSpec
 
@@ -240,6 +241,36 @@ class GenerationRunner:
             gather_started = time.perf_counter()
             if futures:
                 results.extend(self.client.gather(futures))
+            profile_fields = (
+                ("est_data_transfer", "data_transfer"),
+                ("est_compute", "est_compute"),
+                ("gradient_metadata_all_reduce", "gradient_metadata_all_reduce"),
+                ("gradient_tensor_all_reduce", "gradient_tensor_all_reduce"),
+                ("gradient_aggregation_total", "gradient_aggregation"),
+                ("metric_all_reduce", "metric_all_reduce"),
+                ("metric_aggregation_total", "metric_aggregation"),
+                ("gradient_assignment", "gradient_assignment"),
+                ("backward_total", "backward"),
+                ("step_total", "step_total"),
+                ("throughput_all_gather", "throughput_all_gather"),
+                ("action_broadcast", "action_broadcast"),
+            )
+            for result in sorted(results, key=lambda item: item.physical_rank):
+                timings = result.timings
+                steps = int(timings.get("profile_steps", 0.0))
+                if not steps:
+                    continue
+                details = " ".join(
+                    f"{label}={timings.get(f'profile_mean_{name}', 0.0) * 1000.0:.2f}ms"
+                    for name, label in profile_fields
+                )
+                WorkflowTaskLogger.get_current().log(
+                    f"easyscale generation profile generation={generation} "
+                    f"rank={result.physical_rank} steps={steps} "
+                    f"ests={result.assigned_ests} "
+                    f"gradient_mb={timings.get('profile_mean_gradient_elements', 0.0) * 4.0 / 1e6:.2f} "
+                    f"{details}"
+                )
             gather_seconds = time.perf_counter() - gather_started
         except Exception:
             if futures:

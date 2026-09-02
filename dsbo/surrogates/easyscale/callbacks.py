@@ -13,7 +13,15 @@ from dsbo.surrogates.easyscale.random import VirtualRankContext, _capture_random
 from dsbo.surrogates.easyscale.generation import GenerationAction
 
 
-def global_throughput(strategy: EasyScaleStrategy, completed_steps: int, elapsed: float) -> float:
+def global_throughput(
+    strategy: EasyScaleStrategy,
+    completed_steps: int,
+    elapsed: float,
+    timings: dict[str, float] | None = None,
+) -> float:
+    if timings is not None and strategy.root_device.type == "cuda":
+        torch.cuda.synchronize(strategy.root_device)
+    gather_started = time.perf_counter()
     completed_by_rank = strategy.all_gather(
         torch.tensor(
             [completed_steps, elapsed],
@@ -21,6 +29,10 @@ def global_throughput(strategy: EasyScaleStrategy, completed_steps: int, elapsed
             device=strategy.root_device,
         )
     )
+    if timings is not None:
+        if strategy.root_device.type == "cuda":
+            torch.cuda.synchronize(strategy.root_device)
+        timings["throughput_all_gather"] = time.perf_counter() - gather_started
     total_steps = completed_by_rank[:, 0].sum()
     max_elapsed = completed_by_rank[:, 1].max()
     return float((total_steps / max_elapsed.clamp_min(torch.finfo(torch.float64).eps)).item())
@@ -32,6 +44,7 @@ def synchronize_action(
     completed_epoch: int,
     throughput: float,
     finished: bool,
+    timings: dict[str, float] | None = None,
 ) -> tuple[GenerationAction, Exception | None]:
     failure = None
     action = GenerationAction.CONTINUE
@@ -48,7 +61,14 @@ def synchronize_action(
     #encodes the GenerationAction enum as a GPU/CPU scalar tensor so all 
     # ranks can receive the value through the process group
     encoded = torch.tensor(int(action), dtype=torch.int64, device=strategy.root_device)
+    if timings is not None and strategy.root_device.type == "cuda":
+        torch.cuda.synchronize(strategy.root_device)
+    broadcast_started = time.perf_counter()
     strategy.broadcast(encoded, src=0)
+    if timings is not None:
+        if strategy.root_device.type == "cuda":
+            torch.cuda.synchronize(strategy.root_device)
+        timings["action_broadcast"] = time.perf_counter() - broadcast_started
     return GenerationAction(int(encoded.item())), failure
 
 
@@ -67,6 +87,8 @@ class EasyScaleControlCallback(L.Callback):
         self.throughput = 0.0
         self.completed_epoch = 0
         self.control_seconds = 0.0
+        self.control_profile_totals: dict[str, float] = {}
+        self.control_profile_events = 0
         self._last_steps = 0
         self._last_time = 0.0
 
@@ -76,12 +98,14 @@ class EasyScaleControlCallback(L.Callback):
 
     def on_train_epoch_end(self, trainer, pl_module) -> None:
         control_started = time.perf_counter()
+        control_profile: dict[str, float] = {}
         self.completed_epoch = trainer.current_epoch + 1
         now = time.perf_counter()
         self.throughput = global_throughput(
             self.strategy,
             self.strategy.est_steps - self._last_steps,
             now - self._last_time,
+            timings=control_profile,
         )
         self._last_steps = self.strategy.est_steps
         self._last_time = now
@@ -92,10 +116,16 @@ class EasyScaleControlCallback(L.Callback):
             self.completed_epoch,
             self.throughput,
             finished,
+            timings=control_profile,
         )
         if self.action != GenerationAction.CONTINUE:
             trainer.should_stop = True
         self.control_seconds += time.perf_counter() - control_started
+        self.control_profile_events += 1
+        for name, value in control_profile.items():
+            self.control_profile_totals[name] = (
+                self.control_profile_totals.get(name, 0.0) + value
+            )
         if self.action == GenerationAction.FAIL:
             if failure is not None:
                 raise failure

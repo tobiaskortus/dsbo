@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import contextvars
 from contextlib import contextmanager
-from typing import Any, Generator
+from typing import Any, Generator, TYPE_CHECKING
 
-from dsbo.utils.io.storage.autograd import AutogradFileInterface
-from dsbo.utils.io.storage.hdf5 import HDF5File
+if TYPE_CHECKING:
+    from dsbo.utils.io.storage.autograd import AutogradFileInterface
 
 _config_var: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "dsbo_config", default={}
@@ -49,6 +49,8 @@ config = Config()
 
 
 def get_active_file_backend() -> type[AutogradFileInterface]:
+    from dsbo.utils.io.storage.hdf5 import HDF5File
+
     backend = config.get("file_backend")
     if backend is not None:
         return backend
