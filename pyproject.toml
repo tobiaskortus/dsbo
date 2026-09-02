@@ -14,23 +14,15 @@ dependencies = [
     "dask-jobqueue",
     "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main",
     "diffusers",
-    "duckdb",
-    "duckdb-engine",
     "filelock",
     "graphviz",
-    "grpcio",
     "h5py",
-    "lancedb",
     "lightning",
     "matplotlib",
     "networkx",
     "numpy",
-    "optuna",
-    "optuna-integration[botorch]",
     "pandas",
     "psutil",
-    "pyarrow",
-    "pytorch-lightning",
     "sqlalchemy",
     "sqlmodel",
     "sqlite-vec",
@@ -41,7 +33,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "grpcio-tools",
     "pre-commit",
     "pytest",
 ]
