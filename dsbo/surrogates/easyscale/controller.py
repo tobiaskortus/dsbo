@@ -197,6 +197,11 @@ class GenerationRunner:
         futures: list[Any] = []
 
         try:
+            WorkflowTaskLogger.get_current().log(
+                f"easyscale generation dispatch generation={generation} "
+                f"world={len(plans)} "
+                f"assignments={assignments} checkpoint={checkpoint_path or 'none'}"
+            )
             nonzero_rank_plans = plans[1:]
             if nonzero_rank_plans:
                 count = len(nonzero_rank_plans)
@@ -224,6 +229,10 @@ class GenerationRunner:
                     )
                 )
             submission_seconds = time.perf_counter() - submission_started
+            WorkflowTaskLogger.get_current().log(
+                f"easyscale generation siblings-submitted generation={generation} "
+                f"count={len(nonzero_rank_plans)} elapsed={submission_seconds:.3f}s"
+            )
             results = [
                 run_easyscale_generation(
                     plans[0],

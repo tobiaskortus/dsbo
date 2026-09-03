@@ -89,6 +89,11 @@ def process_group(
 ):
     timings = {}
     rendezvous_started = time.perf_counter()
+    WorkflowTaskLogger.get_current().log(
+        f"easyscale rendezvous start generation={plan.generation} "
+        f"rank={plan.physical_rank} world={plan.physical_world_size} "
+        f"backend={plan.backend} timeout={timeout:.1f}s"
+    )
     rendezvous_host = plan.rendezvous_host
     rendezvous_port = plan.rendezvous_port
     rendezvous_variable = None
@@ -134,6 +139,11 @@ def process_group(
             )
             timings["store"] = time.perf_counter() - endpoint_started
             rendezvous_port = store.port
+            WorkflowTaskLogger.get_current().log(
+                f"easyscale rendezvous store-ready generation={plan.generation} "
+                f"rank={plan.physical_rank} host={rendezvous_host} "
+                f"port={rendezvous_port} elapsed={timings['store']:.3f}s"
+            )
             if rendezvous_variable is not None:
                 publish_started = time.perf_counter()
                 rendezvous_variable.set(
@@ -141,13 +151,26 @@ def process_group(
                     timeout=timeout,
                 )
                 timings["endpoint"] = time.perf_counter() - publish_started
+                WorkflowTaskLogger.get_current().log(
+                    f"easyscale rendezvous endpoint-published generation={plan.generation} "
+                    f"rank={plan.physical_rank} elapsed={timings['endpoint']:.3f}s"
+                )
         else:
             if rendezvous_host is None or rendezvous_port is None:
                 endpoint_started = time.perf_counter()
+                WorkflowTaskLogger.get_current().log(
+                    f"easyscale rendezvous endpoint-wait generation={plan.generation} "
+                    f"rank={plan.physical_rank}"
+                )
                 rendezvous_host, rendezvous_port = rendezvous_variable.get(
                     timeout=timeout
                 )
                 timings["endpoint"] = time.perf_counter() - endpoint_started
+                WorkflowTaskLogger.get_current().log(
+                    f"easyscale rendezvous endpoint-ready generation={plan.generation} "
+                    f"rank={plan.physical_rank} host={rendezvous_host} "
+                    f"port={rendezvous_port} elapsed={timings['endpoint']:.3f}s"
+                )
             store_started = time.perf_counter()
             store = dist.TCPStore(
                 rendezvous_host,
@@ -157,18 +180,48 @@ def process_group(
                 timedelta(seconds=timeout),
             )
             timings["store"] = time.perf_counter() - store_started
+            WorkflowTaskLogger.get_current().log(
+                f"easyscale rendezvous store-ready generation={plan.generation} "
+                f"rank={plan.physical_rank} host={rendezvous_host} "
+                f"port={rendezvous_port} elapsed={timings['store']:.3f}s"
+            )
         rank_alignment_started = time.perf_counter()
         store.set(f"rank-{plan.physical_rank}-ready", "1")
+        WorkflowTaskLogger.get_current().log(
+            f"easyscale rendezvous rank-ready generation={plan.generation} "
+            f"rank={plan.physical_rank}"
+        )
         if plan.physical_rank == 0:
+            WorkflowTaskLogger.get_current().log(
+                f"easyscale rendezvous rank-alignment-wait generation={plan.generation} "
+                f"rank={plan.physical_rank} expected={plan.physical_world_size}"
+            )
             store.wait(
                 [f"rank-{rank}-ready" for rank in range(plan.physical_world_size)],
                 timedelta(seconds=timeout),
             )
             store.set("ranks-ready", "1")
+            WorkflowTaskLogger.get_current().log(
+                f"easyscale rendezvous ranks-aligned generation={plan.generation} "
+                f"rank={plan.physical_rank}"
+            )
         else:
+            WorkflowTaskLogger.get_current().log(
+                f"easyscale rendezvous rank-alignment-wait generation={plan.generation} "
+                f"rank={plan.physical_rank}"
+            )
             store.wait(["ranks-ready"], timedelta(seconds=timeout))
         timings["rank_alignment"] = time.perf_counter() - rank_alignment_started
+        WorkflowTaskLogger.get_current().log(
+            f"easyscale rendezvous rank-alignment-done generation={plan.generation} "
+            f"rank={plan.physical_rank} elapsed={timings['rank_alignment']:.3f}s"
+        )
         process_group_started = time.perf_counter()
+        WorkflowTaskLogger.get_current().log(
+            f"easyscale process-group-init start generation={plan.generation} "
+            f"rank={plan.physical_rank} world={plan.physical_world_size} "
+            f"backend={plan.backend}"
+        )
         dist.init_process_group(
             backend=plan.backend,
             store=store,
@@ -178,12 +231,27 @@ def process_group(
         )
         timings["process_group_init"] = time.perf_counter() - process_group_started
         timings["rendezvous"] = time.perf_counter() - rendezvous_started
+        WorkflowTaskLogger.get_current().log(
+            f"easyscale process-group-init done generation={plan.generation} "
+            f"rank={plan.physical_rank} elapsed={timings['process_group_init']:.3f}s "
+            f"rendezvous_total={timings['rendezvous']:.3f}s"
+        )
         started = True
         yield rendezvous_host, rendezvous_port, timings
     finally:
         try:
             if started and dist.is_initialized():
+                teardown_started = time.perf_counter()
+                WorkflowTaskLogger.get_current().log(
+                    f"easyscale process-group-teardown start "
+                    f"generation={plan.generation} rank={plan.physical_rank}"
+                )
                 dist.destroy_process_group()
+                WorkflowTaskLogger.get_current().log(
+                    f"easyscale process-group-teardown done "
+                    f"generation={plan.generation} rank={plan.physical_rank} "
+                    f"elapsed={time.perf_counter() - teardown_started:.3f}s"
+                )
         finally:
             if plan.physical_rank == 0 and rendezvous_variable is not None:
                 rendezvous_variable.delete()
@@ -205,6 +273,12 @@ def _run_generation_body(
     body_started = time.perf_counter()
     seed = int(getattr(training_config, "seed", 0))
     virtual_world_size = len(state.contexts)
+    WorkflowTaskLogger.get_current().log(
+        f"easyscale generation-body start generation={plan.generation} "
+        f"rank={plan.physical_rank} world={plan.physical_world_size} "
+        f"ests={plan.assigned_ests} device={device} "
+        f"checkpoint={state.checkpoint_path or 'none'}"
+    )
     if device.type == "cuda":
         torch.cuda.set_device(device)
 
@@ -233,6 +307,11 @@ def _run_generation_body(
         seed,
         assigned_ranks=plan.assigned_ests,
         contexts=assigned_contexts,
+    )
+    WorkflowTaskLogger.get_current().log(
+        f"easyscale virtual-dataloader ready generation={plan.generation} "
+        f"rank={plan.physical_rank} ests={plan.assigned_ests} "
+        f"elapsed={time.perf_counter() - body_started:.3f}s"
     )
     control_callback = EasyScaleControlCallback(
         strategy,
@@ -268,7 +347,15 @@ def _run_generation_body(
         reload_dataloaders_every_n_epochs=1,
         precision="32-true",
     )
+    WorkflowTaskLogger.get_current().log(
+        f"easyscale trainer ready generation={plan.generation} "
+        f"rank={plan.physical_rank} elapsed={time.perf_counter() - body_started:.3f}s"
+    )
     fit_started = time.perf_counter()
+    WorkflowTaskLogger.get_current().log(
+        f"easyscale trainer-fit start generation={plan.generation} "
+        f"rank={plan.physical_rank} checkpoint={state.checkpoint_path or 'none'}"
+    )
     trainer.fit(
         model,
         train_dataloaders=virtual_loader,
@@ -276,6 +363,11 @@ def _run_generation_body(
         ckpt_path=state.checkpoint_path,
     )
     fit_seconds = time.perf_counter() - fit_started
+    WorkflowTaskLogger.get_current().log(
+        f"easyscale trainer-fit done generation={plan.generation} "
+        f"rank={plan.physical_rank} elapsed={fit_seconds:.3f}s "
+        f"checkpoint_saved={checkpoint_callback.saved}"
+    )
     if not checkpoint_callback.saved:
         raise RuntimeError("EasyScale generation stopped without a state checkpoint.")
 
@@ -361,6 +453,7 @@ def run_easyscale_generation(
     if worker is not None:
         WorkflowTaskLogger.get_current().log(
             f"EasyScale generation {plan.generation} rank {plan.physical_rank} "
+            f"world {plan.physical_world_size} ests={plan.assigned_ests} "
             f"running on worker {worker.address}"
         )
     timeout = allocation_timeout(training_config)
@@ -382,6 +475,15 @@ def run_easyscale_generation(
             rendezvous_timings,
         ):
             rendezvous_seconds = time.perf_counter() - rendezvous_started
+            WorkflowTaskLogger.get_current().log(
+                f"easyscale rendezvous complete generation={plan.generation} "
+                f"rank={plan.physical_rank} world={plan.physical_world_size} "
+                f"endpoint={rendezvous_timings.get('endpoint', 0.0):.3f}s "
+                f"store={rendezvous_timings.get('store', 0.0):.3f}s "
+                f"rank_alignment={rendezvous_timings.get('rank_alignment', 0.0):.3f}s "
+                f"process_group_init={rendezvous_timings.get('process_group_init', 0.0):.3f}s "
+                f"total={rendezvous_seconds:.3f}s"
+            )
             result = _run_generation_body(
                 plan,
                 state,
