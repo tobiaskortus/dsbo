@@ -51,25 +51,19 @@ def reduce_gradients(
     losses = torch.zeros(virtual_world_size, dtype=torch.float32, device=device)
     ownership = torch.zeros(virtual_world_size, dtype=torch.float32, device=device)
     masks = torch.zeros((virtual_world_size, parameter_count), dtype=torch.float32, device=device)
-    contributions = torch.zeros((virtual_world_size, gradient_size), dtype=torch.float32, device=device)
 
     for item in pending:
         ownership[item.rank] += 1
         masks[item.rank].copy_(item.mask.to(dtype=torch.float32))
         losses[item.rank] = item.loss
-        contributions[item.rank].copy_(item.gradient)
 
     metadata = torch.cat((ownership, masks.reshape(-1), losses))
     if physical_world_size > 1:
         _timed_all_reduce(
             metadata, device, timings, "gradient_metadata_all_reduce"
         )
-        _timed_all_reduce(
-            contributions, device, timings, "gradient_tensor_all_reduce"
-        )
     elif timings is not None:
         timings["gradient_metadata_all_reduce"] = 0.0
-        timings["gradient_tensor_all_reduce"] = 0.0
 
     head = virtual_world_size
     tail = head + virtual_world_size * parameter_count
@@ -83,6 +77,47 @@ def reduce_gradients(
         ordered_masks = masks.to(dtype=torch.bool)
         if any(not torch.equal(mask, ordered_masks[0]) for mask in ordered_masks[1:]):
             raise RuntimeError("a parameter gradient is missing from only some ESTs.")
+
+        contributions = torch.zeros((virtual_world_size, gradient_size), dtype=torch.float32, device=device)
+        if physical_world_size > 1:
+            slots = (virtual_world_size + physical_world_size - 1) // physical_world_size
+            if len(pending) > slots:
+                raise RuntimeError("gradient gather requires balanced EST assignments.")
+            local = torch.zeros((slots, gradient_size + 1), dtype=torch.float32, device=device)
+            local[:, 0] = -1
+            for index, item in enumerate(pending):
+                local[index, 0] = item.rank
+                local[index, 1:].copy_(item.gradient)
+
+            gathered = torch.empty(
+                (physical_world_size * slots, gradient_size + 1),
+                dtype=torch.float32,
+                device=device,
+            )
+            if timings is None:
+                dist.all_gather_into_tensor(gathered, local)
+            else:
+                _synchronize(device)
+                gather_started = time.perf_counter()
+                dist.all_gather_into_tensor(gathered, local)
+                _synchronize(device)
+                timings["gradient_tensor_all_gather"] = (
+                    time.perf_counter() - gather_started
+                )
+
+            gathered_ranks = gathered[:, 0].to(dtype=torch.int64).tolist()
+            sorthed_gathered_ranks = sorted(rank for rank in gathered_ranks if rank >= 0)
+            if sorthed_gathered_ranks != list(range(virtual_world_size)):
+                raise RuntimeError("gradient gather requires every EST exactly once.")
+            for index, rank in enumerate(gathered_ranks):
+                if rank >= 0:
+                    contributions[rank].copy_(gathered[index, 1:])
+        else:
+            if timings is not None:
+                timings["gradient_tensor_all_gather"] = 0.0
+            for item in pending:
+                contributions[item.rank].copy_(item.gradient)
+
         result = (
             contributions.div(virtual_world_size).sum(dim=0),
             ordered_masks[0].clone(),

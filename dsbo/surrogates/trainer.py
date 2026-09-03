@@ -115,7 +115,7 @@ class PerfCallback(L.Callback):
                     ("est_data_transfer", "data_transfer"),
                     ("est_compute", "est_compute"),
                     ("gradient_metadata_all_reduce", "gradient_metadata_all_reduce"),
-                    ("gradient_tensor_all_reduce", "gradient_tensor_all_reduce"),
+                    ("gradient_tensor_all_gather", "gradient_tensor_all_gather"),
                     ("gradient_aggregation_total", "gradient_aggregation"),
                     ("metric_all_reduce", "metric_all_reduce"),
                     ("metric_aggregation_total", "metric_aggregation"),
