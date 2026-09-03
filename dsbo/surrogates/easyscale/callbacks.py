@@ -73,16 +73,18 @@ def synchronize_action(
 
 
 class EasyScaleControlCallback(L.Callback):
-    """Synchronize controller decisions at completed epoch boundaries."""
+    """Synchronize controller decisions at completed global-step boundaries."""
 
     def __init__(
         self,
         strategy: EasyScaleStrategy,
         decide: Callable[[int, float, bool], GenerationAction] | None,
+        control_interval_steps: int,
     ) -> None:
         super().__init__()
         self.strategy = strategy
         self.decide = decide
+        self.control_interval_steps = control_interval_steps
         self.action = GenerationAction.CONTINUE
         self.throughput = 0.0
         self.completed_epoch = 0
@@ -96,10 +98,12 @@ class EasyScaleControlCallback(L.Callback):
         self._last_steps = self.strategy.est_steps
         self._last_time = time.perf_counter()
 
-    def on_train_epoch_end(self, trainer, pl_module) -> None:
+    def _synchronize_boundary_decision(
+        self, trainer, completed_epoch: int, finished: bool
+    ) -> None:
         control_started = time.perf_counter()
         control_profile: dict[str, float] = {}
-        self.completed_epoch = trainer.current_epoch + 1
+        self.completed_epoch = completed_epoch
         now = time.perf_counter()
         self.throughput = global_throughput(
             self.strategy,
@@ -109,7 +113,6 @@ class EasyScaleControlCallback(L.Callback):
         )
         self._last_steps = self.strategy.est_steps
         self._last_time = now
-        finished = bool(trainer.should_stop) or self.completed_epoch >= trainer.max_epochs
         self.action, failure = synchronize_action(
             self.strategy,
             self.decide,
@@ -129,7 +132,30 @@ class EasyScaleControlCallback(L.Callback):
         if self.action == GenerationAction.FAIL:
             if failure is not None:
                 raise failure
-            raise RuntimeError("EasyScale controller failed at an epoch boundary.")
+            raise RuntimeError("EasyScale controller failed at a training boundary.")
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        if self.action != GenerationAction.CONTINUE:
+            return
+        if batch_idx + 1 >= trainer.num_training_batches:
+            return
+        if trainer.global_step % self.control_interval_steps != 0:
+            return
+        self._synchronize_boundary_decision(
+            trainer,
+            trainer.current_epoch,
+            bool(trainer.should_stop),
+        )
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if self.action != GenerationAction.CONTINUE:
+            return
+        completed_epoch = trainer.current_epoch + 1
+        self._synchronize_boundary_decision(
+            trainer,
+            completed_epoch,
+            bool(trainer.should_stop) or completed_epoch >= trainer.max_epochs,
+        )
 
 
 class EasyScaleCheckpointCallback(L.Callback):
@@ -147,6 +173,7 @@ class EasyScaleCheckpointCallback(L.Callback):
         self.rank_zero_state = rank_zero_state
         self.saved = False
         self.save_seconds = 0.0
+        self._saving_mid_epoch = False
 
     @property
     def state_key(self) -> str:
@@ -182,6 +209,15 @@ class EasyScaleCheckpointCallback(L.Callback):
                 self.strategy.root_device,
             )
 
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint) -> None:
+        if not self._saving_mid_epoch:
+            return
+        # The virtual sampler already omits consumed batches, so resume this
+        # shortened loader as the start of the still-incomplete epoch.
+        epoch_progress = checkpoint["loops"]["fit_loop"]["epoch_progress"]
+        for progress in epoch_progress.values():
+            for name in progress:
+                progress[name] = self.control.completed_epoch
 
     def save(self, trainer) -> None:
         save_started = time.perf_counter()
@@ -193,6 +229,7 @@ class EasyScaleCheckpointCallback(L.Callback):
         }
         if len(boundaries) != 1:
             raise RuntimeError("EST contexts are not at one completed global-step boundary")
+        self._saving_mid_epoch = contexts[0].sampler_position != 0
         self.rank_zero_state = (
             _capture_random_state(self.strategy.root_device)
             if self.strategy.is_global_zero
@@ -205,6 +242,14 @@ class EasyScaleCheckpointCallback(L.Callback):
         self.save_seconds += time.perf_counter() - save_started
 
     def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if self.control.action not in {
+            GenerationAction.RECONFIGURE,
+            GenerationAction.STOP,
+        }:
+            return
+        self.save(trainer)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
         if self.control.action not in {
             GenerationAction.RECONFIGURE,
             GenerationAction.STOP,

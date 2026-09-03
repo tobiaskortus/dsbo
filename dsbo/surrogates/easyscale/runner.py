@@ -234,7 +234,11 @@ def _run_generation_body(
         assigned_ranks=plan.assigned_ests,
         contexts=assigned_contexts,
     )
-    control_callback = EasyScaleControlCallback(strategy, boundary_decision)
+    control_callback = EasyScaleControlCallback(
+        strategy,
+        boundary_decision,
+        training_config.easyscale_scheduler.control_interval_steps,
+    )
     checkpoint_callback = EasyScaleCheckpointCallback(
         strategy,
         plan.checkpoint_path,
@@ -261,6 +265,7 @@ def _run_generation_body(
         enable_progress_bar=False,
         enable_model_summary=False,
         use_distributed_sampler=False,
+        reload_dataloaders_every_n_epochs=1,
         precision="32-true",
     )
     fit_started = time.perf_counter()

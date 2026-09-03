@@ -214,7 +214,7 @@ class Trainer:
         if self._elastic:
             if enable_checkpointing:
                 raise ValueError(
-                    "EasyScale uses internal epoch-boundary checkpoints; persistent "
+                    "EasyScale uses internal generation-boundary checkpoints; persistent "
                     "Lightning checkpointing is not supported."
                 )
             if kwargs.get("accumulate_grad_batches", 1) != 1:

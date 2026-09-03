@@ -11,6 +11,7 @@ class EasyScaleSchedulerConfig:
     profile_bias_threshold: float = 0.2
     allocation_timeout: float = 300.0
     proposal_increment: int = 1
+    control_interval_steps: int = 25
     capabilities: Mapping[str, float] = field(default_factory=dict)
 
 
