@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
@@ -228,6 +229,23 @@ class GenerationRunner:
                         pure=False,
                     )
                 )
+                task_logger = WorkflowTaskLogger.get_current()
+                for future, plan in zip(futures, nonzero_rank_plans):
+                    if not hasattr(future, "add_done_callback"):
+                        continue
+
+                    def log_rank_failure(completed, rank=plan.physical_rank):
+                        try:
+                            failure = completed.exception()
+                        except Exception as exc:
+                            if exc is not None:
+                                task_logger.log(
+                                    f"EasyScale generation {generation} rank {rank} failed: "
+                                    f"{failure!r}",
+                                    logging.ERROR,
+                                )
+
+                    future.add_done_callback(log_rank_failure)
             submission_seconds = time.perf_counter() - submission_started
             WorkflowTaskLogger.get_current().log(
                 f"easyscale generation siblings-submitted generation={generation} "
