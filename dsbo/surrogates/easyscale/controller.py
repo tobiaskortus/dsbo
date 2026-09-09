@@ -10,6 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import cloudpickle
 import lightning as L
 import torch.distributed as dist
 from distributed import Client, get_worker, wait
@@ -24,7 +25,10 @@ from dsbo.surrogates.easyscale.generation import (
 )
 from dsbo.surrogates.easyscale.protocol import ESTPlan, PlanDatabase, assign_virtual_ranks
 from dsbo.surrogates.easyscale.random import VirtualRankContext, initial_context
-from dsbo.surrogates.easyscale.runner import run_easyscale_generation
+from dsbo.surrogates.easyscale.runner import (
+    close_easyscale_dataloaders,
+    run_easyscale_generation,
+)
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import Workdir
 from dsbo.worker.spec import WorkerSpec
@@ -78,14 +82,25 @@ class WorkerStateMachine:
 
         return plan
 
-    def decide(self, epoch: int, throughput: float, should_stop: bool) -> GenerationAction:
+    def needs_retry(self) -> bool:
+        return (
+            self.pending_round is not None
+            or self.approved_worker_count != self.active_worker_count
+        )
+
+    def decide(
+        self,
+        epoch: int,
+        throughput: float | None,
+        should_stop: bool,
+    ) -> GenerationAction:
         self._poll_allocation()
 
-        if self.database.capability is None:
+        if throughput is not None and self.database.capability is None:
             self.database.set_capability(throughput / self.active_worker_count)
             self.current_plan = self.database.select_plan(self.active_worker_count)
             self.database.current_plan = self.current_plan
-        else:
+        elif throughput is not None:
             fallback = self.database.fallback_if_slowdown(throughput)
             self.current_plan = self.database.current_plan
             if fallback is not None:
@@ -103,33 +118,46 @@ class WorkerStateMachine:
             self._release_final_tail()
             return GenerationAction.STOP
 
+        if throughput is not None and self.pending_round is None and not self.needs_retry():
+            plan = self.database.select_plan(self.approved_worker_count)
+            proposals = self.database.propose(plan, self.max_worker_count)
+            submission = self.allocator.submit_proposals(self.job_id, proposals)
+            if submission.pending:
+                self.pending_round = submission.round_id
+            elif submission.decision is not None:
+                self._apply_approved(
+                    submission.decision.allocation,
+                    submission.decision.allocation_revision,
+                )
+
         if self.approved_worker_count != self.active_worker_count:
             capacity = self.allocator.capacity(self.job_id)
-            if capacity.allocation_revision != self.allocation_revision:
-                self._apply_approved(
-                    capacity.approved_allocation,
-                    capacity.allocation_revision,
-                )
-            if capacity.ready and self.approved_worker_count != self.active_worker_count:
+            accepted = self._apply_approved(
+                capacity.approved_allocation,
+                capacity.allocation_revision,
+            )
+            if accepted and capacity.ready:
                 self.active_worker_count = self.approved_worker_count
                 self.select_active_plan()
                 return GenerationAction.RECONFIGURE
-            return GenerationAction.CONTINUE
-
-        if self.pending_round is None:
-            plan = self.database.select_plan(self.approved_worker_count)
-            proposals = self.database.propose(plan, self.max_worker_count)
-            self.pending_round = self.allocator.submit_proposals(self.job_id, proposals)
         return GenerationAction.CONTINUE
 
     def _worker_count(self, allocation: Mapping[str, int]) -> int:
         return int(allocation.get(self.resource_type, 0))
 
-    def _apply_approved(self, allocation: Mapping[str, int], revision: int) -> None:
-        self.allocation_revision = revision
-        self.approved_worker_count = self._worker_count(allocation)
-        if self.approved_worker_count > self.virtual_world_size:
+    def _apply_approved(self, allocation: Mapping[str, int], revision: int) -> bool:
+        worker_count = self._worker_count(allocation)
+        if worker_count > self.virtual_world_size:
             raise RuntimeError("granted physical allocation exceeds virtual world size.")
+        if revision < self.allocation_revision:
+            return False
+        if revision == self.allocation_revision:
+            if worker_count != self.approved_worker_count:
+                raise RuntimeError("allocation changed without advancing its revision.")
+            return True
+        self.allocation_revision = revision
+        self.approved_worker_count = worker_count
+        return True
 
     def _poll_allocation(self) -> None:
         if self.pending_round is None:
@@ -175,6 +203,7 @@ class GenerationRunner:
         state: GenerationState,
         assignments: Mapping[str, Sequence[int]],
         boundary_decision,
+        boundary_retry,
     ) -> tuple[list[GenerationResult], dict[str, Any]]:
         slots = sorted(assignments)
         store, host, port = self._rendezvous(len(slots))
@@ -193,8 +222,8 @@ class GenerationRunner:
             )
             for rank, slot in enumerate(slots)
         ]
-        submitted_wall = time.time()
         submission_started = time.perf_counter()
+        scatter_seconds = 0.0
         futures: list[Any] = []
 
         try:
@@ -205,20 +234,29 @@ class GenerationRunner:
             )
             nonzero_rank_plans = plans[1:]
             if nonzero_rank_plans:
-                count = len(nonzero_rank_plans)
+                scatter_started = time.perf_counter()
+                model, train_loader, val_loader = self.client.scatter(
+                    [
+                        cloudpickle.dumps(self.model),
+                        cloudpickle.dumps(self.train_loader),
+                        cloudpickle.dumps(self.val_loader),
+                    ],
+                    broadcast=True,
+                    hash=False,
+                )
+                scatter_seconds = time.perf_counter() - scatter_started
+                submitted_wall = time.time()
                 futures.extend(
                     self.client.map(
                         run_easyscale_generation,
                         nonzero_rank_plans,
-                        [state] * count,
-                        [self.model] * count,
-                        [self.train_loader] * count,
-                        [self.val_loader] * count,
-                        [self.config] * count,
-                        [self.model_tag] * count,
-                        [self.callbacks] * count,
-                        [None] * count,
-                        [None] * count,
+                        state=state,
+                        model=model,
+                        train_loader=train_loader,
+                        val_loader=val_loader,
+                        training_config=self.config,
+                        model_tag=self.model_tag,
+                        external_callbacks=self.callbacks,
                         key=[
                             f"dsbo-easyscale-{job_id}-generation-{generation}"
                             f"-rank-{plan.physical_rank}"
@@ -238,14 +276,17 @@ class GenerationRunner:
                         try:
                             failure = completed.exception()
                         except Exception as exc:
-                            if exc is not None:
-                                task_logger.log(
-                                    f"EasyScale generation {generation} rank {rank} failed: "
-                                    f"{failure!r}",
-                                    logging.ERROR,
-                                )
+                            failure = exc
+                        if failure is not None:
+                            task_logger.log(
+                                f"EasyScale generation {generation} rank {rank} failed: "
+                                f"{failure!r}",
+                                logging.ERROR,
+                            )
 
                     future.add_done_callback(log_rank_failure)
+            else:
+                submitted_wall = time.time()
             submission_seconds = time.perf_counter() - submission_started
             WorkflowTaskLogger.get_current().log(
                 f"easyscale generation siblings-submitted generation={generation} "
@@ -262,6 +303,7 @@ class GenerationRunner:
                     self.model_tag,
                     self.callbacks,
                     boundary_decision,
+                    boundary_retry,
                     store,
                 )
             ]
@@ -271,8 +313,13 @@ class GenerationRunner:
             profile_fields = (
                 ("est_data_transfer", "data_transfer"),
                 ("est_compute", "est_compute"),
+                ("gradient_pre_collective_wait", "gradient_wait"),
                 ("gradient_metadata_all_reduce", "gradient_metadata_all_reduce"),
-                ("gradient_tensor_all_gather", "gradient_tensor_all_gather"),
+                ("gradient_rank_all_gather", "gradient_rank_all_gather"),
+                ("gradient_shard_exchange", "gradient_shard_exchange"),
+                ("gradient_result_wait", "gradient_result_wait"),
+                ("gradient_result_all_gather", "gradient_result_all_gather"),
+                ("gradient_collective_total", "gradient_collective"),
                 ("gradient_aggregation_total", "gradient_aggregation"),
                 ("metric_all_reduce", "metric_all_reduce"),
                 ("metric_aggregation_total", "metric_aggregation"),
@@ -309,6 +356,7 @@ class GenerationRunner:
         return results, {
             "world_size": len(slots),
             "submitted_wall": submitted_wall,
+            "scatter": scatter_seconds,
             "submission": submission_seconds,
             "gather": gather_seconds,
             "ranks": [
@@ -461,6 +509,7 @@ class EasyScaleController:
                     state,
                     assignments,
                     allocation.decide,
+                    allocation.needs_retry,
                 )
                 self.generation_profiles.append(
                     {"generation": generation, **profile}
@@ -509,6 +558,12 @@ class EasyScaleController:
             model.load_state_dict(final_result.model_state, strict=True)
             succeeded = True
         finally:
+            cleanup_failure = None
+            if registered and hasattr(self.client, "run"):
+                try:
+                    self.client.run(close_easyscale_dataloaders, job_id)
+                except Exception as exc:
+                    cleanup_failure = exc
             try:
                 if registered:
                     self.allocator.close_job(job_id)
@@ -520,3 +575,8 @@ class EasyScaleController:
                     for path in owned_checkpoints:
                         if os.path.exists(path):
                             os.unlink(path)
+            if cleanup_failure is not None:
+                WorkflowTaskLogger.get_current().log(
+                    f"EasyScale loader cleanup failed: {cleanup_failure}",
+                    logging.ERROR,
+                )

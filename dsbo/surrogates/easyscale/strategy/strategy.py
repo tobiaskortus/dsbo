@@ -243,7 +243,11 @@ class EasyScaleStrategy(SingleDeviceStrategy):
         if isinstance(obj, torch.Tensor):
             return self.collective.broadcast(obj, src)
         values = [obj if self.physical_rank == src else None]
-        self.collective.broadcast_object_list(values, src=src)
+        self.collective.broadcast_object_list(
+            values,
+            src=src,
+            device=self.root_device,
+        )
         return values[0]
 
     def barrier(self, name=None):

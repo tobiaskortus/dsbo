@@ -7,7 +7,9 @@ import time
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from datetime import timedelta
+from pathlib import Path
 
+import cloudpickle
 import lightning as L
 import torch
 import torch.distributed as dist
@@ -16,7 +18,11 @@ from lightning.pytorch.callbacks import EarlyStopping
 
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.surrogates.easyscale.strategy import EasyScaleStrategy
-from dsbo.surrogates.easyscale.virtual_dataset import build_virtual_dataloader
+from dsbo.surrogates.easyscale.virtual_dataset import (
+    VirtualDataLoader,
+    build_virtual_dataloader,
+)
+from dsbo.surrogates.easyscale.scheduler.plugin import EASYSCALE_RUNTIME_PLUGIN_NAME
 from dsbo.surrogates.easyscale.callbacks import (
     EasyScaleCheckpointCallback,
     EasyScaleControlCallback,
@@ -268,7 +274,9 @@ def _run_generation_body(
     rendezvous_host: str | None,
     rendezvous_port: int | None,
     device: torch.device,
-    boundary_decision: Callable[[int, float, bool], GenerationAction] | None,
+    boundary_decision: Callable[[int, float | None, bool], GenerationAction] | None,
+    boundary_retry: Callable[[], bool] | None,
+    runtime_plugin=None,
 ) -> GenerationResult:
     body_started = time.perf_counter()
     seed = int(getattr(training_config, "seed", 0))
@@ -301,13 +309,22 @@ def _run_generation_body(
         device=device,
         backend=plan.backend,
     )
-    virtual_loader = build_virtual_dataloader(
-        train_loader,
-        virtual_world_size,
-        seed,
-        assigned_ranks=plan.assigned_ests,
-        contexts=assigned_contexts,
-    )
+    virtual_loader: VirtualDataLoader | None = None
+    if runtime_plugin is not None and train_loader.persistent_workers:
+        virtual_loader = runtime_plugin.take_dataloader(plan.job_id)
+    if virtual_loader is None:
+        virtual_loader = build_virtual_dataloader(
+            train_loader,
+            virtual_world_size,
+            seed,
+            assigned_ranks=plan.assigned_ests,
+            contexts=assigned_contexts,
+        )
+    else:
+        virtual_loader.reconfigure(plan.assigned_ests, assigned_contexts)
+        virtual_loader.restore_workers()
+    if runtime_plugin is not None and virtual_loader.persistent_workers:
+        runtime_plugin.retain_dataloader(plan.job_id, virtual_loader)
     WorkflowTaskLogger.get_current().log(
         f"easyscale virtual-dataloader ready generation={plan.generation} "
         f"rank={plan.physical_rank} ests={plan.assigned_ests} "
@@ -317,12 +334,14 @@ def _run_generation_body(
         strategy,
         boundary_decision,
         training_config.easyscale_scheduler.control_interval_steps,
+        boundary_retry,
     )
     checkpoint_callback = EasyScaleCheckpointCallback(
         strategy,
         plan.checkpoint_path,
         control_callback,
         rank_zero_state=state.rank_zero_state,
+        persistent_loader=virtual_loader if runtime_plugin is not None else None,
     )
     callbacks: list[L.Callback] = copy.deepcopy(list(external_callbacks))
     patience = getattr(training_config, "patience", None)
@@ -351,6 +370,13 @@ def _run_generation_body(
         f"easyscale trainer ready generation={plan.generation} "
         f"rank={plan.physical_rank} elapsed={time.perf_counter() - body_started:.3f}s"
     )
+    if state.checkpoint_path is not None:
+        checkpoint = Path(state.checkpoint_path)
+        checkpoint_size = checkpoint.stat().st_size
+        WorkflowTaskLogger.get_current().log(
+            f"easyscale checkpoint preflight generation={plan.generation} "
+            f"rank={plan.physical_rank} path={checkpoint} bytes={checkpoint_size}"
+        )
     fit_started = time.perf_counter()
     WorkflowTaskLogger.get_current().log(
         f"easyscale trainer-fit start generation={plan.generation} "
@@ -369,7 +395,14 @@ def _run_generation_body(
         f"checkpoint_saved={checkpoint_callback.saved}"
     )
     if not checkpoint_callback.saved:
+        virtual_loader.close_workers()
+        if runtime_plugin is not None:
+            runtime_plugin.close_job(plan.job_id)
         raise RuntimeError("EasyScale generation stopped without a state checkpoint.")
+    if control_callback.action == GenerationAction.RECONFIGURE:
+        virtual_loader.park_workers()
+    elif runtime_plugin is not None:
+        runtime_plugin.close_job(plan.job_id)
 
     contexts = strategy.all_contexts
     if contexts is None:
@@ -435,6 +468,15 @@ def _run_generation_body(
     )
 
 
+def close_easyscale_dataloaders(job_id: str, dask_worker=None) -> None:
+    if dask_worker is None:
+        return
+    
+    runtime_plugin = getattr(dask_worker, "plugins", {}).get(EASYSCALE_RUNTIME_PLUGIN_NAME)
+    if runtime_plugin is not None:
+        runtime_plugin.close_job(job_id)
+
+
 def run_easyscale_generation(
     plan: GenerationPlan,
     state: GenerationState,
@@ -444,12 +486,18 @@ def run_easyscale_generation(
     training_config,
     model_tag: str | None = None,
     external_callbacks: Sequence[L.Callback] = (),
-    boundary_decision: Callable[[int, float, bool], GenerationAction] | None = None,
+    boundary_decision: Callable[[int, float | None, bool], GenerationAction] | None = None,
+    boundary_retry: Callable[[], bool] | None = None,
     rendezvous_store: dist.TCPStore | None = None,
 ) -> GenerationResult:
+    if isinstance(model, bytes):
+        model = cloudpickle.loads(model)
+        train_loader = cloudpickle.loads(train_loader)
+        val_loader = cloudpickle.loads(val_loader)
     task_started = time.perf_counter()
     wall_started = time.time()
     client, worker = connect_dask()
+    runtime_plugin = getattr(worker, "plugins", {}).get(EASYSCALE_RUNTIME_PLUGIN_NAME)
     if worker is not None:
         WorkflowTaskLogger.get_current().log(
             f"EasyScale generation {plan.generation} rank {plan.physical_rank} "
@@ -466,6 +514,8 @@ def run_easyscale_generation(
         if plan.backend == "nccl"
         else torch.device("cpu")
     )
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
 
     with framework_state_preserved(device):
         rendezvous_started = time.perf_counter()
@@ -484,19 +534,26 @@ def run_easyscale_generation(
                 f"process_group_init={rendezvous_timings.get('process_group_init', 0.0):.3f}s "
                 f"total={rendezvous_seconds:.3f}s"
             )
-            result = _run_generation_body(
-                plan,
-                state,
-                model,
-                train_loader,
-                val_loader,
-                training_config,
-                external_callbacks,
-                rendezvous_host,
-                rendezvous_port,
-                device,
-                boundary_decision,
-            )
+            try:
+                result = _run_generation_body(
+                    plan,
+                    state,
+                    model,
+                    train_loader,
+                    val_loader,
+                    training_config,
+                    external_callbacks,
+                    rendezvous_host,
+                    rendezvous_port,
+                    device,
+                    boundary_decision,
+                    boundary_retry,
+                    runtime_plugin,
+                )
+            except Exception:
+                if runtime_plugin is not None:
+                    runtime_plugin.close_job(plan.job_id)
+                raise
         process_group_teardown = (
             time.perf_counter() - rendezvous_started - rendezvous_seconds
             - result.timings["generation_body"]

@@ -20,21 +20,27 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _timed_all_reduce(
-    tensor: torch.Tensor,
-    device: torch.device,
-    timings: dict[str, float] | None,
-    name: str,
-) -> None:
+def _timed_all_reduce(tensor: torch.Tensor, device: torch.device, timings: dict[str, float] | None, name: str) -> None:
     if timings is None:
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         return
+    
     _synchronize(device)
     started = time.perf_counter()
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     _synchronize(device)
     if timings is not None:
         timings[name] = time.perf_counter() - started
+
+
+def _timed_barrier(device: torch.device, timings: dict[str, float] | None, name: str) -> None:
+    if timings is None:
+        return
+    _synchronize(device)
+    started = time.perf_counter()
+    dist.barrier()
+    _synchronize(device)
+    timings[name] = time.perf_counter() - started
 
 
 def reduce_gradients(
@@ -59,10 +65,10 @@ def reduce_gradients(
 
     metadata = torch.cat((ownership, masks.reshape(-1), losses))
     if physical_world_size > 1:
-        _timed_all_reduce(
-            metadata, device, timings, "gradient_metadata_all_reduce"
-        )
+        _timed_barrier(device, timings, "gradient_pre_collective_wait")
+        _timed_all_reduce(metadata, device, timings, "gradient_metadata_all_reduce")
     elif timings is not None:
+        timings["gradient_pre_collective_wait"] = 0.0
         timings["gradient_metadata_all_reduce"] = 0.0
 
     head = virtual_world_size
@@ -78,52 +84,135 @@ def reduce_gradients(
         if any(not torch.equal(mask, ordered_masks[0]) for mask in ordered_masks[1:]):
             raise RuntimeError("a parameter gradient is missing from only some ESTs.")
 
-        contributions = torch.zeros((virtual_world_size, gradient_size), dtype=torch.float32, device=device)
-        if physical_world_size > 1:
-            slots = (virtual_world_size + physical_world_size - 1) // physical_world_size
-            if len(pending) > slots:
-                raise RuntimeError("gradient gather requires balanced EST assignments.")
-            local = torch.zeros((slots, gradient_size + 1), dtype=torch.float32, device=device)
-            local[:, 0] = -1
-            for index, item in enumerate(pending):
-                local[index, 0] = item.rank
-                local[index, 1:].copy_(item.gradient)
+        slots = (virtual_world_size + physical_world_size - 1) // physical_world_size
+        if len(pending) > slots:
+            raise RuntimeError("gradient reduction requires balanced EST assignments.")
 
-            gathered = torch.empty(
-                (physical_world_size * slots, gradient_size + 1),
-                dtype=torch.float32,
+        if physical_world_size > 1:
+            local_ranks = torch.full((slots,), -1, dtype=torch.int64, device=device)
+            for index, item in enumerate(pending):
+                local_ranks[index] = item.rank
+            gathered_ranks = torch.empty(
+                physical_world_size * slots,
+                dtype=torch.int64,
                 device=device,
             )
-            if timings is None:
-                dist.all_gather_into_tensor(gathered, local)
-            else:
+            if timings is not None:
                 _synchronize(device)
-                gather_started = time.perf_counter()
-                dist.all_gather_into_tensor(gathered, local)
+            rank_gather_started = time.perf_counter()
+            dist.all_gather_into_tensor(gathered_ranks, local_ranks)
+            if timings is not None:
                 _synchronize(device)
-                timings["gradient_tensor_all_gather"] = (
-                    time.perf_counter() - gather_started
+                timings["gradient_rank_all_gather"] = (
+                    time.perf_counter() - rank_gather_started
                 )
 
-            gathered_ranks = gathered[:, 0].to(dtype=torch.int64).tolist()
-            sorthed_gathered_ranks = sorted(rank for rank in gathered_ranks if rank >= 0)
-            if sorthed_gathered_ranks != list(range(virtual_world_size)):
-                raise RuntimeError("gradient gather requires every EST exactly once.")
-            for index, rank in enumerate(gathered_ranks):
-                if rank >= 0:
-                    contributions[rank].copy_(gathered[index, 1:])
+            rank_rows = gathered_ranks.reshape(physical_world_size, slots).tolist()
+            if sorted(rank for rows in rank_rows for rank in rows if rank >= 0) != list(
+                range(virtual_world_size)
+            ):
+                raise RuntimeError("gradient exchange requires every EST exactly once.")
+
+            if gradient_size:
+                chunk_size = (gradient_size + physical_world_size - 1) // physical_world_size
+                send_shards = torch.zeros(
+                    (physical_world_size, len(pending), chunk_size),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                for index, item in enumerate(pending):
+                    for peer in range(physical_world_size):
+                        start = peer * chunk_size
+                        end = min(start + chunk_size, gradient_size)
+                        if start < end:
+                            send_shards[peer, index, : end - start].copy_(item.gradient[start:end])
+
+                physical_rank = dist.get_rank()
+                received = [
+                    send_shards[peer]
+                    if peer == physical_rank
+                    else torch.empty(
+                        (sum(rank >= 0 for rank in rows), chunk_size),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    for peer, rows in enumerate(rank_rows)
+                ]
+                operations = []
+                for peer in range(physical_world_size):
+                    if peer == physical_rank:
+                        continue
+
+                    operations.append(dist.P2POp(dist.isend, send_shards[peer], peer))
+                    operations.append(dist.P2POp(dist.irecv, received[peer], peer))
+
+                if timings is not None:
+                    _synchronize(device)
+                exchange_started = time.perf_counter()
+                requests = dist.batch_isend_irecv(operations)
+                for request in requests:
+                    request.wait()
+                if timings is not None:
+                    _synchronize(device)
+                    timings["gradient_shard_exchange"] = (time.perf_counter() - exchange_started)
+
+                ordered_gradients: list[torch.Tensor | None] = [None] * virtual_world_size
+                for rows, values in zip(rank_rows, received):
+                    for rank, value in zip((rank for rank in rows if rank >= 0), values):
+                        ordered_gradients[rank] = value
+                local_average = torch.zeros(chunk_size, dtype=torch.float32, device=device)
+
+                for gradient in ordered_gradients:
+                    if gradient is None:
+                        raise RuntimeError("gradient exchange omitted an EST.")
+                    local_average.add_(gradient, alpha=1 / virtual_world_size)
+
+                _timed_barrier(device, timings, "gradient_result_wait")
+                gathered_average = torch.empty(physical_world_size * chunk_size, dtype=torch.float32, device=device)
+                if timings is not None:
+                    _synchronize(device)
+                result_gather_started = time.perf_counter()
+                dist.all_gather_into_tensor(gathered_average, local_average)
+                if timings is not None:
+                    _synchronize(device)
+                    timings["gradient_result_all_gather"] = (time.perf_counter() - result_gather_started)
+                averages = gathered_average[:gradient_size]
+            else:
+                averages = torch.empty(0, dtype=torch.float32, device=device)
+                if timings is not None:
+                    timings["gradient_shard_exchange"] = 0.0
+                    timings["gradient_result_wait"] = 0.0
+                    timings["gradient_result_all_gather"] = 0.0
         else:
             if timings is not None:
-                timings["gradient_tensor_all_gather"] = 0.0
+                timings["gradient_rank_all_gather"] = 0.0
+                timings["gradient_shard_exchange"] = 0.0
+                timings["gradient_result_wait"] = 0.0
+                timings["gradient_result_all_gather"] = 0.0
+            ordered_gradients = [None] * virtual_world_size
             for item in pending:
-                contributions[item.rank].copy_(item.gradient)
+                ordered_gradients[item.rank] = item.gradient
+            averages = torch.zeros(gradient_size, dtype=torch.float32, device=device)
+            for gradient in ordered_gradients:
+                if gradient is None:
+                    raise RuntimeError("gradient reduction omitted an EST.")
+                averages.add_(gradient, alpha=1 / virtual_world_size)
 
         result = (
-            contributions.div(virtual_world_size).sum(dim=0),
+            averages,
             ordered_masks[0].clone(),
             losses.mean(),
         )
         if timings is not None:
+            timings["gradient_collective_total"] = sum(
+                timings.get(name, 0.0)
+                for name in (
+                    "gradient_metadata_all_reduce",
+                    "gradient_rank_all_gather",
+                    "gradient_shard_exchange",
+                    "gradient_result_all_gather",
+                )
+            )
             timings["gradient_aggregation_total"] = time.perf_counter() - started
         return result
     except Exception as exc:
@@ -168,7 +257,7 @@ def aggregate_metrics(
 
     if not bool(presence.to(dtype=torch.bool).all()):
         raise RuntimeError("training metrics require every EST exactly once.")
-    
+
     result = {
         name: (
             float((values[:, index].sum() / virtual_world_size).item()),

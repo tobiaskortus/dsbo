@@ -26,6 +26,20 @@ class AllocationDecision:
     allocation: dict[str, int]
     allocation_revision: int
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> AllocationDecision:
+        return cls(
+            allocation=dict(payload["allocation"]),
+            allocation_revision=int(payload["allocation_revision"]),
+        )
+
+
+@dataclass(frozen=True)
+class ProposalSubmission:
+    round_id: int
+    pending: bool
+    decision: AllocationDecision | None
+
 
 @dataclass(frozen=True)
 class Capacity:
@@ -60,14 +74,26 @@ class ClientResourceAllocator:
             allocation_revision=int(response["allocation_revision"]),
         )
 
-    def submit_proposals(self, job_id: str, proposals: Sequence[Proposal]) -> int:
+    def submit_proposals(self, job_id: str, proposals: Sequence[Proposal]) -> ProposalSubmission:
         submission = scheduler_rpc(
             self.client,
             "dsbo_easyscale_submit_proposals",
             job_id=job_id,
             proposals=[proposal.to_dict() for proposal in proposals],
         )
-        return submission["round"]
+        decision = next(
+            (
+                AllocationDecision.from_dict(decision)
+                for decision in submission["decisions"]
+                if decision["job_id"] == job_id
+            ),
+            None,
+        )
+        return ProposalSubmission(
+            round_id=int(submission["round"]),
+            pending=bool(submission["pending"]),
+            decision=decision,
+        )
 
     def poll_allocation(self, job_id: str, round_id: int) -> AllocationDecision | None:
         decision = scheduler_rpc(

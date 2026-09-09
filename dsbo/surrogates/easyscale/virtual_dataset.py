@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -12,9 +11,7 @@ from torch.utils.data import (
     DataLoader,
     Dataset,
     DistributedSampler,
-    IterableDataset,
     RandomSampler,
-    SequentialSampler,
 )
 
 from dsbo.surrogates.easyscale.random import (
@@ -23,6 +20,17 @@ from dsbo.surrogates.easyscale.random import (
     seed_everything,
     seed_scope,
 )
+
+
+@dataclass(frozen=True)
+class TaggedSample:
+    """One dataset sample tagged with the boundary it belongs to."""
+
+    rank: int
+    epoch: int
+    batch_position: int
+    index: int
+    sample: Any
 
 
 @dataclass(frozen=True)
@@ -51,7 +59,7 @@ class VirtualDataset(Dataset):
         with seed_scope(sample_seed, torch.device("cpu")):
             sample = self.dataset[index]
 
-        return rank, index, sample
+        return TaggedSample(rank, epoch, batch_position, index, sample)
 
 
 class SeedWorker:
@@ -66,20 +74,17 @@ class SeedWorker:
 
 
 class CollateTagged:
-    def __init__(self, ranks: tuple[int, ...], collate_fn: Callable):
-        self.ranks = ranks
+    def __init__(self, collate_fn: Callable):
         self.collate_fn = collate_fn
 
-    def __call__(self, samples) -> VirtualBatch:
-        indices: dict[int, list[int]] = {rank: [] for rank in self.ranks}
-        grouped: dict[int, list[Any]] = {rank: [] for rank in self.ranks}
-        for rank, index, sample in samples:
-            indices[rank].append(index)
-            grouped[rank].append(sample)
-        return VirtualBatch(
-            ranks=self.ranks,
-            indices=tuple(tuple(indices[rank]) for rank in self.ranks),
-            batches=tuple(self.collate_fn(grouped[rank]) for rank in self.ranks),
+    def __call__(self, samples: Sequence[TaggedSample]):
+        first = samples[0]
+        return (
+            first.rank,
+            first.epoch,
+            first.batch_position,
+            tuple(sample.index for sample in samples),
+            self.collate_fn([sample.sample for sample in samples]),
         )
 
 
@@ -115,6 +120,25 @@ class VirtualBatchSampler:
             for rank in self.assigned_ranks
         }
 
+    def reconfigure(
+        self,
+        assigned_ranks: Sequence[int],
+        contexts: Mapping[int, VirtualRankContext],
+    ) -> None:
+        self.contexts = dict(contexts)
+        self.assigned_ranks = tuple(sorted(assigned_ranks))
+        self.distributed_samplers = {
+            rank: DistributedSampler(
+                self.dataset,
+                num_replicas=self.virtual_world_size,
+                rank=rank,
+                shuffle=self.shuffle,
+                seed=self.seed,
+                drop_last=self.drop_last,
+            )
+            for rank in self.assigned_ranks
+        }
+
     def _rank_batches(self, rank: int) -> BatchSampler:
         context = self.contexts[rank]
         sampler = self.distributed_samplers[rank]
@@ -131,7 +155,6 @@ class VirtualBatchSampler:
         iterators = []
         epoch = epochs.pop()
         position = positions.pop()
-        total = len(self._rank_batches(self.assigned_ranks[0]))
 
         for rank in self.assigned_ranks:
             iterator = iter(self._rank_batches(rank))
@@ -145,22 +168,101 @@ class VirtualBatchSampler:
             
         
         for batch_position, rank_batches in enumerate(zip(*iterators), start=position):
-            for rank in self.assigned_ranks:
-                self.contexts[rank].sampler_position += 1
-                if self.contexts[rank].sampler_position == total:
-                    self.contexts[rank].sampler_epoch = epoch + 1
-                    self.contexts[rank].sampler_position = 0
-            yield [
-                (rank, epoch, batch_position, sample_offset, index)
-                for rank, indices in zip(self.assigned_ranks, rank_batches)
-                for sample_offset, index in enumerate(indices)
-            ]
+            for rank, indices in zip(self.assigned_ranks, rank_batches):
+                yield [
+                    (rank, epoch, batch_position, sample_offset, index)
+                    for sample_offset, index in enumerate(indices)
+                ]
 
     def __len__(self) -> int:
+        return self.logical_length() * len(self.assigned_ranks)
+
+    def logical_length(self) -> int:
         if not self.assigned_ranks:
             return 0
         total = len(self._rank_batches(self.assigned_ranks[0]))
         return max(0, total - self.contexts[self.assigned_ranks[0]].sampler_position)
+
+    def commit(self, epoch: int, batch_position: int) -> None:
+        total = len(self._rank_batches(self.assigned_ranks[0]))
+        expected = (epoch, batch_position)
+        if any(
+            (context.sampler_epoch, context.sampler_position) != expected
+            for context in self.contexts.values()
+        ):
+            raise RuntimeError("EST sampler contexts do not match the consumed batch.")
+
+        for context in self.contexts.values():
+            context.sampler_position += 1
+            if context.sampler_position == total:
+                context.sampler_epoch += 1
+                context.sampler_position = 0
+
+
+class VirtualDataLoader(DataLoader):
+    def __init__(self, *args, assigned_ranks: Sequence[int], **kwargs) -> None:
+        self.assigned_ranks = tuple(sorted(assigned_ranks))
+        self._parked_iterator = None
+        super().__init__(*args, **kwargs)
+
+    def __len__(self) -> int:
+        return self.batch_sampler.logical_length()
+
+    def __iter__(self):
+        prepared = super().__iter__()
+        while True:
+            group = []
+            for _ in self.assigned_ranks:
+                try:
+                    group.append(next(prepared))
+                except StopIteration:
+                    if group:
+                        raise RuntimeError("data workers returned an incomplete EST group.")
+                    return
+
+            ranks = tuple(item[0] for item in group)
+            boundaries = {(item[1], item[2]) for item in group}
+            if ranks != self.assigned_ranks or len(boundaries) != 1:
+                raise RuntimeError("data workers returned EST batches out of order.")
+
+            epoch, batch_position = boundaries.pop()
+            self.batch_sampler.commit(epoch, batch_position)
+            yield VirtualBatch(
+                ranks=ranks,
+                indices=tuple(item[3] for item in group),
+                batches=tuple(item[4] for item in group),
+            )
+
+    def reconfigure(
+        self,
+        assigned_ranks: Sequence[int],
+        contexts: Mapping[int, VirtualRankContext],
+    ) -> None:
+        if self._iterator is not None:
+            raise RuntimeError("cannot reconfigure an active virtual dataloader.")
+        self.assigned_ranks = tuple(sorted(assigned_ranks))
+        self.batch_sampler.reconfigure(self.assigned_ranks, contexts)
+
+    def park_workers(self) -> bool:
+        if not self.persistent_workers or self.num_workers == 0:
+            return False
+        if self._iterator is not None:
+            self._parked_iterator = self._iterator
+            self._iterator = None
+        return self._parked_iterator is not None
+
+    def restore_workers(self) -> None:
+        if self._parked_iterator is not None:
+            self._iterator = self._parked_iterator
+            self._parked_iterator = None
+
+    def close_workers(self) -> None:
+        iterators = (self._iterator, self._parked_iterator)
+        self._iterator = None
+        self._parked_iterator = None
+        for iterator in iterators:
+            if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+                iterator._shutdown_workers()
 
 
 def build_virtual_dataloader(
@@ -194,11 +296,13 @@ def build_virtual_dataloader(
 
     loader_options = {
         "batch_sampler": batch_sampler,
-        "collate_fn": CollateTagged(assigned, loader.collate_fn),
+        "collate_fn": CollateTagged(loader.collate_fn),
         "num_workers": loader.num_workers,
         "worker_init_fn": SeedWorker(loader.worker_init_fn),
         "generator": torch.Generator().manual_seed(seed),
         "persistent_workers": loader.persistent_workers,
+        "pin_memory": loader.pin_memory,
+        "pin_memory_device": getattr(loader, "pin_memory_device", ""),
         "timeout": loader.timeout,
     }
 
@@ -206,7 +310,11 @@ def build_virtual_dataloader(
         loader_options["prefetch_factor"] = loader.prefetch_factor
         loader_options["multiprocessing_context"] = loader.multiprocessing_context
     
-    return DataLoader(
+    if hasattr(loader, "in_order"):
+        loader_options["in_order"] = True
+
+    return VirtualDataLoader(
         VirtualDataset(loader.dataset, seed),
+        assigned_ranks=assigned,
         **loader_options,
     )

@@ -11,6 +11,7 @@ from pathlib import Path
 from dsbo.surrogates.easyscale.strategy import EasyScaleStrategy
 from dsbo.surrogates.easyscale.random import VirtualRankContext, _capture_random_state, _restore_random_state
 from dsbo.surrogates.easyscale.generation import GenerationAction
+from dsbo.surrogates.easyscale.virtual_dataset import VirtualDataLoader
 
 
 def global_throughput(
@@ -40,27 +41,30 @@ def global_throughput(
 
 def synchronize_action(
     strategy: EasyScaleStrategy,
-    decide: Callable[[int, float, bool], GenerationAction] | None,
+    decide: Callable[[int, float | None, bool], GenerationAction] | None,
+    should_retry: Callable[[], bool] | None,
     completed_epoch: int,
-    throughput: float,
+    throughput: float | None,
     finished: bool,
     timings: dict[str, float] | None = None,
-) -> tuple[GenerationAction, Exception | None]:
+) -> tuple[GenerationAction, bool, Exception | None]:
     failure = None
     action = GenerationAction.CONTINUE
+    retry = False
     if strategy.is_global_zero:
         try:
             if decide is not None:
                 action = decide(completed_epoch, throughput, finished)
             elif finished:
                 action = GenerationAction.STOP
+            retry = should_retry() if should_retry is not None else False
         except Exception as exc:
             failure = exc
             action = GenerationAction.FAIL
 
     #encodes the GenerationAction enum as a GPU/CPU scalar tensor so all 
     # ranks can receive the value through the process group
-    encoded = torch.tensor(int(action), dtype=torch.int64, device=strategy.root_device)
+    encoded = torch.tensor([int(action), int(retry)], dtype=torch.int64, device=strategy.root_device)
     if timings is not None and strategy.root_device.type == "cuda":
         torch.cuda.synchronize(strategy.root_device)
     broadcast_started = time.perf_counter()
@@ -69,7 +73,7 @@ def synchronize_action(
         if strategy.root_device.type == "cuda":
             torch.cuda.synchronize(strategy.root_device)
         timings["action_broadcast"] = time.perf_counter() - broadcast_started
-    return GenerationAction(int(encoded.item())), failure
+    return GenerationAction(int(encoded[0].item())), bool(encoded[1].item()), failure
 
 
 class EasyScaleControlCallback(L.Callback):
@@ -78,12 +82,14 @@ class EasyScaleControlCallback(L.Callback):
     def __init__(
         self,
         strategy: EasyScaleStrategy,
-        decide: Callable[[int, float, bool], GenerationAction] | None,
+        decide: Callable[[int, float | None, bool], GenerationAction] | None,
         control_interval_steps: int,
+        should_retry: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__()
         self.strategy = strategy
         self.decide = decide
+        self.should_retry = should_retry
         self.control_interval_steps = control_interval_steps
         self.action = GenerationAction.CONTINUE
         self.throughput = 0.0
@@ -91,6 +97,7 @@ class EasyScaleControlCallback(L.Callback):
         self.control_seconds = 0.0
         self.control_profile_totals: dict[str, float] = {}
         self.control_profile_events = 0
+        self.retry_next_step = False
         self._last_steps = 0
         self._last_time = 0.0
 
@@ -99,25 +106,33 @@ class EasyScaleControlCallback(L.Callback):
         self._last_time = time.perf_counter()
 
     def _synchronize_boundary_decision(
-        self, trainer, completed_epoch: int, finished: bool
+        self,
+        trainer,
+        completed_epoch: int,
+        finished: bool,
+        profile: bool = True,
     ) -> None:
         control_started = time.perf_counter()
         control_profile: dict[str, float] = {}
         self.completed_epoch = completed_epoch
-        now = time.perf_counter()
-        self.throughput = global_throughput(
-            self.strategy,
-            self.strategy.est_steps - self._last_steps,
-            now - self._last_time,
-            timings=control_profile,
-        )
-        self._last_steps = self.strategy.est_steps
-        self._last_time = now
-        self.action, failure = synchronize_action(
+        measured_throughput = None
+        if profile:
+            now = time.perf_counter()
+            self.throughput = global_throughput(
+                self.strategy,
+                self.strategy.est_steps - self._last_steps,
+                now - self._last_time,
+                timings=control_profile,
+            )
+            self._last_steps = self.strategy.est_steps
+            self._last_time = now
+            measured_throughput = self.throughput
+        self.action, self.retry_next_step, failure = synchronize_action(
             self.strategy,
             self.decide,
+            self.should_retry,
             self.completed_epoch,
-            self.throughput,
+            measured_throughput,
             finished,
             timings=control_profile,
         )
@@ -139,12 +154,14 @@ class EasyScaleControlCallback(L.Callback):
             return
         if batch_idx + 1 >= trainer.num_training_batches:
             return
-        if trainer.global_step % self.control_interval_steps != 0:
+        profile = self.strategy.profile_steps % self.control_interval_steps == 0
+        if not profile and not self.retry_next_step:
             return
         self._synchronize_boundary_decision(
             trainer,
             trainer.current_epoch,
             bool(trainer.should_stop),
+            profile=profile,
         )
 
     def on_train_epoch_end(self, trainer, pl_module) -> None:
@@ -165,12 +182,14 @@ class EasyScaleCheckpointCallback(L.Callback):
         checkpoint_path: str,
         control: EasyScaleControlCallback,
         rank_zero_state=None,
+        persistent_loader: VirtualDataLoader | None = None,
     ) -> None:
         super().__init__()
         self.strategy = strategy
         self.checkpoint_path = checkpoint_path
         self.control = control
         self.rank_zero_state = rank_zero_state
+        self.persistent_loader = persistent_loader
         self.saved = False
         self.save_seconds = 0.0
         self._saving_mid_epoch = False
@@ -220,6 +239,8 @@ class EasyScaleCheckpointCallback(L.Callback):
                 progress[name] = self.control.completed_epoch
 
     def save(self, trainer) -> None:
+        if self.saved:
+            return
         save_started = time.perf_counter()
         if self.strategy._pending is not None:
             raise RuntimeError("cannot checkpoint a partial EasyScale EST batch")
@@ -256,3 +277,10 @@ class EasyScaleCheckpointCallback(L.Callback):
         }:
             return
         self.save(trainer)
+
+    def on_train_end(self, trainer, pl_module) -> None:
+        if (
+            self.control.action == GenerationAction.RECONFIGURE
+            and self.persistent_loader is not None
+        ):
+            self.persistent_loader.park_workers()

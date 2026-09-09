@@ -32,10 +32,31 @@ class EasyScaleRuntimePlugin(WorkerPlugin):
     def setup(self, worker) -> None:
         import dsbo.surrogates.easyscale.runner  # noqa: F401
 
+        self._dataloaders = {}
+
         async def report_ready() -> None:
             await worker.scheduler.dsbo_easyscale_worker_ready(address=worker.address)
 
         worker.loop.add_callback(report_ready)
+
+    def take_dataloader(self, job_id: str):
+        return self._dataloaders.get(job_id)
+
+    def retain_dataloader(self, job_id: str, loader) -> None:
+        previous = self._dataloaders.pop(job_id, None)
+        if previous is not None and previous is not loader:
+            previous.close_workers()
+        self._dataloaders[job_id] = loader
+
+    def close_job(self, job_id: str) -> None:
+        loader = self._dataloaders.pop(job_id, None)
+        if loader is not None:
+            loader.close_workers()
+
+    def teardown(self, worker) -> None:
+        for loader in self._dataloaders.values():
+            loader.close_workers()
+        self._dataloaders.clear()
 
 
 class EasyScaleSchedulerPlugin(SchedulerPlugin):
@@ -90,6 +111,8 @@ class EasyScaleSchedulerPlugin(SchedulerPlugin):
 
         valid = []
         for worker in workers:
+            if getattr(worker, "long_running", None):
+                continue
             resource_type = self._worker_resource_type(worker)
             if removable[resource_type] > 0:
                 valid.append(worker)
