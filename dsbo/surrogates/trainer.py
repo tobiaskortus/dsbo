@@ -114,8 +114,13 @@ class PerfCallback(L.Callback):
                 profile_fields = (
                     ("est_data_transfer", "data_transfer"),
                     ("est_compute", "est_compute"),
+                    ("gradient_pre_collective_wait", "gradient_wait"),
                     ("gradient_metadata_all_reduce", "gradient_metadata_all_reduce"),
-                    ("gradient_tensor_all_gather", "gradient_tensor_all_gather"),
+                    ("gradient_rank_all_gather", "gradient_rank_all_gather"),
+                    ("gradient_shard_exchange", "gradient_shard_exchange"),
+                    ("gradient_result_wait", "gradient_result_wait"),
+                    ("gradient_result_all_gather", "gradient_result_all_gather"),
+                    ("gradient_collective_total", "gradient_collective"),
                     ("gradient_aggregation_total", "gradient_aggregation"),
                     ("metric_all_reduce", "metric_all_reduce"),
                     ("metric_aggregation_total", "metric_aggregation"),
@@ -267,7 +272,7 @@ class Trainer:
             from distributed import worker_client
             from dsbo.surrogates.easyscale import EasyScaleController
 
-            with worker_client(separate_thread=False) as client:
+            with worker_client(separate_thread=True) as client:
                 EasyScaleController(client).fit(
                     model=model,
                     train_loader=train_loader,
