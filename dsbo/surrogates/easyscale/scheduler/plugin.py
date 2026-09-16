@@ -2,6 +2,7 @@ import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
+from distributed.core import Status
 from distributed.diagnostics.plugin import SchedulerPlugin, WorkerPlugin
 
 from dsbo.surrogates.easyscale.protocol import Proposal
@@ -305,7 +306,7 @@ class EasyScaleSchedulerPlugin(SchedulerPlugin):
             for worker in self._scheduler.workers.values():
                 resource_type = self._worker_resource_type(worker)
                 live[resource_type] += 1
-                if worker.address in self._ready_workers:
+                if worker.address in self._ready_workers and worker.status == Status.running:
                     ready_live[resource_type] += 1
 
         approved = self.registry.total_approved(self.provision_limits).to_dict()
