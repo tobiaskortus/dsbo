@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import  torch.autograd.forward_ad as fw
+from torch import nn
 
 from enum import Enum
 from attr import field
@@ -22,6 +23,9 @@ class Continuous:
     lower: float
     upper: float
     log: bool = False
+
+    def repeat(self, size: int) -> "Vector":
+        return Vector(self.lower, self.upper, size, self.log)
 
 @dataclass(frozen=True)
 class Integer:
@@ -116,6 +120,36 @@ class ParameterMap(ABC):
 
 
 @dataclass(frozen=True)
+class ParameterAccessor:
+    tensor: torch.Tensor
+    parameter: torch.Tensor
+
+
+class CandidateTensor(torch.Tensor):
+    """Flat candidate tensor whose gradients are shared with the candidate's parameters."""
+    @property
+    def grad(self):
+        grad = torch.Tensor.grad.__get__(self)
+        if grad is not None:
+            return grad
+        candidate = getattr(self, "candidate", None)
+        if candidate is None:
+            return None
+        grads = [candidate.parameters[name].grad for name in candidate.parameter_names]
+        return None if any(value is None for value in grads) else torch.cat(grads)
+
+    @grad.setter
+    def grad(self, gradient):
+        candidate = getattr(self, "candidate", None)
+        if candidate is None:
+            torch.Tensor.grad.__set__(self, gradient)
+            return
+        parameters = candidate.parameters
+        for name, (offset, width) in candidate._index.items():
+            parameters[name].grad = gradient[offset:offset + width].detach()
+
+
+@dataclass(frozen=True)
 class Candidate:
     space: ParameterSpace
     tensor: torch.Tensor
@@ -125,15 +159,45 @@ class Candidate:
         if not isinstance(self.space, ParameterMap):
             index: Dict[str, Tuple[int, int]] = {}
             offset = 0
+            seen: Dict[int, Tuple[int, int]] = {}
             for n, p in self.space._params.items():
                 if isinstance(p, Constant):
                     continue
                 w = len(p.choices) if hasattr(p, 'choices') else 1
-                index[n] = (offset, w)
+                pid = id(p)
+                if pid in seen:
+                    index[n] = seen[pid]
+                    continue
+                slot = (offset, w)
+                seen[pid] = slot
+                index[n] = slot
                 offset += w
         else:
             index = {n: (i, 1) for i, n in enumerate(self.space.source._params)}
         object.__setattr__(self, '_index', index)
+        object.__setattr__(self, '_parameters', None)
+        tensor = self.tensor
+        if not isinstance(tensor, CandidateTensor):
+            if fw.unpack_dual(tensor).tangent is None:
+                tensor = torch.Tensor._make_subclass(CandidateTensor, tensor, tensor.requires_grad)
+                object.__setattr__(self, 'tensor', tensor)
+        if isinstance(tensor, CandidateTensor):
+            object.__setattr__(tensor, 'candidate', self)
+
+    @property
+    def parameter_names(self) -> Tuple[str, ...]:
+        return tuple(self._index)
+
+    @property
+    def parameters(self) -> nn.ParameterDict:
+        parameters = self._parameters
+        if parameters is None:
+            parameters = nn.ParameterDict({
+                name: nn.Parameter(self.tensor.detach()[offset:offset + width])
+                for name, (offset, width) in self._index.items()
+            })
+            object.__setattr__(self, '_parameters', parameters)
+        return parameters
 
     @classmethod
     def from_values(cls, space: ParameterSpace, values: Dict[str, Any], requires_grad: bool = False) -> Candidate:
@@ -145,8 +209,9 @@ class Candidate:
             if isinstance(p, Constant):
                 return p.value
             offset, w = self._index[key]
-            return self.tensor[offset:offset+w] if w > 1 else self.tensor[offset].item()
-        
+            tensor = self.tensor[offset:offset + w]
+            return ParameterAccessor(tensor, tensor.detach())
+
         return self.space.decode_tensors(self.tensor)[key]
     
     @property
@@ -162,9 +227,9 @@ class Candidate:
                         case Constant():
                             result[self.space._key_fn(parts)] = p.value
                         case Vector():
-                            first_key = self.space._key_fn((*_parts, f"{name}_1"))
-                            offset, _ = self._index[first_key]
-                            result[self.space._key_fn(parts)] = self.tensor[offset:offset + p.size]
+                            key = self.space._key_fn(parts)
+                            offset, _ = self._index[key]
+                            result[key] = self.tensor[offset:offset + 1].expand(p.size)
                         case Categorical():
                             key = self.space._key_fn(parts)
                             offset, w = self._index[key]
@@ -269,38 +334,60 @@ class ParameterSpace:
         
         self._key_fn = key_fn
         self._spec = spec
-        self._params = _collect(spec, key_fn)
+        self._params, self._aliases = _collect(spec, key_fn)
+        self._canonical_names: Dict[str, List[str]] = {}
+        for key in self._params:
+            self._canonical_names.setdefault(key, []).append(key)
+        for exposed, canonical in self._aliases.items():
+            self._canonical_names.setdefault(canonical, []).append(exposed)
         self._sampler: Sampler | None = None
 
     @staticmethod
     def repeat(prefix: str, n: int, **params: Union[DesignParameter, Group]) -> Dict[str, Union[DesignParameter, Group]]:
-        return {f"{prefix}_{i}": Group(**params) for i in range(n)}
+        group = Group(**params)
+        return {f"{prefix}_{i}": group for i in range(n)}
     
     def register_sampler(self, sampler: Sampler) -> None:
         sampler.bind(self)
         self._sampler = sampler
 
     def encode(self, values: Dict[str, Any], requires_grad: bool = False) -> torch.Tensor:
-        # Pre-expand any vector values (values[name] = array) into individual keys
-        expanded = dict(values)
-        for base_key, (_, flat_keys) in _collect_vectors(self._spec, self._key_fn).items():
-            if base_key in values:
-                for flat_key, v in zip(flat_keys, values[base_key]):
-                    expanded[flat_key] = v
-
-        parts: List[float] = []
+        parts: List[torch.Tensor] = []
+        seen: set[int] = set()
         for name, p in self:
+            if isinstance(p, Constant):
+                continue
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            src = next((s for s in self._canonical_names.get(name, [name]) if s in values), name)
             match p:
-                case Constant():
-                    continue
                 case Categorical():
-                    v = expanded[name]
+                    v = values[src]
                     one_hot = [0.0] * len(p.choices)
                     one_hot[p.choices.index(v)] = 1.0
-                    parts.extend(one_hot)
+                    parts.append(torch.tensor(one_hot, dtype=torch.float32))
+                case Vector():
+                    v = values[src]
+                    if isinstance(v, torch.Tensor) and v.numel() != 1:
+                        raise ValueError(
+                            f"Vector parameter '{name}' expects a single value (homogeneous), "
+                            f"got {v.numel()} elements."
+                        )
+                    if not isinstance(v, torch.Tensor):
+                        v = torch.tensor(v, dtype=torch.float32)
+                    parts.append(v.reshape(1))
                 case _:
-                    parts.append(expanded[name])
-        return torch.tensor(parts, dtype=torch.float32, requires_grad=requires_grad)
+                    v = values[src]
+                    if not isinstance(v, torch.Tensor):
+                        v = torch.tensor(v, dtype=torch.float32)
+                    parts.append(v.reshape(1))
+        encoded = torch.cat(parts) if parts else torch.empty(0, dtype=torch.float32)
+        if requires_grad:
+            encoded.requires_grad_(requires_grad)
+        else:
+            encoded = encoded.detach()
+        return encoded
 
     def sample(self, 
                sampler: Sampler = None, 
@@ -328,14 +415,21 @@ class ParameterSpace:
         return CandidateBatch([self.sample(sampler, requires_grad) for _ in range(batch_size)])
 
     def dims(self, encoding: Encoding | str = Encoding.ORDINAL, include_constants: bool = False) -> int:
+        seen: set[int] = set()
+        unique: list[DesignParameter] = []
+        for p in self._params.values():
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            unique.append(p)
         match encoding:
             case Encoding.ORDINAL | "ordinal":
-                return sum(0 if isinstance(p, Constant) and not include_constants else 1 for p in self._params.values())
+                return sum(0 if isinstance(p, Constant) and not include_constants else 1 for p in unique)
             case Encoding.ONE_HOT | "one_hot":
                 return sum(
                     0 if isinstance(p, Constant) and not include_constants else
                     len(p.choices) if isinstance(p, Categorical) else 1
-                    for p in self._params.values()
+                    for p in unique
                 )
             case _:
                 raise ValueError(f"Unknown encoding {encoding!r}. Use 'ordinal' or 'one_hot'.")
@@ -382,33 +476,34 @@ class CandidateBatch(list[Candidate]):
 
 
 
-def _collect(params: Dict[str, Union[DesignParameter, Group]], 
+def _collect(params: Dict[str, Union[DesignParameter, Group]],
              key_fn: Callable[[Tuple[str, ...]], str] = '.'.join,
-            _parts: Tuple[str, ...] = ()) -> Dict[str, DesignParameter]:
-    """Flatten dictionary representation of parameters {key: parameter}; groups and vectors are expanded"""
-    out: Dict[str, Union[Continuous, Integer, Categorical]] = {}
+             _parts: Tuple[str, ...] = (),
+             _seen: Optional[Dict[int, str]] = None,
+             _aliases: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, DesignParameter], Dict[str, str]]:
+    """Flatten spec into {exposed_key: parameter}, detecting shared parameters.
+
+    Reusing the same parameter object under more than one key shares it: the
+    later keys are recorded as aliases of the first (canonical) key in the
+    returned alias map, so the shared parameter occupies a single latent
+    dimension and fans out on decode.
+    """
+    out: Dict[str, Union[Continuous, Integer, Categorical, Vector]] = {}
+    if _seen is None:
+        _seen = {}
+    if _aliases is None:
+        _aliases = {}
     for name, spec in params.items():
         parts = (*_parts, name)
         if isinstance(spec, Group):
-            out.update(_collect(spec.params, key_fn, parts))
-        elif isinstance(spec, Vector):
-            for i in range(1, spec.size + 1):
-                out[key_fn((*_parts, f"{name}_{i}"))] = Continuous(spec.lower, spec.upper, spec.log)
+            sub, _ = _collect(spec.params, key_fn, parts, _seen, _aliases)
+            out.update(sub)
         else:
-            out[key_fn(parts)] = spec
-    return out
-
-
-def _collect_vectors(params: Dict[str, Union[DesignParameter, Group]],
-                     key_fn: Callable[[Tuple[str, ...]], str] = '.'.join,
-                     _parts: Tuple[str, ...] = ()) -> Dict[str, Tuple[Vector, List[str]]]:
-    """Returns {base_key: (Vector, [flat_keys])} for all Vector params, recursing into Groups."""
-    out: Dict[str, Tuple[Vector, List[str]]] = {}
-    for name, spec in params.items():
-        parts = (*_parts, name)
-        if isinstance(spec, Group):
-            out.update(_collect_vectors(spec.params, key_fn, parts))
-        elif isinstance(spec, Vector):
-            flat_keys = [key_fn((*_parts, f"{name}_{i}")) for i in range(1, spec.size + 1)]
-            out[key_fn(parts)] = (spec, flat_keys)
-    return out
+            key = key_fn(parts)
+            pid = id(spec)
+            if pid in _seen:
+                _aliases[key] = _seen[pid]
+            else:
+                _seen[pid] = key
+            out[key] = spec
+    return out, _aliases
