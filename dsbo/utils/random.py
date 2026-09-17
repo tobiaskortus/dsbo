@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import torch
 import random
 import numpy as np
@@ -27,7 +28,9 @@ def seed_random_engine(seed: int | None = None):
 
 
 class ModuleRandomEngine:
-    _instance: ModuleRandomEngine = None
+    _current: contextvars.ContextVar[ModuleRandomEngine | None] = contextvars.ContextVar(
+        "module_random_engine", default=None
+    )
 
     def __init__(self, seed: int | None = None):
         if seed is None: 
@@ -61,14 +64,17 @@ class ModuleRandomEngine:
 
     @classmethod
     def seed_random_engine(cls, seed: int | None = None):
-        if cls._instance is None or cls._instance._seed != seed:
-            cls._instance = ModuleRandomEngine(seed)
+        engine = cls._current.get()
+        if engine is None or engine._seed != seed:
+            engine = ModuleRandomEngine(seed)
+            cls._current.set(engine)
 
-        return cls._instance
+        return engine
     
     @classmethod
     def get_current_random_engine(cls):
-        if cls._instance is None:
+        engine = cls._current.get()
+        if engine is None:
             return cls.seed_random_engine()
         
-        return cls._instance
+        return engine
