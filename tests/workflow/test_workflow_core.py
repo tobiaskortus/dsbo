@@ -1,10 +1,15 @@
 import pytest
 import torch
 import networkx as nx
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock
 from dsbo.workflow import Workflow
 from dsbo.modules.dsl import DependencyDict
-from dsbo.surrogates.graph_transformations import GraphMode
+from dsbo.surrogates.graph_transformations import (
+    GraphMode,
+    build_module_surrogate_training_plan,
+    build_workflow_surrogate_training_plan,
+)
+from dsbo.workflow.graph_context import WorkflowGraphExecutionStateState
 from dsbo.worker.spec import WorkerSpec
 from tests.workflow.conftest import SimpleModule
 
@@ -32,46 +37,94 @@ class TestWorkflowConstruction:
         dd = DependencyDict({m1: [m2]})
         dd.groups = [MagicMock()]
         wf = Workflow(dd)
-        assert len(wf._dependency_groups) == 1
+        assert len(wf.surrogate_execution.dependency_groups) == 1
 
 
 class TestWorkflowTaskGraph:
     def test_default_mode_returns_default_graph(self, single_module_workflow):
-        assert single_module_workflow.task_graph_mode == GraphMode.DEFAULT
+        assert single_module_workflow.graph_context.mode == GraphMode.DEFAULT
 
-    def test_mode_resets_on_context_exit(self, single_module_workflow):
-        with single_module_workflow.mode(GraphMode.MODULE_SURROGATE_EVAL):
-            assert single_module_workflow.task_graph_mode == GraphMode.MODULE_SURROGATE_EVAL
-        assert single_module_workflow.task_graph_mode == GraphMode.DEFAULT
+    def test_context_resets_on_exit(self, single_module_workflow):
+        graph = single_module_workflow.task_graph.copy()
+        with single_module_workflow.graph_context.use(
+            WorkflowGraphExecutionStateState(GraphMode.MODULE_SURROGATE_EVAL, graph),
+        ):
+            assert single_module_workflow.graph_context.mode == GraphMode.MODULE_SURROGATE_EVAL
+        assert single_module_workflow.graph_context.mode == GraphMode.DEFAULT
 
-    def test_task_graph_changes_with_mode(self, single_module_workflow):
-        with single_module_workflow.mode(GraphMode.MODULE_SURROGATE_EVAL):
+    def test_task_graph_changes_with_context(self, single_module_workflow):
+        graph = single_module_workflow.task_graph.copy()
+        with single_module_workflow.graph_context.use(
+            WorkflowGraphExecutionStateState(GraphMode.MODULE_SURROGATE_EVAL, graph),
+        ):
             G = single_module_workflow.task_graph
             assert G.number_of_nodes() == 1
 
-    def test_workflow_surrogate_mode(self):
+    def test_graph_reads_do_not_implicitly_select_workflow_surrogate(self):
+        class StorageBackedSurrogate(SimpleModule):
+            @property
+            def _is_pretrained(self):
+                raise AssertionError("Graph reads must not query artifact storage.")
+
         m = SimpleModule()
         wf = Workflow(m)
-        surrogate = MagicMock()
-        surrogate._is_pretrained = True
+        surrogate = StorageBackedSurrogate()
         wf.patch(surrogate)
-        assert wf.task_graph_mode == GraphMode.WORKFLOW_SURROGATE
+        assert wf.graph_context.mode == GraphMode.DEFAULT
+        assert list(wf.task_graph) == [m]
 
-    def test_task_graph_for_module_surrogate_train(self, single_module_workflow):
-        G = single_module_workflow.task_graph_for(GraphMode.MODULE_SURROGATE_TRAIN)
-        assert isinstance(G, nx.DiGraph)
-
-    def test_task_graph_for_workflow_surrogate(self):
+    def test_workflow_surrogate_eval_state(self):
         m1 = SimpleModule()
         m2 = SimpleModule()
         wf = Workflow(m1 >> m2)
         surrogate = MagicMock()
-        surrogate._is_pretrained = True
-        wf._surrogate = surrogate
-        G = wf.task_graph_for(GraphMode.WORKFLOW_SURROGATE)
-        assert isinstance(G, nx.DiGraph)
-        assert G.number_of_nodes() == 1
-        assert list(G.nodes)[0] == surrogate
+        wf.patch(surrogate)
+        with wf.surrogate_execution.use_surrogates_if_available([None]):
+            G = wf.task_graph
+            assert isinstance(G, nx.DiGraph)
+            assert G.number_of_nodes() == 1
+            assert list(G.nodes)[0] == surrogate
+
+    def test_nested_state_restoration(self, single_module_workflow):
+        default_graph = single_module_workflow.task_graph
+
+        with single_module_workflow.graph_context.use(
+            WorkflowGraphExecutionStateState(GraphMode.MODULE_SURROGATE_EVAL, default_graph.copy()),
+        ):
+            with single_module_workflow.graph_context.use(
+                WorkflowGraphExecutionStateState(GraphMode.DEFAULT, default_graph)
+            ):
+                assert single_module_workflow.graph_context.mode == GraphMode.DEFAULT
+            assert single_module_workflow.graph_context.mode == GraphMode.MODULE_SURROGATE_EVAL
+        assert single_module_workflow.graph_context.mode == GraphMode.DEFAULT
+
+    def test_context_restoration_after_exception(self, single_module_workflow):
+        with pytest.raises(RuntimeError, match="failed"):
+            with single_module_workflow.graph_context.use(
+                WorkflowGraphExecutionStateState(
+                    GraphMode.MODULE_SURROGATE_EVAL,
+                    single_module_workflow.task_graph.copy(),
+                )
+            ):
+                raise RuntimeError("failed")
+
+        assert single_module_workflow.graph_context.mode == GraphMode.DEFAULT
+
+    def test_training_transitions_validate_inputs(self, single_module_workflow):
+        graph = single_module_workflow.task_graph
+        groups = single_module_workflow.surrogate_execution.dependency_groups
+        with pytest.raises(RuntimeError, match="without a workflow surrogate"):
+            build_workflow_surrogate_training_plan(graph, groups, None, MagicMock(), [])
+        with pytest.raises(RuntimeError, match="lifecycle task"):
+            build_workflow_surrogate_training_plan(graph, groups, MagicMock(), None, [])
+        with pytest.raises(RuntimeError, match="generated candidates"):
+            build_workflow_surrogate_training_plan(graph, groups, MagicMock(), MagicMock(), None)
+        with pytest.raises(RuntimeError, match="surrogate target"):
+            build_module_surrogate_training_plan(graph, groups, None, MagicMock(), [])
+        with pytest.raises(RuntimeError, match="lifecycle task"):
+            build_module_surrogate_training_plan(graph, groups, MagicMock(), None, [])
+        with pytest.raises(RuntimeError, match="generated candidates"):
+            build_module_surrogate_training_plan(graph, groups, MagicMock(), MagicMock(), None)
 
     def test_num_tasks(self, chain_workflow):
         assert chain_workflow.num_tasks == 2
@@ -102,4 +155,3 @@ class TestGetUniqueWorkers:
         assert len(workers) == 2
         assert spec1 in workers
         assert spec2 in workers
-

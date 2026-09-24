@@ -35,10 +35,11 @@ class TestDistributedRunBatch:
         schedule_calls: list[tuple[Module, list, int, MagicMock]] = []
 
         original_schedule = worker.schedule
-        def tracking_schedule(module, design, dependencies=(), priority=None,
-                              file_overlays=None):
+        def tracking_schedule(module, design, dependencies=(), design_tensor=None,
+                              priority=None, file_overlays=None):
             tid, delayed = original_schedule(
-                module, design, dependencies, priority, file_overlays,
+                module, design, dependencies, design_tensor=design_tensor,
+                priority=priority, file_overlays=file_overlays,
             )
             schedule_calls.append((module, list(dependencies), priority, delayed))
             return tid, delayed
@@ -80,9 +81,12 @@ class TestDistributedRunBatch:
 
         schedule_calls: list[tuple[Module, list]] = []
         original_schedule = worker.schedule
-        def tracking_schedule(module, design, dependencies=(), priority=None,
-                              file_overlays=None):
-            tid, delayed = original_schedule(module, design, dependencies, priority, file_overlays,)
+        def tracking_schedule(module, design, dependencies=(), design_tensor=None,
+                              priority=None, file_overlays=None):
+            tid, delayed = original_schedule(
+                module, design, dependencies, design_tensor=design_tensor,
+                priority=priority, file_overlays=file_overlays,
+            )
             schedule_calls.append((module, list(dependencies)))
             return tid, delayed
         
@@ -116,7 +120,7 @@ class TestDistributedRunBatch:
         worker = MockDaskWorker()
 
         with WorkerContext.use_worker(worker):
-            with patch("dsbo.workflow.get_current_storage", return_value=mock_storage):
+            with patch("dsbo.workflow.runner.get_current_storage", return_value=mock_storage):
                 run_batch(wf, [cand])
 
         mock_storage.workflow.add_workflow.assert_called_once()
@@ -243,7 +247,7 @@ class TestDistributedRunBatchReverseAutograd:
         worker = MockDaskWorker()
 
         with WorkerContext.use_worker(worker):
-            with patch("dsbo.workflow.get_current_storage", return_value=mock_storage):
+            with patch("dsbo.workflow.runner.get_current_storage", return_value=mock_storage):
                 run_batch_reverse_autograd(wf, [cand], grad_outputs)
 
         mock_storage.workflow.add_workflow.assert_called_once()

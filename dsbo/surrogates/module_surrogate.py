@@ -7,57 +7,17 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-
 from diffusers.schedulers import DDPMScheduler, DDIMScheduler
 
-from dsbo.modules import Module
-from dsbo.parameters import Candidate
+from dsbo.utils.io import Input, LazyShape
+from dsbo.autograd import train_op
 from dsbo.config import get_active_file_backend
-from dsbo.utils.io.autograd import AutogradFileInterface, AutogradFileStorage
-from dsbo.utils.io.workdir import AbstractFilePath
+from dsbo.modules import dynamic_submodule
+from dsbo.utils.io.storage.autograd import AutogradFileInterface
+from dsbo.utils.io.datasets import ModuleSurrogateDataset
 from dsbo.surrogates import SurrogateBase, SurrogateStrategy
 from dsbo.surrogates.diffusion import MlpDiffusion1D, Trainer
-
-
-class LazyShape(tuple):
-    _fpath: AbstractFilePath
-    _resolved: tuple[int, ...] | None
-
-    def __new__(cls, fpath: AbstractFilePath):
-        instance = super().__new__(cls)
-        instance._fpath = fpath
-        instance._resolved = None
-        return instance
-
-    def _resolve(self):
-        if self._resolved is not None:
-            return
-        Storage = get_active_file_backend()
-        shards = Storage._discover_shards_from_abstract(self._fpath)
-        if not shards:
-            raise RuntimeError(
-                f"Cannot resolve shape: no shard files found for "
-                f"'{self._fpath.filename}'. The module must be run first."
-            )
-        
-        self._resolved = Storage.shape_from_path(shards[0])[1:]
-
-    def __getitem__(self, idx):  # type: ignore[override]
-        self._resolve()
-        return self._resolved[idx]
-
-    def __len__(self):
-        self._resolve()
-        return len(self._resolved)
-
-    def __iter__(self):
-        self._resolve()
-        return iter(self._resolved)
-
-    def __repr__(self):
-        if self._resolved is None:
-            return "LazyShape(unresolved)"
-        return repr(self._resolved)
+from dsbo.utils.io.workdir import AbstractFilePath, PathAnnotation
 
 
 class ModuleSurrogateContract:
@@ -67,8 +27,8 @@ class ModuleSurrogateContract:
         output_samples: int,
         conditional_dim: tuple[int, ...] | None = None,
         output_conditional_fn: Callable | None = None,
-        data_file: AbstractFilePath | None = None,
-        conditional_file: AbstractFilePath | None = None,
+        data_file: AbstractFilePath | PathAnnotation | None = None,
+        conditional_file: AbstractFilePath | PathAnnotation | None = None,
     ):
         self.output_dim = output_dim
         self.output_samples = output_samples
@@ -77,14 +37,34 @@ class ModuleSurrogateContract:
         self.data_file = data_file
         self.conditional_file = conditional_file
 
+    @staticmethod
+    def _abstract_path(file: AbstractFilePath | PathAnnotation) -> AbstractFilePath:
+        return file.path if isinstance(file, PathAnnotation) else file
+
     def to_data_loader(self, batch_size: int = 256) -> DataLoader:
-        Storage: type[AutogradFileStorage] = get_active_file_backend()
-        return Storage.to_data_loader(
-            self.data_file, self.conditional_file, batch_size=batch_size
+        Storage: type[AutogradFileInterface] = get_active_file_backend()
+        if self.data_file is None or self.conditional_file is None:
+            raise RuntimeError(
+                "A module surrogate contract requires data and conditional files "
+                "to create a data loader."
+            )
+        data_file = self._abstract_path(self.data_file)
+        conditional_file = self._abstract_path(self.conditional_file)
+
+        if isinstance(self.output_dim, LazyShape):
+            self.output_dim.resolve(data_file())
+        if isinstance(self.conditional_dim, LazyShape):
+            self.conditional_dim.resolve(conditional_file())
+
+        dataset = ModuleSurrogateDataset(
+            data_file(),
+            conditional_file(),
+            backend=Storage,
         )
+        return DataLoader(dataset, batch_size=batch_size)
 
     def write_output(self, design: dict, output_tensor: torch.Tensor):
-        Storage: type[AutogradFileStorage | AutogradFileInterface] = get_active_file_backend()
+        Storage: type[AutogradFileInterface] = get_active_file_backend()
         primal = output_tensor.detach().cpu().numpy()
         if self.data_file is not None:
             Storage.write_primal(self.data_file(), primal)
@@ -118,51 +98,25 @@ class StatefulModuleSurrogateWrapper(nn.Module):
         self.register_buffer("C_std", C_std)
 
 
-def requires_contract(fn):
-    def wrapper(self, design: dict, **kwargs):
-        if self.contract is None:
-            raise RuntimeError("No contract registered.")
-        return fn(self, design, **kwargs)
-    return wrapper
-
-
-def requires_diffusion_model(fn):
-    def wrapper(self, design: dict, **kwargs):
-        if self._diffusion_model is None:
-            raise RuntimeError("Surrogate not trained.")
-        return fn(self, design, **kwargs)
-    return wrapper
-
 class ModuleSurrogate(SurrogateBase):
-    def __init__(self, surrogate: Module | None, strategy: SurrogateStrategy):
-        super().__init__(surrogate=surrogate, strategy=strategy)
+    def __init__(self, strategy: SurrogateStrategy):
+        super().__init__(strategy=strategy)
         self.contract: ModuleSurrogateContract | None = None
 
-    
     def register_contract(self, contract: ModuleSurrogateContract):
         if contract.output_samples <= 0:
             raise ValueError("output_samples > 0 is required.")
         self.contract = contract
 
-    @requires_contract
-    @requires_diffusion_model
-    def __call__(self, design: dict, **kwargs) -> dict[str, torch.Tensor]:
-        pass
-
-    @requires_contract
-    def train(self, candidate: Candidate, workflow_callback: Callable):
-        pass
-
-    def state_dict(self):
-        pass
-
-    def load_state_dict():
-        pass
-
+        #Automatically register the required input files for the module‚
+        for attr in ("data_file", "conditional_file"):
+            path = getattr(contract, attr)
+            if path is not None:
+                setattr(self, attr, Input(ModuleSurrogateContract._abstract_path(path)))
 
 class DiffusersModuleSurrogate(ModuleSurrogate):
     def __init__(self, strategy: SurrogateStrategy):
-        super().__init__(surrogate=None, strategy=strategy)
+        super().__init__(strategy=strategy)
         self._diffusion_model: StatefulModuleSurrogateWrapper | None = None
         self._noise_scheduler: DDPMScheduler | None = None
         self._sample_scheduler: DDIMScheduler | None = None
@@ -171,9 +125,25 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
         self._num_train_timesteps = 1000
         self._num_infer_timesteps = 100
 
+    def _create_schedulers(self) -> None:
+        self._noise_scheduler = DDPMScheduler(
+            clip_sample=False,
+            num_train_timesteps=self._num_train_timesteps,
+            prediction_type="v_prediction",
+            beta_schedule="squaredcos_cap_v2",
+        )
+        self._sample_scheduler = DDIMScheduler(
+            clip_sample=False,
+            num_train_timesteps=self._num_train_timesteps,
+            prediction_type="v_prediction",
+            beta_schedule="squaredcos_cap_v2",
+        )
 
-    @requires_diffusion_model
+
     def __call__(self, design: dict, **kwargs) -> dict[str, torch.Tensor]:
+        self.get_runtime_model()
+        if self._diffusion_model is None:
+            raise RuntimeError("Surrogate not trained.")
         cond = self.contract.output_conditional_fn(design) \
             if self.contract.output_conditional_fn is not None \
             else torch.tensor(list(design.values()), dtype=torch.float32)
@@ -205,12 +175,7 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
         return {}
 
 
-    def train(self, candidate: Candidate, workflow_callback: Callable):
-        candidates = self.strategy.generate_candidates(candidate, candidate.space)
-        workflow_callback(candidates)
-
-        loader = self.contract.to_data_loader(batch_size=256)
-
+    def _train_from_loader(self, loader: DataLoader, num_candidates: int):
         output_dim = self.contract.output_dim
         cond_dim = self.contract.conditional_dim
 
@@ -225,24 +190,13 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
             dropout=0.1,
         )
 
-        self._diffusion_model = StatefulModuleSurrogateWrapper(
+        diffusion_model = StatefulModuleSurrogateWrapper(
             model,
             loader.dataset.mean_x, loader.dataset.std_x,
             loader.dataset.mean_c, loader.dataset.std_c,
         )
 
-        self._noise_scheduler = DDPMScheduler(
-            clip_sample=False, 
-            num_train_timesteps=self._num_train_timesteps, 
-            prediction_type="v_prediction", 
-            beta_schedule="squaredcos_cap_v2"
-        )
-        self._sample_scheduler = DDIMScheduler(
-            clip_sample=False, 
-            num_train_timesteps=self._num_train_timesteps, 
-            prediction_type="v_prediction", 
-            beta_schedule="squaredcos_cap_v2"
-        )
+        self._create_schedulers()
 
         optim = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=200, eta_min=1e-6)
@@ -253,26 +207,55 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
             model_tag=type(self).__name__.lower(),
         ).fit(n_epochs=200, dataloader=loader, show_progress=False)
 
-        self.surrogate = self._diffusion_model
-
         self.training_metrics = {
             "n_samples": len(loader.dataset),
-            "n_candidates": len(candidates),
-            "output_dim": output_dim,
-            "cond_dim": cond_dim,
+            "n_candidates": num_candidates,
+            "output_dim": tuple(output_dim),
+            "cond_dim": tuple(cond_dim),
             "loss_history": loss_history,
             "final_loss": loss_history[-1] if loss_history else None,
         }
 
-        return self._diffusion_model
-    
+        return diffusion_model
 
-    def state_dict(self):
-        return self._diffusion_model.state_dict()
 
-    def load_state_dict(self, state_dict):
-        # TODO: this is a bit weird, rework state_dict and load_state_dict 
-        # functionality to handle scheduler, optimizer and other states.
+    @train_op
+    @dynamic_submodule
+    def train(self, design, candidates):
+        model_file_path = self.model_file_path() if callable(self.model_file_path) else self.model_file_path
+        if model_file_path is None:
+            raise RuntimeError(
+                f"{type(self).__name__} training requires a model_file_path; "
+                "the module surrogate training plan must set model_file_path."
+            )
+        loader = self.contract.to_data_loader(batch_size=256)
+        
+        try:
+            diffusion_model = self._train_from_loader(loader, len(candidates))
+            torch.save(self._model_state(diffusion_model), model_file_path)
+        finally:
+            loader.dataset.close()
+
+        return {}
+
+    def _model_state(self, diffusion_model) -> dict:
+        return {
+            "output_dim": tuple(self.contract.output_dim),
+            "conditional_dim": tuple(self.contract.conditional_dim),
+            "training_metrics": self.training_metrics,
+            "model": diffusion_model.state_dict(),
+        }
+
+    def state_dict(self) -> dict:
+        return self._model_state(self._diffusion_model)
+
+    def from_state_dict(self, state: dict) -> None:
+        if isinstance(self.contract.output_dim, LazyShape):
+            self.contract.output_dim.set(state["output_dim"])
+        if isinstance(self.contract.conditional_dim, LazyShape):
+            self.contract.conditional_dim.set(state["conditional_dim"])
+        self.training_metrics = state["training_metrics"]
+
         model = MlpDiffusion1D(
             objective_dim=self.contract.output_dim,
             parameter_dim=self.contract.conditional_dim,
@@ -288,19 +271,8 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
             C_mean=torch.zeros(self.contract.conditional_dim[-1:]),
             C_std=torch.ones(self.contract.conditional_dim[-1:]),
         )
-        wrapper.load_state_dict(state_dict)
+        wrapper.load_state_dict(state["model"])
         self._diffusion_model = wrapper
         self.surrogate = wrapper
 
-        self._noise_scheduler = DDPMScheduler(
-            clip_sample=False,
-            num_train_timesteps=self._num_train_timesteps,
-            prediction_type="v_prediction",
-            beta_schedule="squaredcos_cap_v2",
-        )
-        self._sample_scheduler = DDIMScheduler(
-            clip_sample=False,
-            num_train_timesteps=self._num_train_timesteps,
-            prediction_type="v_prediction",
-            beta_schedule="squaredcos_cap_v2",
-        )
+        self._create_schedulers()

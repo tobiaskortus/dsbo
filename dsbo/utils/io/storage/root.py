@@ -6,7 +6,16 @@ import numpy as np
 import torch
 import uproot
 
-from dsbo.utils.io.autograd import AutogradFileInterface
+from dsbo.utils.io.storage.autograd import AutogradFileInterface
+from dsbo.utils.io.datasets.views import (
+    STORE_COLUMN,
+    STORE_FLAT,
+    STORE_ROW,
+    DatasetView,
+    ROOTColumnStoreDatasetView,
+    ROOTDatasetView,
+    ROOTRowStoreDatasetView,
+)
 
 
 class ROOTFile(AutogradFileInterface):
@@ -35,9 +44,10 @@ class ROOTFile(AutogradFileInterface):
 
     METADATA_OBJECT = "dsbo_metadata"
     VDS_SOURCES_OBJECT = "dsbo_vds_sources"
-    FORMAT_VERSION = 1
+    FORMAT_VERSION = 2
     VALUE_BRANCH = "values"
     COLUMN_BRANCH_PREFIX = "column_"
+    ROW_STORE_DATASET = "__dsbo_row_store__"
 
     @classmethod
     def reducible_extensions(cls) -> frozenset[str]:
@@ -65,6 +75,49 @@ class ROOTFile(AutogradFileInterface):
         if np.shape(primal) != np.shape(tangent):
             raise ValueError("ROOT primal and tangent arrays must have identical shapes.")
         cls._write_datasets(fpath, columns=columns, primal=primal, tangent=tangent)
+
+    @classmethod
+    def write_named_datasets(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        if not datasets:
+            return
+        stored: dict[str, np.ndarray] = {}
+        if os.path.isfile(fpath):
+            metadata, sources = cls._load_container(fpath)
+            if sources is not None:
+                raise ValueError("Cannot append named datasets to a reduced ROOT file.")
+            stored = {
+                name: cls._read_dataset(fpath, name)
+                for name in metadata["datasets"]
+            }
+        stored.update(datasets)
+        cls._write_datasets(fpath, **stored)
+
+    @classmethod
+    def write_row_store(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        keys, values = cls._prepare_row_store(datasets)
+        cls._write_datasets(
+            fpath,
+            columns=keys,
+            **{cls.ROW_STORE_DATASET: values.T},
+        )
+
+    @classmethod
+    def open_dataset(cls, fpath: str) -> DatasetView:
+        metadata, _ = cls._load_container(fpath)
+        store = metadata.get("store")
+        if store == STORE_ROW:
+            return ROOTRowStoreDatasetView(fpath, cls.ROW_STORE_DATASET)
+        if store == STORE_COLUMN:
+            return ROOTColumnStoreDatasetView(fpath)
+        if store == STORE_FLAT:
+            return ROOTDatasetView(fpath)
+        raise ValueError(f"ROOT file '{fpath}' has a missing or unknown 'store' tag.")
+
+    @classmethod
+    def columns(cls, fpath: str) -> list[str]:
+        metadata, _ = cls._load_container(fpath)
+        primal = metadata["datasets"]["primal"]
+        return [] if primal["columns"] is None else list(primal["columns"])
 
     @classmethod
     def _read_dataset(cls, fpath: str, name: str, columns: list[str] | None = None) -> np.ndarray:
@@ -204,23 +257,70 @@ class ROOTFile(AutogradFileInterface):
         return torch.from_numpy(gradient).float()
 
     @classmethod
-    def _write_datasets(cls, fpath: str, columns: list[str] | None = None, **datasets: np.ndarray) -> None:
+    def _write_datasets(
+        cls,
+        fpath: str,
+        columns: list[str] | None = None,
+        row_store: list[str] | None = None,
+        **datasets: np.ndarray,
+    ) -> None:
         arrays = {name: cls._prepare_array(value) for name, value in datasets.items()}
+        if (
+            row_store is None
+            and columns is not None
+            and set(arrays) == {cls.ROW_STORE_DATASET}
+        ):
+            row_store = columns
+            columns = None
+            arrays[cls.ROW_STORE_DATASET] = np.ascontiguousarray(
+                arrays[cls.ROW_STORE_DATASET].T
+            )
+        if row_store is not None:
+            cls._validate_columns(row_store)
+            if set(arrays) != {cls.ROW_STORE_DATASET}:
+                raise ValueError("Row-store metadata can only describe the row-store dataset.")
         if columns is not None:
             cls._validate_columns(columns)
             for value in arrays.values():
                 cls._validate_columns(columns, value)
 
         os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
-        metadata = {"version": cls.FORMAT_VERSION, "datasets": {}}
-        with uproot.recreate(fpath, compression=uproot.ZLIB(4)) as file:
+        store_type = STORE_ROW if row_store is not None else (STORE_COLUMN if columns is not None else STORE_FLAT)
+        metadata = {"version": cls.FORMAT_VERSION, "store": store_type, "datasets": {}}
+        with uproot.recreate(fpath, compression=None) as file:
             for name, value in arrays.items():
                 dataset_metadata, branch_values, branch_types = cls._dataset_for_write(value, columns)
+                if row_store is not None:
+                    dataset_metadata["keys"] = list(row_store)
+                    statistics = {
+                        key: cls._statistics(value[:, index])
+                        for index, key in enumerate(row_store)
+                    }
+                    if all(item is not None for item in statistics.values()):
+                        dataset_metadata["statistics"] = statistics
                 tree = file.mktree(name, branch_types, title=f"DSBO {name}")
-                if next(iter(branch_values.values())).size:
-                    tree.extend(branch_values)
+                cls._extend_in_baskets(tree, branch_values)
                 metadata["datasets"][name] = dataset_metadata
             file[cls.METADATA_OBJECT] = json.dumps(metadata, separators=(",", ":"))
+
+    @classmethod
+    def _extend_in_baskets(cls, tree, branch_values: dict[str, np.ndarray]) -> None:
+        first = next(iter(branch_values.values()))
+        if not first.size:
+            return
+        num_entries = first.shape[0]
+        bytes_per_entry = max(
+            1,
+            sum(value.nbytes for value in branch_values.values()) // num_entries,
+        )
+        entries_per_basket = max(1, cls._basket_target_bytes() // bytes_per_entry)
+        for start in range(0, num_entries, entries_per_basket):
+            stop = min(start + entries_per_basket, num_entries)
+            tree.extend({branch: value[start:stop] for branch, value in branch_values.items()})
+
+    @staticmethod
+    def _basket_target_bytes() -> int:
+        return 1 << 20
 
     @classmethod
     def _prepare_array(cls, value: np.ndarray) -> np.ndarray:
@@ -264,7 +364,70 @@ class ROOTFile(AutogradFileInterface):
             "columns": list(columns) if columns is not None else None,
             "branches": branches,
         }
+        if columns is None:
+            statistics = cls._statistics(value)
+            if statistics is not None:
+                metadata["statistics"] = statistics
+        else:
+            statistics = {
+                column: cls._statistics(column_value)
+                for column, column_value in zip(columns, value, strict=True)
+            }
+            if all(value is not None for value in statistics.values()):
+                metadata["statistics"] = statistics
         return metadata, branch_values, branch_types
+
+    @staticmethod
+    def _prepare_row_store(datasets: dict[str, np.ndarray]) -> tuple[list[str], np.ndarray]:
+        if not datasets:
+            raise ValueError("Row-store storage requires at least one feature.")
+        keys = list(datasets)
+        ROOTFile._validate_columns(keys)
+        arrays = []
+        for value in datasets.values():
+            array = np.asarray(value)
+            if array.ndim > 1:
+                raise ValueError("Row-store features must be scalars or one-dimensional arrays.")
+            arrays.append(array.reshape(-1))
+        row_count = arrays[0].shape[0]
+        if any(value.shape[0] != row_count for value in arrays[1:]):
+            raise ValueError("All row-store features must contain the same number of rows.")
+        return keys, np.column_stack(arrays)
+
+    @staticmethod
+    def _statistics(value: np.ndarray) -> dict | None:
+        if value.ndim != 1 or value.size == 0 or value.dtype.kind not in "biuf":
+            return None
+        values = value.astype(np.float64, copy=False)
+        mean = float(values.mean())
+        return {
+            "count": value.size,
+            "mean": mean,
+            "squared_deviation": float(np.square(values - mean).sum()),
+        }
+
+    @staticmethod
+    def _combine_statistics(values: list[dict | None]) -> dict | None:
+        if not values or any(value is None for value in values):
+            return None
+        count = values[0]["count"]
+        mean = values[0]["mean"]
+        squared_deviation = values[0]["squared_deviation"]
+        for value in values[1:]:
+            batch_count = value["count"]
+            total = count + batch_count
+            delta = value["mean"] - mean
+            mean += delta * batch_count / total
+            squared_deviation += (
+                value["squared_deviation"]
+                + delta * delta * count * batch_count / total
+            )
+            count = total
+        return {
+            "count": count,
+            "mean": mean,
+            "squared_deviation": squared_deviation,
+        }
 
     @classmethod
     def _branch_for_write(cls, value: np.ndarray) -> tuple[np.ndarray, np.dtype]:
@@ -337,7 +500,13 @@ class ROOTFile(AutogradFileInterface):
         if absolute_path in seen:
             raise ValueError(f"ROOT virtual dataset dependency cycle includes '{absolute_path}'.")
         seen.add(absolute_path)
-        _, sources = cls._load_container(absolute_path)
+        metadata, sources = cls._load_container(absolute_path)
+        if dependencies is not None:
+            file_dir = os.path.dirname(absolute_path)
+            dependencies.update(
+                os.path.normpath(os.path.join(file_dir, dependency))
+                for dependency in metadata.get("dependencies", [])
+            )
         if sources is None:
             seen.remove(absolute_path)
             return [absolute_path]
@@ -364,7 +533,12 @@ class ROOTFile(AutogradFileInterface):
         if not sources:
             raise ValueError("ROOT reduction requires at least one source file.")
 
-        metadata = cls._collect_metadata(sources)
+        metadata, leaf_sources = cls._collect_metadata(sources)
+        stores = [item.get("store") for item in metadata]
+        if any(store not in (STORE_FLAT, STORE_COLUMN, STORE_ROW) for store in stores):
+            raise ValueError("ROOT reduction sources must expose a valid 'store' tag.")
+        if any(store != stores[0] for store in stores[1:]):
+            raise ValueError("ROOT reduction sources must share the same store type.")
         destination_path = os.path.realpath(destination)
         dependency_paths = {os.path.realpath(source) for source in sources}
         for source in sources:
@@ -386,17 +560,29 @@ class ROOTFile(AutogradFileInterface):
             name: cls._reduce_dataset_metadata(name, [item["datasets"][name] for item in metadata])
             for name in sorted(dataset_names)
         }
-        destination_metadata = {"version": cls.FORMAT_VERSION, "datasets": reduced_datasets}
         os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
         destination_dir = os.path.dirname(os.path.abspath(destination))
-        relative_sources = [os.path.relpath(os.path.abspath(source), destination_dir) for source in sources]
-        with uproot.recreate(destination, compression=uproot.ZLIB(4)) as file:
+        destination_metadata = {
+            "version": cls.FORMAT_VERSION,
+            "store": stores[0],
+            "datasets": reduced_datasets,
+            "dependencies": [
+                os.path.relpath(path, destination_dir)
+                for path in sorted(dependency_paths)
+            ],
+        }
+        relative_sources = [
+            os.path.relpath(os.path.abspath(source), destination_dir)
+            for source in leaf_sources
+        ]
+        with uproot.recreate(destination, compression=None) as file:
             file[cls.METADATA_OBJECT] = json.dumps(destination_metadata, separators=(",", ":"))
             file[cls.VDS_SOURCES_OBJECT] = json.dumps(relative_sources, separators=(",", ":"))
 
     @classmethod
-    def _collect_metadata(cls, sources: list[str]) -> list[dict]:
+    def _collect_metadata(cls, sources: list[str]) -> tuple[list[dict], list[str]]:
         metadata = []
+        resolved_leaves = []
         for source in sources:
             if not os.path.isfile(source):
                 raise FileNotFoundError(f"Missing registered batch input: {source}")
@@ -410,17 +596,14 @@ class ROOTFile(AutogradFileInterface):
                 source_metadata, _ = cls._load_container(source)
             except OSError as exc:
                 raise TypeError(f"ROOT reduction source '{source}' is not a valid ROOT file.") from exc
-            if "primal" not in source_metadata["datasets"]:
-                raise ValueError(f"ROOT source '{source}' has no 'primal' TTree.")
             leaf_sources = cls._leaf_sources(source)
             for leaf_source in leaf_sources:
                 leaf_metadata, leaf_manifest = cls._load_container(leaf_source)
                 if leaf_manifest is not None:
                     raise ValueError(f"ROOT virtual dataset '{source}' did not resolve to physical leaves.")
-                if "primal" not in leaf_metadata["datasets"]:
-                    raise ValueError(f"ROOT source '{leaf_source}' has no 'primal' TTree.")
                 metadata.append(leaf_metadata)
-        return metadata
+                resolved_leaves.append(leaf_source)
+        return metadata, resolved_leaves
 
     @classmethod
     def _reduce_dataset_metadata(cls, name: str, datasets: list[dict]) -> dict:
@@ -441,22 +624,52 @@ class ROOTFile(AutogradFileInterface):
             for dataset in datasets
         ):
             raise ValueError(f"Cannot reduce ROOT dataset '{name}' with incompatible branches.")
+        first_keys = first.get("keys")
+        if any(dataset.get("keys") != first_keys for dataset in datasets[1:]):
+            raise ValueError(f"Cannot reduce ROOT dataset '{name}' with incompatible keyed rows.")
 
         shapes = [tuple(dataset["shape"]) for dataset in datasets]
         columns = first_columns
         if columns is None:
             reduced_shape = cls._concatenated_shape(name, shapes)
+            partitions = [1 if shape == () else shape[0] for shape in shapes]
         else:
             if any(not shape or shape[0] != len(columns) for shape in shapes):
                 raise ValueError(f"Cannot reduce ROOT dataset '{name}' with incompatible shapes: {shapes}.")
             column_shape = cls._concatenated_shape(name, [shape[1:] for shape in shapes])
             reduced_shape = (len(columns), *column_shape)
-        return {
+            partitions = [1 if len(shape) == 1 else shape[1] for shape in shapes]
+        result = {
             "shape": list(reduced_shape),
             "dtype": first["dtype"],
             "columns": columns,
             "branches": first["branches"],
+            "partitions": partitions,
         }
+        if first_keys is not None:
+            result["keys"] = first_keys
+            statistics = {
+                key: cls._combine_statistics(
+                    [dataset.get("statistics", {}).get(key) for dataset in datasets]
+                )
+                for key in first_keys
+            }
+            if all(value is not None for value in statistics.values()):
+                result["statistics"] = statistics
+        elif columns is None:
+            statistics = cls._combine_statistics([dataset.get("statistics") for dataset in datasets])
+            if statistics is not None:
+                result["statistics"] = statistics
+        else:
+            statistics = {
+                column: cls._combine_statistics(
+                    [dataset.get("statistics", {}).get(column) for dataset in datasets]
+                )
+                for column in columns
+            }
+            if all(value is not None for value in statistics.values()):
+                result["statistics"] = statistics
+        return result
 
     @classmethod
     def _concatenated_shape(cls, name: str, shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
@@ -468,3 +681,13 @@ class ROOTFile(AutogradFileInterface):
             raise ValueError(f"Cannot reduce ROOT dataset '{name}' with incompatible shapes: {shapes}.")
         return sum(shape[0] for shape in shapes), *shapes[0][1:]
 
+    @classmethod
+    def shape_from_path(cls, path: str) -> tuple[int, ...]:
+        metadata, _ = cls._load_container(path)
+        primal = metadata["datasets"]["primal"]
+        shape = tuple(primal["shape"])
+        columns = primal["columns"]
+        if columns is None:
+            return shape
+        num_samples = 1 if len(shape) == 1 else shape[1]
+        return num_samples, len(columns)

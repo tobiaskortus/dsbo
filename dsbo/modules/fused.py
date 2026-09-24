@@ -98,6 +98,8 @@ def file_overlays(graph, task, index: int | None, candidate_subdirs):
         if not sources:
             continue
 
+        sources = list(dict.fromkeys(sources))
+
         subdir = "batch_reduce" if index is None else candidate_subdirs[index]
 
         destination = _reduced_destination(input_path, producer_indices, subdir, module.i)

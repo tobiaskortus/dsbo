@@ -5,6 +5,7 @@ import os
 import xml.etree.ElementTree as ET
 from typing import TYPE_CHECKING
 
+import networkx as nx
 import matplotlib
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
@@ -244,52 +245,59 @@ def visualize_workflow(
 
     nodes = set(workflow.task_graph.nodes())
     stacked_nodes = {
-        predecessor
+        ancestor
         for fused in nodes
         if getattr(fused, "_is_batch_fused", False)
-        for predecessor in workflow.task_graph.predecessors(fused)
-        if not getattr(predecessor, "_is_batch_fused", False)
+        for ancestor in nx.ancestors(workflow.task_graph, fused)
+        if not getattr(ancestor, "_is_batch_fused", False)
     }
     keys, color_map = _build_color_map(nodes)
     _color = lambda n: color_map.get(_res_key(n), "#d3d3d3")
     from dsbo.workflow import task_levels
     levels = task_levels(workflow.task_graph)
 
+    from dsbo.surrogates.graph_transformations import GraphMode
+    is_default_mode = workflow.graph_context.mode == GraphMode.DEFAULT
+
+    dependency_groups = workflow.surrogate_execution.dependency_groups if is_default_mode \
+        else getattr(workflow.task_graph, "_dependency_groups", ())
+
     rep_entry: dict = {}
     rep_exit: dict = {}
     hidden_nodes: set = set()
     grouped_nodes: set = set()
 
-    for gi, dependency_group in enumerate(workflow._dependency_groups):
-        active_nodes = dependency_group.nodes & nodes
-        if not active_nodes:
-            continue
+    if is_default_mode or dependency_groups:
+        for gi, dependency_group in enumerate(dependency_groups):
+            active_nodes = dependency_group.nodes & nodes
+            if not active_nodes:
+                continue
 
-        grouped_nodes.update(active_nodes)
-        template_replicas: dict[object, list] = {}
-        for node in active_nodes:
-            template = dependency_group.node_to_template.get(node, node)
-            template_replicas.setdefault(template, []).append(node)
+            grouped_nodes.update(active_nodes)
+            template_replicas: dict[object, list] = {}
+            for node in active_nodes:
+                template = dependency_group.node_to_template.get(node, node)
+                template_replicas.setdefault(template, []).append(node)
 
-        with dot.subgraph(name=f"cluster_dependency_{gi}") as sg:
-            sg.attr(
-                color="#777777",
-                style="dashed",
-            )
-            for template, replicas in template_replicas.items():
-                replicas.sort(key=lambda n: getattr(n, "i", 0) or 0)
-                if len(replicas) > 1:
-                    hidden_nodes.update(replicas[1:-1])
-                    _add_replica_group(
-                        sg,
-                        replicas[0],
-                        replicas[-1],
-                        dependency_group.count,
-                        template,
-                    )
-                else:
-                    for node in replicas:
-                        _add_node(sg, node, template)
+            with dot.subgraph(name=f"cluster_dependency_{gi}") as sg:
+                sg.attr(
+                    color="#777777",
+                    style="dashed",
+                )
+                for template, replicas in template_replicas.items():
+                    replicas.sort(key=lambda n: getattr(n, "i", 0) or 0)
+                    if len(replicas) > 1:
+                        hidden_nodes.update(replicas[1:-1])
+                        _add_replica_group(
+                            sg,
+                            replicas[0],
+                            replicas[-1],
+                            dependency_group.count,
+                            template,
+                        )
+                    else:
+                        for node in replicas:
+                            _add_node(sg, node, template)
 
     for node in nodes - grouped_nodes:
         _add_node(dot, node)

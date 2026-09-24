@@ -3,19 +3,32 @@ import torch
 import numpy as np
 from abc import ABC, abstractmethod
 import torch.autograd.forward_ad as fw
-from torch.utils.data import DataLoader
 from torch.utils.hooks import RemovableHandle
 
-from dsbo.utils.io.workdir import AbstractFilePath
+from dsbo.utils.io.datasets.views import DatasetView, InMemoryDatasetView
 
 
 class AutogradFileInterface(ABC):
     handles: dict[str, RemovableHandle] = {}
     _gradient_written: set[str] = set()
+    _registered_extensions: set[str] = set()
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        AutogradFileInterface._registered_extensions.update(cls.reducible_extensions())
 
     @classmethod
     def reducible_extensions(cls) -> frozenset[str]:
         return frozenset()
+
+    @classmethod
+    def default_extension(cls) -> str:
+        extensions = cls.reducible_extensions()
+        return min(extensions, key=lambda extension: (len(extension), extension)) if extensions else ""
+
+    @classmethod
+    def registered_extensions(cls) -> frozenset[str]:
+        return frozenset(AutogradFileInterface._registered_extensions)
 
     @classmethod
     def reset_gradient_state(cls):
@@ -81,6 +94,24 @@ class AutogradFileInterface(ABC):
         pass
 
     @classmethod
+    def columns(cls, fpath: str) -> list[str]:
+        return []
+
+    @classmethod
+    @abstractmethod
+    def write_named_datasets(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        pass
+
+    @classmethod
+    def write_row_store(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        cls.write_named_datasets(fpath, datasets)
+
+    @classmethod
+    @abstractmethod
+    def open_dataset(cls, fpath: str) -> DatasetView:
+        pass
+
+    @classmethod
     def write_backward_gradient(cls, gradient: np.ndarray, fpath: str, columns: list[str] | None = None):
         if fpath not in cls.handles:
             raise RuntimeError(
@@ -115,6 +146,10 @@ class AutogradFileInterface(ABC):
         raise NotImplementedError(f"{cls.__name__} does not support file reduction.")
 
     @classmethod
+    def shape_from_path(cls, path: str) -> tuple[int, ...]:
+        return cls.open_primal(path).shape
+
+    @classmethod
     def _gradient_path(cls, fpath: str) -> str:
         base, stem = os.path.splitext(fpath)
         return f"{base}_gradient{stem}"
@@ -138,6 +173,32 @@ class InMemoryFile(AutogradFileInterface):
     """A simple in-memory file interface for reverse-mode AD without actual file I/O.
     Does only work for simple workflows with local execution without dask workers."""
     _storage: dict[str, torch.Tensor] = {}
+    _named_storage: dict[str, dict[str, torch.Tensor]] = {}
+
+    @classmethod
+    def write_named_datasets(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
+        stored = cls._named_storage.setdefault(fpath, {})
+        stored.update({key: torch.from_numpy(value) for key, value in datasets.items()})
+
+    @classmethod
+    def open_dataset(cls, fpath: str) -> DatasetView:
+        datasets: dict[str, torch.Tensor] = {}
+        named = cls._named_storage.get(fpath)
+        if named:
+            datasets.update(named)
+        if fpath in cls._storage:
+            value = cls._storage[fpath]
+            if isinstance(value, dict):
+                datasets.update(
+                    {
+                        key: tensor
+                        for key, tensor in value.items()
+                        if isinstance(tensor, torch.Tensor)
+                    }
+                )
+            else:
+                datasets.setdefault("primal", value)
+        return InMemoryDatasetView(datasets)
 
     @classmethod
     def open_primal(cls, fpath: str, columns: list[str] | None = None) -> np.ndarray:
@@ -168,6 +229,13 @@ class InMemoryFile(AutogradFileInterface):
         }
 
     @classmethod
+    def columns(cls, fpath: str) -> list[str]:
+        value = cls._storage[fpath]
+        if isinstance(value, dict):
+            return [key for key in value if key != "tangent"]
+        return []
+
+    @classmethod
     def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
         return cls._storage[grad_path]
 
@@ -178,17 +246,3 @@ class InMemoryFile(AutogradFileInterface):
     @classmethod
     def read_backward_gradient(cls, fpath: str) -> torch.Tensor:
         return torch.tensor(cls._storage[cls._gradient_path(fpath)]).float()
-
-
-class AutogradFileStorage(AutogradFileInterface):
-    @classmethod
-    @abstractmethod
-    def to_data_loader(
-        cls,
-        data_fpath_abstract: AbstractFilePath,
-        cond_fpath_abstract: AbstractFilePath,
-        batch_size: int = 64,
-        shuffle: bool = True,
-        num_workers: int = 0,
-    ) -> DataLoader:
-       pass

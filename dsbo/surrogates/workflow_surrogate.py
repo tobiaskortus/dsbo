@@ -1,286 +1,302 @@
 from __future__ import annotations
 
 import torch
+from diffusers.schedulers import DDPMScheduler, DDIMScheduler
 from typing import Any, Mapping, TYPE_CHECKING
+from torch.utils.data import Subset, DataLoader, default_collate
 
-
+from dsbo.autograd import train_op
+from dsbo.utils.io import Input, Workdir
+from dsbo.modules import dynamic_submodule
+from dsbo.config import get_active_file_backend
+from dsbo.utils.io.datasets import design_split
 from dsbo.surrogates import SurrogateBase, SurrogateStrategy
-from lightning.pytorch.utilities import disable_possible_user_warnings
+from dsbo.surrogates.diffusion import MlpDiffusion1D, Trainer
+from dsbo.utils.io.workdir import AbstractFilePath, DefaultFilenames, DefaultPaths
 
 
+if TYPE_CHECKING:
+    from dsbo.parameters import CandidateBatch
 
-def reduce(result: dict[str, torch.Tensor] | ResultsBatch) -> dict[str, torch.Tensor] | ResultsBatch:
-    if isinstance(result, ResultsBatch):
-        return ResultsBatch([reduce(r) for r in result])
 
-    return {k: v.mean() for k, v in result.items()}
-
-def expand(result: dict[str, torch.Tensor] | ResultsBatch) -> dict[str, torch.Tensor] | ResultsBatch:
-    if isinstance(result, ResultsBatch):
-        return ResultsBatch([expand(r) for r in result])
-
-    vector_lengths = [v.shape[0] for v in result.values() if v.ndim == 1 and v.shape[0] > 1]
-    
-    if vector_lengths:
-        assert len(set(vector_lengths)) == 1, f"All vectors must have the same length, got lengths: {vector_lengths}"
-        target_len = vector_lengths[0]
-    else:
-        raise Exception("No vector entries found in the result to determine target length for expansion.")
-    
-    expanded = {}
-    for k, v in result.items():
-        if v.ndim == 0 or (v.ndim == 1 and v.shape[0] == 1):
-            expanded[k] = v.repeat(target_len)
-        else:
-            expanded[k] = v
-
-    return expanded
+def _collate_workflow_surrogate_batch(batch):
+    x, y = default_collate(batch)
+    return y, x
 
 
 def surrogate_predictions_to_dict(tensor: torch.Tensor, keys: list[str], n: int) -> dict[str, torch.Tensor]:
-    if n > 1:
-        return {k: tensor[:, i] for i, k in enumerate(keys)}
-    
-    return {k: tensor[i] for i, k in enumerate(keys)}
+    tensor = tensor.reshape(-1, len(keys))
+    return {k: tensor[:, i] for i, k in enumerate(keys)}
 
 
 class WorkflowSurrogate(SurrogateBase):
-    def __init__(self, surrogate: Any, strategy: SurrogateStrategy):
-        super().__init__(surrogate, strategy)
+    requires_design_tensor = True
+
+    def __init__(self, strategy: SurrogateStrategy):
+        super().__init__(strategy=strategy)
+        self._data_path = Input(Workdir.register_file(
+                DefaultPaths.TRAINING_RECORDS,
+                DefaultFilenames.RESULTS,
+            )
+        )
 
     def __call__(self, design, **kwargs):
-        pass
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement __call__ to predict objectives."
+        )
 
+    def backward(self, design, grad_output=None, design_tensor=None) -> None:
+        if grad_output is None:
+            return
+        keys = list(grad_output.keys())
+        results = self(design, design_tensor=design_tensor)
+        tensors = [results[k] for k in keys]
+        grad_tensors = [grad_output[k] for k in keys]
+        torch.autograd.backward(tensors, grad_tensors)
 
-from typing import Any, Callable
-
-import torch
-from torch.utils.data import TensorDataset, random_split, DataLoader
-
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping
-
-from dsbo.modules import Module
-from dsbo.parameters import Candidate, CandidateBatch
-from dsbo.surrogates import SurrogateBase, SurrogateStrategy
-from dsbo.surrogates.workflow_surrogate import (
-    WorkflowSurrogate,
-    surrogate_predictions_to_dict,
-    reduce,
-)
-from dsbo.workflow import ResultsBatch
-
-
-class MLPSurrogateModule(pl.LightningModule):
-    def __init__(
+    def get_train_val_loaders(
         self,
-        in_dim: int,
-        out_dim: int,
-        hidden_dims: tuple[int, ...] = (64, 64),
-        learning_rate: float = 1e-3,
-        weight_decay: float = 1e-5,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
+        training_data_path: str,
+        candidates: CandidateBatch,
+    ) -> tuple[DataLoader, DataLoader]:
+        from dsbo.utils.io.datasets.datasets import WorkflowSurrogateDataset
 
-        layers: list[torch.nn.Module] = []
-        prev_dim = in_dim
-        for h_dim in hidden_dims:
-            layers.extend([torch.nn.Linear(prev_dim, h_dim), torch.nn.ReLU()])
-            prev_dim = h_dim
-        layers.append(torch.nn.Linear(prev_dim, out_dim))
-        self.mlp = torch.nn.Sequential(*layers)
-
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
-
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = torch.nn.functional.mse_loss(y_hat, y)
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = torch.nn.functional.mse_loss(y_hat, y)
-        self.log("val_loss", loss, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams.learning_rate,
-            weight_decay=self.hparams.weight_decay,
+        dataset = WorkflowSurrogateDataset(
+            training_data_path,
+            candidates.tensor.detach(),
+            backend=get_active_file_backend(),
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=10
+        self._records_dataset = dataset
+        self.keys = dataset.keys
+        self.n = dataset.n
+
+        # Split by candidate *before* fitting normalization, then compute the
+        # moments over the training rows only. Both loaders below reuse these
+        # train-derived constants, so validation data never leaks into the
+        # training normalization (and is normalized identically at inference).
+        train_indices, val_indices = design_split(
+            n_candidates=candidates.tensor.shape[0],
+            rows_per_design=self.n,
+            val_split=self.val_split,
+            seed=self.seed,
         )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-            },
+        dataset.compute_stats(train_indices)
+        self._mean_x = dataset.mean_x
+        self._std_x = dataset.std_x
+        self._mean_y = dataset.mean_y
+        self._std_y = dataset.std_y
+
+        num_workers = getattr(self, "num_workers", 8)
+        loader_options = {
+            "batch_size": self.batch_size,
+            "num_workers": num_workers,
+            "collate_fn": _collate_workflow_surrogate_batch,
         }
+        if num_workers:
+            loader_options.update(
+                persistent_workers=True,
+                prefetch_factor=getattr(self, "prefetch_factor", 4),
+            )
+        return (
+            DataLoader(Subset(dataset, train_indices), shuffle=True, **loader_options),
+            DataLoader(Subset(dataset, val_indices), shuffle=False, **loader_options),
+        )
 
-    def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=16, num_workers=1, persistent_workers=True, shuffle=True)  # type: ignore[attr-defined]
-
-    def val_dataloader(self):
-        if hasattr(self, "val_dataset") and self.val_dataset is not None:  # type: ignore[attr-defined]
-            return DataLoader(self.val_dataset, batch_size=16, num_workers=1, persistent_workers=True)  # type: ignore[attr-defined]
-        return None
+    @property
+    def data_path(self) -> AbstractFilePath:   
+        return self._data_path
 
 
-class MLPWorkflowSurrogate(WorkflowSurrogate):
-    hidden_dims: tuple[int, ...] = (64, 64)
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-5
-    max_epochs: int = 200
-    patience: int = 20
-    val_split: float = 0.2
-    train_batch_size: int = 16
-    sample_count: int = 16
-
+class DefaultWorkflowSurrogate(WorkflowSurrogate):
     def __init__(
         self,
         strategy: SurrogateStrategy,
-        hidden_dims: tuple[int, ...] | None = None,
-        learning_rate: float | None = None,
-        weight_decay: float | None = None,
-        max_epochs: int | None = None,
+        emb_dim: int = 256,
+        hidden_dim: int = 256,
+        n_layers: int = 12,
+        dropout: float = 0.1,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 1e-2,
+        max_epochs: int = 200,
+        batch_size: int = 256,
+        grad_clip: float = 1.0,
+        val_split: float = 0.2,
+        sample_count: int = 16,
+        num_train_timesteps: int = 1000,
+        num_infer_timesteps: int = 50,
+        eta: float = 0.8,
+        seed: int = 0,
         patience: int | None = None,
-        val_split: float | None = None,
-        sample_count: int | None = None,
+        num_workers: int = 8,
+        prefetch_factor: int = 4,
     ):
-        # Build a dummy surrogate (will be replaced during training)
-        dummy = torch.nn.Linear(1, 1)
-        super().__init__(surrogate=dummy, strategy=strategy)
 
-        if hidden_dims is not None:
-            self.hidden_dims = hidden_dims
-        if learning_rate is not None:
-            self.learning_rate = learning_rate
-        if weight_decay is not None:
-            self.weight_decay = weight_decay
-        if max_epochs is not None:
-            self.max_epochs = max_epochs
-        if patience is not None:
-            self.patience = patience
-        if val_split is not None:
-            self.val_split = val_split
-        if sample_count is not None:
-            self.sample_count = sample_count
+        super().__init__(strategy=strategy)
+        if num_workers < 0:
+            raise ValueError("num_workers must be non-negative.")
+        if prefetch_factor < 1:
+            raise ValueError("prefetch_factor must be positive.")
 
-        # Populated during training
+        self.emb_dim = emb_dim
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.dropout = dropout
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.max_epochs = max_epochs
+        self.batch_size = batch_size
+        self.grad_clip = grad_clip
+        self.val_split = val_split
+        self.sample_count = sample_count
+        self.num_train_timesteps = num_train_timesteps
+        self.num_infer_timesteps = num_infer_timesteps
+        self.eta = eta
+        self.seed = seed
+        self.patience = patience
+        self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
+
         self.keys: list[str] = []
         self.n: int = 1
+        self._mean_x: torch.Tensor | None = None
+        self._std_x: torch.Tensor | None = None
+        self._mean_y: torch.Tensor | None = None
+        self._std_y: torch.Tensor | None = None
+        self._diffusion_model: MlpDiffusion1D | None = None
+        self._noise_scheduler: DDPMScheduler | None = None
+        self._sample_scheduler: DDIMScheduler | None = None
 
+    def _create_schedulers(self) -> None:
+        self._noise_scheduler = DDPMScheduler(
+            clip_sample=False,
+            num_train_timesteps=self.num_train_timesteps,
+            prediction_type="v_prediction",
+            beta_schedule="squaredcos_cap_v2",
+        )
+        self._sample_scheduler = DDIMScheduler(
+            clip_sample=False,
+            num_train_timesteps=self.num_train_timesteps,
+            prediction_type="v_prediction",
+            beta_schedule="squaredcos_cap_v2",
+        )
 
-    @staticmethod
-    def _filter_failed(
-        candidates: CandidateBatch, results: ResultsBatch
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        X = candidates.tensor
-        Y = results.tensor
+    @train_op
+    @dynamic_submodule
+    def train(self, design, candidates):
+        data_path = self.data_path()
+        model_file_path = self.model_file_path()
 
-        # TODO: define a consistent "failed" definition
-        return X, Y
+        train_loader, val_loader = self.get_train_val_loaders(data_path, candidates)
+        try:
+            objective_dim = len(self.keys)
+            parameter_dim = candidates.tensor.shape[1]
 
-    def to_datasets(self, candidates: CandidateBatch, results: ResultsBatch) -> tuple[TensorDataset, TensorDataset]:
-        X, Y = self._filter_failed(candidates, results)
-        total = X.shape[0]
+            model = MlpDiffusion1D(
+                objective_dim=objective_dim,
+                parameter_dim=parameter_dim,
+                emb_dim=self.emb_dim,
+                hidden_dim=self.hidden_dim,
+                n_layers=self.n_layers,
+                dropout=self.dropout,
+            )
+            self._diffusion_model = model
+            self._create_schedulers()
 
-        if total < 2:
-            raise ValueError(
-                f"Need at least 2 valid samples for training, got {total}."
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+            )
+            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.max_epochs, eta_min=1e-6
             )
 
-        val_size = max(1, int(total * self.val_split))
-        train_size = total - val_size
+            Trainer(model,
+                self._noise_scheduler,
+                optimizer,
+                lr_scheduler,
+                device=next(model.parameters()).device,
+                grad_clip=self.grad_clip,
+                model_tag=type(self).__name__.lower(),
+            ).fit(
+                n_epochs=self.max_epochs,
+                dataloader=train_loader,
+                val_dataloader=val_loader,
+                patience=self.patience,
+                show_progress=False,
+            )
 
-        # Split indices
-        indices = torch.randperm(total)
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:]
+            torch.save(self.state_dict(), model_file_path)
+        finally:
+            # Always release the records HDF5 handle, even if training errors.
+            if getattr(self, "_records_dataset", None) is not None:
+                self._records_dataset.close()
+                self._records_dataset = None
+        return {}
 
-        train_dataset = TensorDataset(X[train_indices], Y[train_indices])
-        val_dataset = TensorDataset(X[val_indices], Y[val_indices])
 
-        return train_dataset, val_dataset
+    def state_dict(self) -> dict:
+        if self._diffusion_model is None:
+            return {}
+        
+        return {
+            "model": self._diffusion_model.state_dict(),
+            "objective_dim": self._diffusion_model.config.objective_dim,
+            "parameter_dim": self._diffusion_model.cond_dim,
+            "mean_x": self._mean_x,
+            "std_x": self._std_x,
+            "mean_y": self._mean_y,
+            "std_y": self._std_y,
+            "keys": self.keys,
+            "n": self.n,
+        }
 
-    # -- training ------------------------------------------------------------
-
-    def train(
-        self,
-        candidate: Candidate,
-        run_batch: Callable[[CandidateBatch], ResultsBatch],
-    ) -> None:
-        disable_possible_user_warnings()
-  
-
-        candidates = self.strategy.generate_candidates(
-            candidate, space=candidate.space, n=self.sample_count
+    def from_state_dict(self, state: dict) -> None:
+        model = MlpDiffusion1D(
+            objective_dim=state["objective_dim"],
+            parameter_dim=state["parameter_dim"],
+            emb_dim=self.emb_dim,
+            hidden_dim=self.hidden_dim,
+            n_layers=self.n_layers,
+            dropout=self.dropout,
         )
-        results = reduce(ResultsBatch(run_batch(candidates)))
-
-        self.keys = list(results.keys)
-        in_dim = candidate.space.dims()
-        out_dim = len(self.keys)
-
-        train_ds, val_ds = self.to_datasets(candidates, results)
-
-        model = MLPSurrogateModule(
-            in_dim=in_dim,
-            out_dim=out_dim,
-            hidden_dims=self.hidden_dims,
-            learning_rate=self.learning_rate,
-            weight_decay=self.weight_decay,
-        )
-        model.train_dataset = train_ds 
-        model.val_dataset = val_ds
-
-        early_stop = EarlyStopping(
-            monitor="val_loss",
-            patience=self.patience,
-            mode="min",
-            verbose=False,
-        )
-
-        trainer = pl.Trainer(
-            max_epochs=self.max_epochs,
-            callbacks=[early_stop],
-            enable_progress_bar=True,
-            enable_checkpointing=False,
-            logger=False,
-        )
-        trainer.fit(model)
-
-        self.write_to_registry(model)
-
-        return model
-
-
-    def __call__(self, design: Candidate, **kwargs) -> dict[str, torch.Tensor]:
-        x = design.tensor
-
-        in_dim = x.shape[0] if x.ndim == 1 else x.shape[1]
-        out_dim = len(self.keys)
-
-        model = MLPSurrogateModule(
-            in_dim=in_dim,
-            out_dim=out_dim,
-            hidden_dims=self.hidden_dims,
-            learning_rate=self.learning_rate,
-            weight_decay=self.weight_decay,
-        )
-        model.load_state_dict(self.load_from_registry())
+        model.load_state_dict(state["model"])
         model.eval()
+        self.keys = state["keys"]
+        self.n = state["n"]
+        self._mean_x = state.get("mean_x")
+        self._std_x = state.get("std_x")
+        self._mean_y = state.get("mean_y")
+        self._std_y = state.get("std_y")
+        self._diffusion_model = model
+        self.surrogate = model
+        self._create_schedulers()
 
-        y = model(x)
+    def __call__(self, design: Mapping[str, Any], design_tensor: torch.Tensor, **kwargs) -> dict[str, torch.Tensor]:
+        self.get_runtime_model()
 
-        return surrogate_predictions_to_dict(y, self.keys, self.n)
+        model = self._diffusion_model
+        if model is None:
+            raise RuntimeError(f"{type(self).__name__} has no trained surrogate model.")
+
+        B = self.sample_count
+        c = design_tensor.float()
+        if self._mean_x is not None:
+            c = (design_tensor - self._mean_x) / self._std_x
+        c = c.unsqueeze(0).expand(B, -1)
+
+        model.eval()
+        self._sample_scheduler.set_timesteps(self.num_infer_timesteps)
+        objective_dim = model.config.objective_dim
+
+        x = torch.randn(B, 1, objective_dim, device=c.device)
+
+        for t in self._sample_scheduler.timesteps:
+            v = model(x, t.expand(B).to(c.device), c).sample
+            x = self._sample_scheduler.step(v, t, x, eta=self.eta).prev_sample
+
+        x = x.squeeze(1)
+        if self._mean_y is not None and self._std_y is not None:
+            x = x * self._std_y + self._mean_y
+
+        return surrogate_predictions_to_dict(x, self.keys, B)

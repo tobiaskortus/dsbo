@@ -137,7 +137,7 @@ class TestAssertNoMixedSurrogateUsage:
         m = SimpleModule()
         m.surrogate = MagicMock()
         wf = Workflow(m)
-        wf._surrogate = MagicMock()
+        wf.surrogate_execution.set_workflow_surrogate(MagicMock())
         with pytest.raises(ValueError, match="cannot use both"):
             assert_no_mixed_surrogate_usage(wf)
 

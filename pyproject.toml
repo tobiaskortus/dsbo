@@ -34,6 +34,8 @@ dependencies = [
     "sqlalchemy",
     "sqlmodel",
     "sqlite-vec",
+    "ipython",
+    "diffusers",
     "torch",
     "tqdm",
     "uproot>=5,<6",

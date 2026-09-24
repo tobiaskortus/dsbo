@@ -11,12 +11,13 @@ from dask.delayed import Delayed, delayed
 from dask.distributed import Client, Future
 
 import dsbo
-from dask_jobqueue.local import LocalCluster
-from contextlib import contextmanager, nullcontext
-from dsbo.autograd import SerializedTensor, _pack, _unpack
+from contextlib import contextmanager
+from dsbo.storage import get_current_storage, use_storage
+from dsbo.autograd import _pack, _unpack
 from dask_heterogeneous.hybrid import HybridCluster
 from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
+
 
 if TYPE_CHECKING:
     from dsbo.worker.spec import WorkerSpec
@@ -29,6 +30,14 @@ dask.config.set({
     "distributed.worker.memory.pause": 0.95,
     "distributed.worker.memory.terminate": 0.98,
 })
+
+
+def _pack_tensor(t: torch.Tensor | None):
+    return None if t is None else _pack({"value": t})["value"]
+
+
+def _unpack_tensor(t):
+    return None if t is None else _unpack({"value": t})["value"]
 
 
 class DaskWorkerBase:
@@ -78,6 +87,7 @@ class DaskWorkerBase:
         module: Module,
         design: dict,
         dependencies: Iterable = (),
+        design_tensor: torch.Tensor | None = None,
         priority: int | None = None,
         file_overlays=None,
     ) -> tuple[uuid.UUID, Delayed]:
@@ -86,17 +96,19 @@ class DaskWorkerBase:
         workdir = getattr(get_workdir(), "workdir_root", None)
         resources = getattr(module.resources, "resources", None)
         packed_design = _pack(design)
+        packed_design_tensor = _pack_tensor(design_tensor)
 
         is_forward_ad = fw._current_level > -1
         is_grad_enabled = torch.is_grad_enabled()
 
         config_state = dsbo.config.state()
+        storage = get_current_storage(create=False)
 
         task_id = uuid.uuid4()
 
-        def _module_wrapper(module, design_arg, *deps):
+        def _module_wrapper(module, design_arg, design_tensor_arg, *deps):
             dsbo.config._set(config_state)
-            packed_result = module.run(
+            task_kwargs = dict(
                 design=design_arg,
                 workdir=workdir,
                 suffix=suffix,
@@ -107,11 +119,16 @@ class DaskWorkerBase:
                 pack_result=is_forward_ad,
                 unpack_design=True,
             )
+            design_tensor = _unpack_tensor(design_tensor_arg)
+            if design_tensor is not None:
+                task_kwargs["design_tensor"] = design_tensor
+            with use_storage(storage):
+                packed_result = module.run(**task_kwargs)
             return task_id, packed_result
 
         with dask.annotate(resources=(resources or {}), priority=priority):
             delayed_obj = delayed(_module_wrapper, name=module.name)(
-                module, packed_design, *dependencies
+                module, packed_design, packed_design_tensor, *dependencies
             )
 
         return task_id, delayed_obj
@@ -123,13 +140,19 @@ class DaskWorkerBase:
         resources = getattr(module.resources, "resources", None)
 
         config_state = dsbo.config.state()
+        storage = get_current_storage(create=False)
         task_id = uuid.uuid4()
 
         def _backward_wrapper(module, candidate, *deps):
             dsbo.config._set(config_state)
             grad_candidate = candidate.detach().requires_grad_()
-            with torch.enable_grad():
-                module.run_backward(grad_candidate.values, grad_output, workdir=workdir, suffix=suffix, subdir=subdir)
+            design_tensor = grad_candidate.tensor if getattr(module, "requires_design_tensor", False) else None
+            with use_storage(storage), torch.enable_grad():
+                module.run_backward(
+                    grad_candidate.values, grad_output,
+                    design_tensor=design_tensor,
+                    workdir=workdir, suffix=suffix, subdir=subdir,
+                )
             return task_id, grad_candidate.grad.clone() if grad_candidate.grad is not None else None
 
         with dask.annotate(resources=(resources or {}), priority=priority):
@@ -161,7 +184,6 @@ class HeterogeneousDaskWorker(DaskWorkerBase):
         cluster_spec = dict(ChainMap(*[s.get_spec_dict() for s in job_specs]))
 
         adapt_config = dict()
-        scale_config = dict()
 
         for spec in job_specs:
             assert (spec.min_worker is not None and 
@@ -171,7 +193,10 @@ class HeterogeneousDaskWorker(DaskWorkerBase):
             adapt_config[spec.spec_key] = (spec.min_worker, spec.max_worker)
 
         self.cluster = HybridCluster(spec=cluster_spec, log_directory=logdir)
-        self.cluster.adapt(adapt_config)
+        if all(minimum == maximum for minimum, maximum in adapt_config.values()):
+            self.cluster.scale({key: minimum for key, (minimum, _) in adapt_config.items()})
+        else:
+            self.cluster.adapt(adapt_config)
         super().__init__(self.cluster)
 
     @classmethod

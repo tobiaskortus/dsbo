@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 import time
 import json
+import shutil
+import uuid
 import torch
 import numpy as np
 import dataclasses
@@ -10,47 +13,17 @@ from typing import List, Optional
 
 import networkx as nx
 from sqlalchemy import Engine, event as sa_event, inspect
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import NullPool
-from sqlmodel import Session, SQLModel, case, create_engine, select
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase, ArtifactStorageBase, Artifact
 from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow, ArtifactEntry
 from dsbo.utils.io.workdir import Workdir
 
 
-DUCKDB_VECTOR_METRICS = {
-        "l2":     "array_distance",
-        "cosine": "array_cosine_distance",
-        "ip":     "array_negative_inner_product",
-    }
-
-
-def _configure_duckdb_vss(engine: Engine, vector_dim: int) -> None:
-    @sa_event.listens_for(engine, "connect")
-    def _load_vss(conn, _):
-        try:
-            conn.execute("LOAD vss")
-        except Exception:
-            conn.execute("INSTALL vss")
-            conn.execute("LOAD vss")
-        conn.execute("SET hnsw_enable_experimental_persistence = true")
-
-    with engine.connect() as conn:
-        conn.exec_driver_sql(
-            f"CREATE TABLE IF NOT EXISTS trial_vectors "
-            f"(trial_id VARCHAR, vec FLOAT[{vector_dim}])"
-        )
-        conn.commit()
-
-    with engine.connect() as conn:
-        try:
-            conn.exec_driver_sql(
-                f"CREATE INDEX IF NOT EXISTS trial_vectors_hnsw "
-                f"ON trial_vectors USING HNSW(vec)"
-            )
-            conn.commit()
-        except Exception:
-            pass
+class StudyStorageExistsError(FileExistsError):
+    pass
 
 
 def _configure_sqlite_vec(engine: Engine, vector_dim: int) -> None:
@@ -88,6 +61,7 @@ class SQLModelTransitionWriter(TransitionWriter):
         exec_id: str,
         log: str,
         status: JobStatus,
+        tag: str = "",
     ) -> None:
         engine = create_engine(self.url, poolclass=NullPool)
         with Session(engine) as session:
@@ -111,6 +85,7 @@ class SQLModelTransitionWriter(TransitionWriter):
                         stop=stop,
                         log=log,
                         status=status,
+                        tag=tag,
                     )
                 else:
                     job_trace.status = status
@@ -128,6 +103,7 @@ class SQLModelTransitionWriter(TransitionWriter):
                 job_trace.stop = stop
                 job_trace.log = log
                 job_trace.status = status
+                job_trace.tag = tag
 
             session.add(job_trace)
 
@@ -313,10 +289,9 @@ class IntermediatesStorage(IntermediatesStorageBase):
 
 
 class TrialStorage(TrialStorageBase):
-    def __init__(self, engine: Engine, readonly: bool = False, vector_dim: int | None = None, backend: str = "duckdb"):
+    def __init__(self, engine: Engine, readonly: bool = False, vector_dim: int | None = None):
         super().__init__()
         self._engine = engine
-        self._backend = backend
         self._readonly = readonly
         self._vector_dim = vector_dim
 
@@ -328,6 +303,10 @@ class TrialStorage(TrialStorageBase):
 
         if isinstance(design_vec, torch.Tensor):
             design_vec = design_vec.detach().cpu().numpy()
+
+        objectives = self._json_scalars(objectives, "objectives")
+        if constraints is not None:
+            constraints = self._json_scalars(constraints, "constraints")
 
         arr = np.asarray(design_vec, dtype=np.float32)
         with Session(self._engine) as session:
@@ -345,40 +324,36 @@ class TrialStorage(TrialStorageBase):
 
         return trial
 
+    @staticmethod
+    def _json_scalars(values: dict, name: str) -> dict:
+        result = {}
+        for key, value in values.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise ValueError(f"{name}['{key}'] must be a scalar tensor.")
+                value = value.detach().cpu().item()
+            elif isinstance(value, np.generic):
+                value = value.item()
+            result[key] = value
+        return result
+
 
     def _index_design(self, trial_id: str, arr: np.ndarray) -> None:
-        def _index_design_duckdb():
-            with self._engine.connect() as conn:
-                conn.exec_driver_sql(
-                    f"INSERT INTO trial_vectors VALUES (?, ?::FLOAT[{self._vector_dim}])",
-                    (trial_id, arr.tolist()),
-                )
-                conn.commit()
+        with self._engine.connect() as conn:
+            result = conn.exec_driver_sql(
+                "SELECT COALESCE(MAX(rowid), 0) + 1 FROM vec_trial_map"
+            )
+            next_rowid = result.scalar()
+            conn.exec_driver_sql(
+                "INSERT INTO vec_trials(rowid, design) VALUES (?, ?)",
+                (next_rowid, arr.tobytes()),
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO vec_trial_map(rowid, trial_id) VALUES (?, ?)",
+                (next_rowid, trial_id),
+            )
+            conn.commit()
 
-        def _index_design_sqlite():
-            with self._engine.connect() as conn:
-                result = conn.exec_driver_sql(
-                    "SELECT COALESCE(MAX(rowid), 0) + 1 FROM vec_trial_map"
-                )
-                next_rowid = result.scalar()
-                conn.exec_driver_sql(
-                    "INSERT INTO vec_trials(rowid, design) VALUES (?, ?)",
-                    (next_rowid, arr.tobytes()),
-                )
-                conn.exec_driver_sql(
-                    "INSERT INTO vec_trial_map(rowid, trial_id) VALUES (?, ?)",
-                    (next_rowid, trial_id),
-                )
-                conn.commit()
-
-        match self._backend:
-            case "duckdb":
-                _index_design_duckdb()
-            case "sqlite":
-                _index_design_sqlite()
-            case _:
-                raise ValueError(f"Unsupported backend: {self._backend}")
-            
 
     def get_trials(self, since_step: Optional[int] = None) -> list[Trial]:
         with Session(self._engine) as session:
@@ -387,65 +362,32 @@ class TrialStorage(TrialStorageBase):
                 query = query.where(Trial.step > since_step)
             return session.exec(query.order_by(Trial.step)).all()
 
-    def get_similar_trials(self, query_vec: np.ndarray | torch.Tensor, 
+    def get_similar_trials(self, query_vec: np.ndarray | torch.Tensor,
                               k: int = 10, metric: str = "l2") -> list[Trial]:
-        
-        def _search_duckdb(arr: np.ndarray, k: int, metric: str) -> list[Trial]:
-            fn = DUCKDB_VECTOR_METRICS.get(metric)
-            if fn is None:
-                raise ValueError(
-                    f"Unsupported metric '{metric}' for DuckDB. "
-                    f"Choose one of: {list(DUCKDB_VECTOR_METRICS)}")
-            
-            with self._engine.connect() as conn:
-                result = conn.exec_driver_sql(
-                    f"SELECT trial_id FROM trial_vectors "
-                    f"ORDER BY {fn}(vec, ?::FLOAT[{self._vector_dim}]) LIMIT {k}",
-                    (arr.tolist(),),
-                )
-                trial_ids = [row[0] for row in result]
-
-            return trial_ids
-
-    
-        def _search_sqlite(arr: np.ndarray, k: int, metric: str) -> list[Trial]:
-            if metric != "l2":
-                raise ValueError(
-                    "sqlite-vec only supports 'l2' metric. "
-                    "Use the DuckDB backend for cosine or inner-product search.")
-            
-            with self._engine.connect() as conn:
-                result = conn.exec_driver_sql(
-                    "SELECT vec_trial_map.trial_id "
-                    "FROM vec_trials "
-                    "JOIN vec_trial_map ON vec_trials.rowid = vec_trial_map.rowid "
-                    "WHERE vec_trials.design MATCH ? AND k = ? "
-                    "ORDER BY vec_trials.distance",
-                    (arr.tobytes(), k),
-                )
-                trial_ids = [row[0] for row in result]
-            
-            return trial_ids
-
-
         if self._vector_dim is None:
             raise NotImplementedError(
                 "Vector search is not enabled. Pass vector_dim to StudyStorage.create() to enable it."
             )
+
+        if metric != "l2":
+            raise ValueError("sqlite-vec only supports the 'l2' metric.")
 
         if isinstance(query_vec, torch.Tensor):
             query_vec = query_vec.detach().cpu().numpy()
 
         arr = np.asarray(query_vec, dtype=np.float32)
 
-        match self._backend:
-            case "duckdb":
-                trial_ids =  _search_duckdb(arr, k, metric)
-            case "sqlite":
-                trial_ids =  _search_sqlite(arr, k, metric)
-            case _:
-                raise ValueError(f"Unsupported backend: {self._backend}")
-            
+        with self._engine.connect() as conn:
+            result = conn.exec_driver_sql(
+                "SELECT vec_trial_map.trial_id "
+                "FROM vec_trials "
+                "JOIN vec_trial_map ON vec_trials.rowid = vec_trial_map.rowid "
+                "WHERE vec_trials.design MATCH ? AND k = ? "
+                "ORDER BY vec_trials.distance",
+                (arr.tobytes(), k),
+            )
+            trial_ids = [row[0] for row in result]
+
         if not trial_ids: return []
         
         with Session(self._engine) as session:
@@ -460,50 +402,82 @@ class ArtifactStorage(ArtifactStorageBase):
         super().__init__(storage_name)
         self._engine = engine
 
-    def write_artifact_metadata(self, tag: str, step: int, metadata: dict) -> None:
-        pass
-
-    def load_artifact_metadata(self, tag: str, step: int | None = None) -> Optional[dict]:
-        pass
-
     def create_artifact(self, name: str, type: str, metadata: dict | None = None) -> Artifact:
         return Artifact(name, type, metadata)
 
     def save_artifact(self, artifact: Artifact, stage: str | None = None,
                       step: int | None = None) -> Artifact:
-        current_dir = Workdir.get_current_dir()
-       
-        prefix = Path(current_dir).as_posix() + "/artifacts/" + artifact.name + "/v"
-        with Session(self._engine) as session:
-            latest = session.exec(
-                select(ArtifactEntry)
-                .where(ArtifactEntry.name == artifact.name)
-                .where(ArtifactEntry.artifact_dir.startswith(prefix))
-                .order_by(ArtifactEntry.version.desc())
-            ).first()
-            version = (latest.version + 1) if latest is not None else 1
+        root = Path(Workdir.get_current_dir()).as_posix()
+        artifacts_dir = Path(root) / "artifacts" / artifact.name
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-        artifact_dir = Path(current_dir) / "artifacts" / artifact.name / f"v{version}"
+        # 1. Stage files atomically so a crash never leaves a torn version dir.
+        staging = artifacts_dir / f".staging-{uuid.uuid4().hex}"
+        try:
+            artifact._save_to_dir(staging)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+        # 2. Reserve a unique version atomically (unique constraint + retry).
+        with Session(self._engine) as session:
+            while True:
+                version = self._next_version(session, artifact.name, root)
+                entry = ArtifactEntry(
+                    name=artifact.name,
+                    type=artifact.type,
+                    version=version,
+                    step=step,
+                    stage=stage,
+                    meta=artifact._metadata,
+                    root=root,
+                )
+                session.add(entry)
+                entry_id = entry.id
+                try:
+                    session.commit()
+                    break
+                except IntegrityError:
+                    session.rollback()
+                    continue
+
+        # 3. Move the staged dir into the final versioned location.
+        final = artifacts_dir / f"v{version}"
+        if final.exists():
+            shutil.rmtree(final, ignore_errors=True)
+        try:
+            os.replace(staging, final)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            with Session(self._engine) as session:
+                entry = session.get(ArtifactEntry, entry_id)
+                if entry is not None:
+                    session.delete(entry)
+                    session.commit()
+            raise
+
         artifact._version = version
         artifact._stage = stage
         artifact._step = step
-        artifact._save_to_dir(artifact_dir)
+        artifact._write_manifest(final)
 
         with Session(self._engine) as session:
-            entry = ArtifactEntry(
-                name=artifact.name,
-                type=artifact.type,
-                version=version,
-                step=step,
-                stage=stage,
-                meta=artifact._metadata,
-                artifact_dir=str(artifact_dir),
-                filepath=str(artifact_dir / "artifact.json"),
-            )
+            entry = session.get(ArtifactEntry, entry_id)
+            entry.artifact_dir = str(final)
+            entry.filepath = str(final / "artifact.json")
             session.add(entry)
             session.commit()
 
         return artifact
+
+    def _next_version(self, session: Session, name: str, root: str) -> int:
+        latest = session.exec(
+            select(ArtifactEntry.version)
+            .where(ArtifactEntry.name == name, ArtifactEntry.root == root)
+            .order_by(ArtifactEntry.version.desc())
+            .limit(1)
+        ).first()
+        return (latest + 1) if latest is not None else 1
 
     def load_artifact(self, name: str, version: int | None = None,
                       stage: str | None = None) -> Artifact:
@@ -540,8 +514,7 @@ class ArtifactStorage(ArtifactStorageBase):
             if stage is not None:
                 query = query.where(ArtifactEntry.stage == stage)
             if subdir is not None:
-                prefix = subdir + "/artifacts/" + name + "/v"
-                query = query.where(ArtifactEntry.artifact_dir.startswith(prefix))
+                query = query.where(ArtifactEntry.root == subdir)
             query = query.order_by(ArtifactEntry.version.desc())
             latest = session.exec(query).first()
             return latest.version if latest is not None else None
@@ -568,41 +541,72 @@ class ArtifactStorage(ArtifactStorageBase):
 
 class StudyStorage(StudyStorageBase):
 
-    def __init__(self, engine: Engine, *, readonly: bool = False, vector_dim: int | None = None,
-                 backend: str = "duckdb"):
+    def __init__(self, engine: Engine, *, readonly: bool = False, vector_dim: int | None = None):
         super().__init__(db_path="")
         self._engine = engine
         self._readonly = readonly
+        self._vector_dim = vector_dim
         inspector = inspect(engine)
         if not inspector.get_table_names():  # DB is empty
             SQLModel.metadata.create_all(engine)
 
-        self._trial_storage = TrialStorage(engine, readonly, vector_dim=vector_dim, backend=backend)
+        self._trial_storage = TrialStorage(engine, readonly, vector_dim=vector_dim)
         self._workflow_storage = WorkflowStorage(engine, readonly)
         self._intermediates_storage = IntermediatesStorage(engine, readonly)
         self._artifact_storage = ArtifactStorage("artifacts", engine)
 
+    def __getstate__(self) -> dict:
+        url = self._engine.url.render_as_string(hide_password=False)
+        if url == "sqlite:///:memory:":
+            raise TypeError("In-memory study storage cannot be shared with worker processes.")
+        return {
+            "url": url,
+            "readonly": self._readonly,
+            "vector_dim": self._vector_dim,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        url = state["url"]
+        connect_args = {"check_same_thread": False} if url.startswith("sqlite:") else {}
+        engine = create_engine(url, connect_args=connect_args)
+        vector_dim = state["vector_dim"]
+        if vector_dim is not None:
+            _configure_sqlite_vec(engine, vector_dim)
+        self.__init__(
+            engine,
+            readonly=state["readonly"],
+            vector_dim=vector_dim,
+        )
+
 
     @classmethod
-    def create(cls, db_path: Path | str, *, readonly: bool = False, backend: str = "duckdb",
+    def create(cls, db_path: Path | str, *, readonly: bool = False,
                vector_dim: int | None = None) -> "StudyStorage":
-        match backend:
-            case "duckdb":
-                engine = create_engine(f"duckdb:///{db_path}", poolclass=NullPool)
-                if vector_dim is not None:
-                    _configure_duckdb_vss(engine, vector_dim)
-            case "sqlite":
-                engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
-                if vector_dim is not None:
-                    _configure_sqlite_vec(engine, vector_dim)
-            case _:
-                raise ValueError(f"Unsupported backend: {backend}")
-
-        return cls(engine, readonly=readonly, vector_dim=vector_dim, backend=backend)
+        db_path = Path(db_path).resolve()
+        if db_path.exists():
+            raise StudyStorageExistsError(
+                f"Study storage '{db_path}' already exists. Use "
+                "StudyStorage.open(...) to access the existing study."
+            )
+        
+        engine = create_engine(
+            f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+        )
+        if vector_dim is not None:
+            _configure_sqlite_vec(engine, vector_dim)
+        return cls(engine, readonly=readonly, vector_dim=vector_dim)
 
     @classmethod
-    def open(cls, db_path: Path | str, backend: str = "duckdb", vector_dim: int | None = None) -> "StudyStorage":
-        return cls.create(db_path, readonly=True, backend=backend, vector_dim=vector_dim)
+    def open(cls, db_path: Path | str, vector_dim: int | None = None) -> "StudyStorage":
+        db_path = Path(db_path).resolve()
+        if not db_path.is_file():
+            raise FileNotFoundError(f"Study storage '{db_path}' does not exist.")
+        engine = create_engine(
+            f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+        )
+        if vector_dim is not None:
+            _configure_sqlite_vec(engine, vector_dim)
+        return cls(engine, readonly=True, vector_dim=vector_dim)
     
     def close(self):
         self._engine.dispose()

@@ -1,21 +1,37 @@
-import torch
-import logging
+from __future__ import annotations
+
+from enum import Enum
+from pathlib import Path
 from abc import abstractmethod
-from typing import Any, Mapping, TYPE_CHECKING
+from typing import BinaryIO, TYPE_CHECKING
+
+import torch
 
 import dsbo
-from dsbo.modules import Module
+from dsbo.utils.io import Workdir, Output
 from dsbo.storage import get_current_storage
-from dsbo.parameters import ParameterSpace, Candidate, CandidateBatch
+from dsbo.storage.artifact import ArtifactRef
+from dsbo.utils.io.workdir import DefaultPaths
+from dsbo.modules import Module, dynamic_submodule
+from dsbo.parameters import ParameterSpace, Candidate
+from dsbo.surrogates.graph_transformations import GraphMode
 
 if TYPE_CHECKING:
     from dsbo.utils.cache import CacheConfig
 
-def implements(self, method_name: str) -> bool:
-    for cls in type(self).__mro__:
-        if method_name in cls.__dict__ and cls is not SurrogateBase:
-            return True
-    return False
+
+class LifecycleStage(Enum):
+    TRAIN = ("train", "trained")
+    PRETRAIN = ("pretrain", "pretrained")
+    FINETUNE = ("finetune", "finetuned")
+
+    @property
+    def task_name(self) -> str:
+        return self.value[0]
+
+    @property
+    def artifact_stage(self) -> str:
+        return self.value[1]
 
 
 class SurrogateStrategy:
@@ -32,137 +48,182 @@ class SurrogateStrategy:
 
 
 class SurrogateBase(Module):
-    def __init__(self, surrogate: Any, strategy: SurrogateStrategy):
+    def __init__(self, strategy: SurrogateStrategy):
         super().__init__()
-        self.surrogate = surrogate
         self.strategy = strategy
 
-    def load_from_registry(self, stage: str | None = None) -> Mapping[str, torch.Tensor]:
-        storage = get_current_storage()
-        name = type(self).__name__.lower()
-        artifact = storage.artifacts.load_artifact(name, stage=stage)
-        state_dict = artifact.get_model("model")
-        return state_dict
+        object.__setattr__(self, "_data_path", None)
+        self.model_file_path = Output(
+            Workdir.register_file(DefaultPaths.SURROGATE, f"{self._artifact_name}.pt")
+        )
 
-    def write_to_registry(self, surrogate: Any, stage: str | None = None) -> None:
-        storage = get_current_storage()
-        name = type(self).__name__.lower()
-        artifact = storage.artifacts.create_artifact(name, "model")
-        artifact.add_model(surrogate, "model")
-        storage.artifacts.save_artifact(artifact, stage=stage)
+        self._lifecycle_tasks: dict[LifecycleStage, Module] = {}
+        self._task_stages: dict[Module, LifecycleStage] = {}
 
-    @property
-    def implements_train(self) -> bool:
-        return implements(self, 'train')
+        for stage in LifecycleStage:
+            if self.implements(stage.task_name):
+                task = getattr(self, stage.task_name)
+                if isinstance(task, Module):
+                    self._lifecycle_tasks[stage] = task
+                    self._task_stages[task] = stage
+
+        if (not self._lifecycle_tasks.get(LifecycleStage.TRAIN) and 
+            not self._lifecycle_tasks.get(LifecycleStage.PRETRAIN)):
+            raise NotImplementedError(
+                f"{type(self).__name__} must implement train or pretrain "
+                "to be trained through the workflow."
+            )
+
+    def implements(self, method_name: str) -> bool:
+        for cls in type(self).__mro__:
+            if method_name in cls.__dict__ and cls is not SurrogateBase:
+                return True
+        return False
+
+    @dynamic_submodule
+    def train(self, design, **kwargs):
+        raise NotImplementedError(f"{type(self).__name__} does not implement train.")
+
+    @dynamic_submodule
+    def pretrain(self, design, **kwargs):
+        raise NotImplementedError(f"{type(self).__name__} does not implement pretrain.")
+
+    @dynamic_submodule
+    def finetune(self, design, **kwargs):
+        raise NotImplementedError(f"{type(self).__name__} does not implement finetune.")
     
-    @property
-    def implements_pretrain(self) -> bool:
-        return implements(self, 'pretrain')
-    
-    @property
-    def implements_finetune(self) -> bool:
-        return implements(self, 'finetune')
-    
-    @property
-    def implements_pretrain_and_finetune(self) -> bool:
-        return self.implements_pretrain and self.implements_finetune
+    def generate_training_candidates(self, candidate: Candidate, training_task: Module):
+        finetune = self._lifecycle_tasks.get(LifecycleStage.FINETUNE) is training_task
+        return self.strategy.generate_candidates(candidate, candidate.space, finetune=finetune)
 
-    @property
-    def _is_pretrained(self) -> bool:
+    @abstractmethod
+    def state_dict(self) -> dict:
+        ...
+
+    @abstractmethod
+    def from_state_dict(self, state: dict) -> None:
+        ...
+        
+    def save_to_file(self, model_file: str | Path) -> None:
+        torch.save(self.state_dict(), model_file)
+
+    def load_from_file(self, model_file: str | Path | BinaryIO) -> None:
+        self.from_state_dict(
+            torch.load(model_file, weights_only=True, map_location="cpu")
+        )
+
+    def publish_trained_model(self, model_file: str, stage: str = "trained") -> ArtifactRef:
         storage = get_current_storage()
-        if storage is None:
-            return False
-        name = type(self).__name__.lower()
-        # Accept any of the trained stages — "pretrained", "trained", "finetuned"
-        # Models saved via the single-phase train() path use stage="trained",
-        # which is functionally equivalent to being pretrained. However usually this shouldnt happen
-        # since train and pretrain/finetune require individual implementaitons.
-        return (storage.artifacts.latest_version(name, stage="pretrained") is not None or
-                storage.artifacts.latest_version(name, stage="trained") is not None)
+        artifact = storage.artifacts.create_artifact(self._artifact_name, "model")
+        artifact.add_file(model_file, name="model.pt")
+        return storage.artifacts.save_artifact(artifact, stage=stage).ref
 
-    @property
-    def _is_finetuned(self) -> bool:
-        # NOTE: _is_finetuned only returns if there exists any finetuned version of the model,
-        # the surrogate strategy decides if this is still usable
-        storage = get_current_storage()
-        if storage is None:
-            return False
-        name = type(self).__name__.lower()
-        return (storage.artifacts.latest_version(name, stage="finetuned") is not None or
-                storage.artifacts.latest_version(name, stage="trained") is not None)
-
-    def train(self, candidate: Candidate, workflow_callback: Any):
-        pass
-
-    def pretrain(self, candidate: Candidate, workflow_callback: Any):
-        pass
-
-    def finetune(self, candidate: Candidate, workflow_callback: Any):
-        pass
-
-    def fit(self, candidate: Candidate, workflow_callback: Any):
-        use_cache = self._use_cached_models()
-        name = type(self).__name__.lower()
-
-        if self.implements_train:
-            if use_cache:
-                try:
-                    state_dict = self.load_from_registry()
-                    self.load_state_dict(state_dict)
-                    return
-                except Exception as exc:
-                    pass
-
-            self.surrogate = self.train(candidate, workflow_callback)
-            self.write_to_registry(self.surrogate, stage="pretrained")
-    
-
-        elif self.implements_pretrain_and_finetune:
-            if use_cache:
-                if self._is_pretrained:
-                    state_dict = self.load_from_registry()
-                    self.surrogate.load_state_dict(state_dict)
-                    self.surrogate = self.finetune(candidate, workflow_callback)
-                    self.write_to_registry(self.surrogate, stage="finetuned")
-                else:
-                    self.surrogate = self.pretrain(candidate, workflow_callback)
-                    self.write_to_registry(self.surrogate, stage="pretrained")
-            else:
-                self.surrogate = self.pretrain(candidate, workflow_callback)
-                self.surrogate = self.finetune(candidate, workflow_callback)
-        else:
-            raise NotImplementedError("Surrogate must implement either 'train' or both 'pretrain' and 'finetune' methods.")
+    def patch(self, surrogate: SurrogateBase):
+        raise RuntimeError(
+            f"A surrogate ({type(self).__name__}) cannot be patched with another "
+            "surrogate; surrogates cannot contain surrogates."
+        )
 
     def is_in_trust_region(self, candidate: Candidate) -> bool:
-        pretrained = self._is_pretrained
-        finetuned  = self._is_finetuned
-        if not pretrained and not finetuned:
+        if not self.is_pretrained and not self.is_finetuned:
             return False
+                
+        return self.strategy.is_in_trust_region(candidate)
 
-        result = self.strategy.is_in_trust_region(candidate)
-        return result
+    def training_stage(self, task: Module) -> str:
+        stage = self._task_stages.get(task)
+        if stage is None:
+            raise ValueError(f"{task.name} is not a lifecycle task of {type(self).__name__}.")
+        return stage.artifact_stage
+        
+    def select_training_task(self, candidate: Candidate) -> Module | None:
+        if self._use_cached_models() and self.is_in_trust_region(candidate):
+            return None
 
+        return self._lifecycle_tasks[self._get_next_stage()]
+
+    def get_runtime_model(self):
+        ref = self._resolve_model_ref()
+        storage = get_current_storage()
+        checkpoint = storage.artifacts.load_file(ref, "model.pt")
+        self.load_from_file(checkpoint)
+        return self.surrogate
+
+    def _resolve_model_ref(self) -> ArtifactRef:
+        storage = get_current_storage()
+        name = self._artifact_name
+        for stage in (LifecycleStage.FINETUNE, LifecycleStage.PRETRAIN, LifecycleStage.TRAIN):
+            artifact_stage = stage.artifact_stage
+            version = storage.artifacts.latest_version(name, stage=artifact_stage)
+            if version is not None:
+                return ArtifactRef(name, "model", version, artifact_stage)
+        raise RuntimeError(f"No trained model artifact exists for '{name}'.")
+
+    
+    def _get_next_stage(self) -> LifecycleStage:
+        if self.implements_finetune and self.is_pretrained:
+            return LifecycleStage.FINETUNE
+        if self.implements_pretrain:
+            return LifecycleStage.PRETRAIN
+        return LifecycleStage.TRAIN
+
+    def _has_artifact_for(self, *stages: LifecycleStage) -> bool:
+            if not (storage := get_current_storage()):
+                return False
+            
+            return any(
+                storage.artifacts.latest_version(self._artifact_name, stage=stage.artifact_stage) is not None
+                for stage in stages
+            )
+    
     def _use_cached_models(self) -> bool:
         from dsbo.utils.cache import CachePolicy
-        from dsbo.surrogates.graph_transformations import GraphMode
-
+        
         cache_config: CacheConfig = dsbo.config.get("cache_config")
         if cache_config is None:
-            return False
+            return True
 
         if cache_config.cache_policy == CachePolicy.RETRAIN_SURROGATES:
             return False
 
         result = cache_config.should_cache(GraphMode.DEFAULT)
         return result
+
+    @property
+    def implements_train(self) -> bool:
+        return LifecycleStage.TRAIN in self._lifecycle_tasks
     
+    @property
+    def implements_pretrain(self) -> bool:
+        return LifecycleStage.PRETRAIN in self._lifecycle_tasks
+    
+    @property
+    def implements_finetune(self) -> bool:
+        return LifecycleStage.FINETUNE in self._lifecycle_tasks
+    
+    @property
+    def implements_pretrain_and_finetune(self) -> bool:
+        return self.implements_pretrain and self.implements_finetune
+
     @property
     def is_available(self):
         from dsbo.utils.cache import CachePolicy
-        cache_config: CacheConfig = dsbo.config.get("cache_config")
+        cache_config: CacheConfig | None = dsbo.config.get("cache_config")
         exceptions = (CachePolicy.RETRAIN_SURROGATES, CachePolicy.ALWAYS_EXECUTE)
-        if cache_config.cache_policy in exceptions:
-            return False
+
+        if cache_config is None or cache_config.cache_policy not in exceptions:
+            return self.is_pretrained or self.is_finetuned
         
-        return self._is_pretrained or self._is_finetuned
-    
+        return False
+
+    @property
+    def is_pretrained(self) -> bool:
+        return self._has_artifact_for(LifecycleStage.PRETRAIN, LifecycleStage.TRAIN)
+
+    @property
+    def is_finetuned(self) -> bool:
+        return self._has_artifact_for(LifecycleStage.FINETUNE)
+
+    @property
+    def _artifact_name(self) -> str:
+        return type(self).__name__.lower()

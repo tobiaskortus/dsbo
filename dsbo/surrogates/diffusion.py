@@ -183,7 +183,7 @@ class Trainer:
         else:
             self._lr_scheduler_needs_metric = False
 
-    def step(self, x0, cond) -> float:
+    def _batch_loss(self, x0, cond) -> torch.Tensor:
         x0, cond = x0.to(self.device), cond.to(self.device)
         B = x0.shape[0]
         t = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=self.device).long()
@@ -193,7 +193,10 @@ class Trainer:
 
         pred = self.model(x_t, t, cond).sample
         # Model outputs (B, 1, n) — squeeze to match target (B, n)
-        loss = F.mse_loss(pred.squeeze(1), target)
+        return F.mse_loss(pred.squeeze(1), target)
+
+    def step(self, x0, cond) -> float:
+        loss = self._batch_loss(x0, cond)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -205,9 +208,21 @@ class Trainer:
 
         return loss.item()
 
-    def fit(self, n_epochs: int, dataloader: DataLoader, show_progress: bool = True) -> list[float]:
+    def fit(
+        self,
+        n_epochs: int,
+        dataloader: DataLoader,
+        val_dataloader: DataLoader | None = None,
+        patience: int | None = None,
+        show_progress: bool = True,
+    ) -> list[float]:
         self.model.train()
         epoch_losses = []
+        val_losses = []
+        best_val = float("inf")
+        best_model_state = None
+        best_ema_state = None
+        epochs_no_improve = 0
         outer = range(n_epochs)
         if show_progress:
             outer = tqdm(outer, desc="Epochs")
@@ -216,6 +231,7 @@ class Trainer:
         storage = get_current_storage()
 
         for epoch in outer:
+            self.model.train()
             epoch_loss = 0.0
             pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False)
             for x0, cond in pbar:
@@ -238,5 +254,39 @@ class Trainer:
 
             if storage is not None and self._model_tag is not None:
                 storage.intermediates.add_scalar(f"{self._model_tag}/mse_loss", epoch, avg)
+
+            if val_dataloader is not None:
+                self.model.eval()
+                val_sum = 0.0
+                with torch.no_grad():
+                    for x0, cond in val_dataloader:
+                        val_sum += self._batch_loss(x0, cond).item()
+                val_avg = val_sum / len(val_dataloader)
+                val_losses.append(val_avg)
+                self.model.train()
+
+                if storage is not None and self._model_tag is not None:
+                    storage.intermediates.add_scalar(f"{self._model_tag}/val_mse_loss", epoch, val_avg)
+
+                if val_avg < best_val:
+                    best_val = val_avg
+                    best_model_state = {
+                        k: v.detach().clone() for k, v in self.model.state_dict().items()
+                    }
+                    if self.ema_model is not None:
+                        best_ema_state = {
+                            k: v.detach().clone() for k, v in self.ema_model.state_dict().items()
+                        }
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    if patience is not None and epochs_no_improve >= patience:
+                        break
+
+        if best_model_state is not None:
+            # Keep the best-validating weights, not the final epoch's.
+            self.model.load_state_dict(best_model_state)
+            if self.ema_model is not None and best_ema_state is not None:
+                self.ema_model.load_state_dict(best_ema_state)
 
         return epoch_losses

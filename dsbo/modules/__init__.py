@@ -3,18 +3,23 @@ from __future__ import annotations
 import inspect
 import weakref
 from abc import ABC
-from functools import wraps
+from functools import partial, wraps
 from typing import Optional, Callable, TYPE_CHECKING
 
-from dsbo.utils.io import Output, Input
 from dsbo.autograd import autograd_context
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.modules.dsl import ModuleDslMixin
 from contextlib import nullcontext, suppress
-from dsbo.utils.io import Workdir, get_workdir
 from dsbo.utils.compile import dryrunnable, is_dry_run
-from dsbo.utils.functools import auto_wrap, ensure_dict_return
-from dsbo.utils.io import  AbstractFilePath, with_remote_workdir
+from dsbo.utils.io import (
+    AbstractFilePath,
+    Input,
+    Output,
+    Workdir,
+    get_workdir,
+    with_remote_workdir,
+)
+from dsbo.utils.io.workdir import DefaultPaths
 
 if TYPE_CHECKING:
     from dsbo.worker.spec import WorkerSpec
@@ -42,6 +47,7 @@ def auto_wrap(cls, method_name, *decorators):
 
 
 class Module(ModuleDslMixin, ABC):
+    requires_design_tensor = False
 
     def __init__(self):
         self._registered_files: dict[str, AbstractFilePath] = {}
@@ -96,6 +102,12 @@ class Module(ModuleDslMixin, ABC):
     def patch(self, surrogate: ModuleSurrogate):
         surrogate.register_contract(self.surrogate_contract)
         self.surrogate = surrogate
+        surrogate.model_file_path = Output(
+            Workdir.register_file(
+                DefaultPaths.SURROGATE,
+                f"{surrogate._artifact_name}_{self.name}.pt",
+            )
+        )
         return self
 
     @property
@@ -113,11 +125,14 @@ class Module(ModuleDslMixin, ABC):
                 return self(design=design, **kwargs)
 
     @with_remote_workdir
-    def run_backward(self, design: dict, grad_output: dict | None = None) -> None:
+    def run_backward(self, design: dict, grad_output: dict | None = None, design_tensor: torch.Tensor | None = None) -> None:
         with Workdir.use_file_suffix(str(self.i)) if self.i is not None else nullcontext():
-            self.backward(design, grad_output)
+            if design_tensor is None:
+                self.backward(design, grad_output)
+            else:
+                self.backward(design, grad_output, design_tensor=design_tensor)
 
-    def backward(self, design: dict, grad_output: dict | None = None) -> None:
+    def backward(self, design: dict, grad_output: dict | None = None, **kwargs) -> None:
         pass
 
     def to(self, resource: WorkerSpec) -> Module:
@@ -147,6 +162,15 @@ class Module(ModuleDslMixin, ABC):
     @property
     def registered_outputs(self) -> list[AbstractFilePath]:
         return list(self._registered_outputs)
+
+
+def _restore_dynamic_submodule(parent, method_name, bindings, index, resources):
+    submodule = getattr(parent, method_name)
+    if bindings:
+        submodule.bind(**bindings)
+    submodule.i = index
+    submodule.resources = resources
+    return submodule
 
 
 def dynamic_submodule(wrapped_fn):
@@ -202,6 +226,7 @@ def dynamic_submodule(wrapped_fn):
                     object.__setattr__(self, "_parent", parent)
                     object.__setattr__(self, "_func", func)        
                     object.__setattr__(self, "_backward", backward)
+                    object.__setattr__(self, "_bound", partial(func, parent))
 
                     if backward is not None:
                         def backward_fn(design, grad_outputs=None):
@@ -210,14 +235,21 @@ def dynamic_submodule(wrapped_fn):
                         object.__setattr__(self, "backward", backward_fn)
 
                 def __setattr__(self, name, value):
-                    if name in ("_parent", "fn", "i", "resources") or name.startswith("_"):
+                    if name in ("_parent", "_func", "_backward", "fn", "i", "resources") or name.startswith("_"):
                         object.__setattr__(self, name, value)
                     else:
                         setattr(self._parent, name, value)
 
+                def bind(self, **kwargs):
+                    self._bound = partial(self._func, self._parent, **kwargs)
+                    return self
+
+                def binding(self, name):
+                    return self._bound.keywords[name]
+
                 def __call__(self, design, **kwargs):
                     try:
-                        return self._func(self._parent, design, **kwargs)
+                        return self._bound(design, **kwargs)
                     except Exception as e:
                         tb = e.__traceback__
                         if tb is not None:
@@ -228,7 +260,16 @@ def dynamic_submodule(wrapped_fn):
                     return getattr(self._parent, name)
 
                 def __reduce__(self):
-                    return (getattr, (self._parent, self._func.__name__))
+                    return (
+                        _restore_dynamic_submodule,
+                        (
+                            self._parent,
+                            self._func.__name__,
+                            self._bound.keywords,
+                            getattr(self, "i", None),
+                            getattr(self, "resources", None),
+                        ),
+                    )
             
                 
                 @property
@@ -243,6 +284,10 @@ def dynamic_submodule(wrapped_fn):
                 @property
                 def registered_outputs(self) -> list[AbstractFilePath]:
                     return self._parent.registered_outputs
+
+                @property
+                def registered_files(self) -> dict[str, AbstractFilePath]:
+                    return self._parent.registered_files
 
             submodule = self._submodule_cache.get(obj)
 
