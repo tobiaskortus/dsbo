@@ -20,6 +20,17 @@ from dsbo.surrogates.diffusion import MlpDiffusion1D, Trainer
 from dsbo.utils.io.workdir import AbstractFilePath, PathAnnotation
 
 
+def _flatten_design(design: dict) -> torch.Tensor:
+    """Flatten a design dict into a 1D float tensor, expanding any vector-valued entries."""
+    parts = []
+    for v in design.values():
+        if isinstance(v, torch.Tensor):
+            parts.append(v.detach().reshape(-1).float())
+        else:
+            parts.append(torch.tensor(v, dtype=torch.float32).reshape(-1))
+    return torch.cat(parts) if parts else torch.empty(0, dtype=torch.float32)
+
+
 class ModuleSurrogateContract:
     def __init__(
         self,
@@ -71,7 +82,7 @@ class ModuleSurrogateContract:
         if self.conditional_file is not None:
             cond = self.output_conditional_fn(design) \
                 if self.output_conditional_fn is not None \
-                else torch.tensor(list(design.values()), dtype=torch.float32)
+                else _flatten_design(design)
             Storage.write_primal(self.conditional_file(), cond.detach().cpu().numpy())
 
     def __repr__(self) -> str:
@@ -146,7 +157,7 @@ class DiffusersModuleSurrogate(ModuleSurrogate):
             raise RuntimeError("Surrogate not trained.")
         cond = self.contract.output_conditional_fn(design) \
             if self.contract.output_conditional_fn is not None \
-            else torch.tensor(list(design.values()), dtype=torch.float32)
+            else _flatten_design(design)
         if cond.ndim == 1:
             cond = cond.unsqueeze(0)
 

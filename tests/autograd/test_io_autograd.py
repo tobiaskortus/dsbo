@@ -642,3 +642,72 @@ def test_workflow_surrogate_normalization_uses_train_rows_only(file_backend):
             # And it must NOT equal the whole-data mean (which would leak val).
             whole = torch.as_tensor(ys, dtype=torch.float32).mean()
             assert not torch.allclose(train_mean_y, whole)
+
+
+def test_hdf5_file_primal_only():
+    #dual_level==-1 and no_grad
+    with torch.no_grad():
+        x = torch.tensor([1.0, 2.0])
+        x = x * 3
+
+        with TemporaryDirectory() as tempdir:
+            file_path = os.path.join(tempdir, "x.h5")
+            HDF5File.write(file_path, x)
+            x_loaded = HDF5File.open(file_path, "cpu")
+
+            torch.testing.assert_close(x_loaded, torch.tensor([3.0, 6.0]))
+
+
+def test_hdf5_file_distributed_contributions_accumulate_without_coordinator():
+    with TemporaryDirectory() as tempdir:
+        file_path = os.path.join(tempdir, "x.h5")
+        HDF5File.write(file_path, torch.tensor([1.0, 2.0]))
+        for scale in (2.0, 3.0):
+            with torch.enable_grad():
+                value = HDF5File.open(file_path, "cpu")
+                (value * scale).sum().backward()
+
+        gradient = HDF5File.read_backward_gradient(file_path)
+
+        torch.testing.assert_close(gradient, torch.tensor([5.0, 5.0]))
+
+
+@pytest.mark.parametrize("columns", [None, ["first", "second"]])
+def test_hdf5_reduced_gradient_accumulates_only_new_contributions(columns):
+    HDF5File.reset_gradient_state()
+    with TemporaryDirectory() as tempdir:
+        sources = [os.path.join(tempdir, f"source_{i}.h5") for i in range(2)]
+        for index, source in enumerate(sources):
+            order = columns[::-1] if columns is not None and index else columns
+            HDF5File.write(source, torch.ones((2, 1)), columns=order)
+        reduced = os.path.join(tempdir, "reduced.h5")
+        HDF5File.reduce(sources, reduced)
+
+        weights = (torch.tensor([[1.0], [3.0], [1.0], [3.0]]) if columns is None
+                   else torch.tensor([[1.0, 1.0], [3.0, 3.0]]))
+        for _ in range(2):
+            (HDF5File.open(reduced, "cpu") * weights).sum().backward()
+
+        for index, source in enumerate(sources):
+            expected = (weights[:2, 0] if columns is None else weights[:, index])
+            expected = (expected * 2).reshape(2, 1)
+            if columns is not None and index:
+                expected = expected.flip(0)
+            torch.testing.assert_close(HDF5File.read_backward_gradient(source), expected)
+
+
+def test_hdf5_nested_reduced_gradient_reaches_leaf_sources():
+    HDF5File.reset_gradient_state()
+    with TemporaryDirectory() as tempdir:
+        sources = [os.path.join(tempdir, f"source_{i}.h5") for i in range(3)]
+        for source in sources:
+            HDF5File.write(source, torch.tensor([1.0]))
+        intermediate = os.path.join(tempdir, "intermediate.h5")
+        reduced = os.path.join(tempdir, "reduced.h5")
+        HDF5File.reduce(sources[:2], intermediate)
+        HDF5File.reduce([intermediate, sources[2]], reduced)
+
+        HDF5File.open(reduced, "cpu").sum().backward()
+
+        for source in sources:
+            torch.testing.assert_close(HDF5File.read_backward_gradient(source), torch.tensor([1.0]))

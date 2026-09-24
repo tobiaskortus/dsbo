@@ -10,7 +10,8 @@ from dsbo.workflow import (
     run_batch, run_batch_reverse_autograd, Workflow,
 )
 from dsbo.worker.dask import WorkerContext
-from dsbo.utils.io import Workdir
+from dsbo.utils.io import Input, Output, Workdir
+from dsbo.utils.io.storage.hdf5 import HDF5File
 from tests.workflow.conftest import (
     MockDaskWorker, LocalDaskWorker, make_mock_worker,
     SimpleModule, BackwardModule, NoGradModule, FailingModule,
@@ -164,7 +165,7 @@ class TestDistributedRunBatchReverseAutograd:
 
         worker = MockDaskWorker()
         def mock_schedule_bwd(module, candidate, grad_output=None,
-                              dependencies=(), priority=None):
+                              dependencies=(), priority=None, file_overlays=None):
             scheduled_order.append(module.name)
             tid = UUID(int=len(scheduled_order), version=4)
             delayed = MagicMock()
@@ -365,3 +366,53 @@ class TestDistributedRunBatchReverseAutogradRealCluster:
 
         assert len(grads) == 1
         assert torch.allclose(grads[0], torch.zeros(1))
+
+    def test_backward_uses_reduced_replica_outputs(self, local_worker):
+        shared_file = Workdir.register_file("simulation", "events.h5")
+
+        class Producer(Module):
+            def __init__(self):
+                super().__init__()
+                self.output = Output(shared_file)
+
+            def __call__(self, design, **kwargs):
+                HDF5File.write(self.output(), design["x"].reshape(1))
+
+            def backward(self, design, grad_output=None):
+                gradient = HDF5File.read_backward_gradient(self.output())
+                design["x"].backward(gradient.reshape_as(design["x"]))
+
+        class Consumer(Module):
+            def __init__(self):
+                super().__init__()
+                self.input = Input(shared_file)
+
+            def _loss(self):
+                return HDF5File.open(self.input(), "cpu").square().sum()
+
+            def __call__(self, design, **kwargs):
+                return {"loss": self._loss()}
+
+            def backward(self, design, grad_output=None):
+                self._loss().backward(grad_output["loss"])
+
+        workflow = Workflow(Producer() * 2 >> Consumer())
+        candidate = Candidate(
+            ParameterSpace(x=Continuous(0, 10)),
+            torch.tensor([3.0], requires_grad=True),
+        )
+
+        with WorkerContext.use_worker(local_worker):
+            result = workflow.run(candidate)
+            gradient = torch.autograd.grad(result["loss"], candidate.tensor)[0]
+
+            replica_gradients = [
+                HDF5File.read_backward_gradient(
+                    Workdir.resolve_file(shared_file, suffix=index, use_overlays=False)
+                )
+                for index in range(2)
+            ]
+
+        torch.testing.assert_close(gradient, torch.tensor([12.0]))
+        for replica_gradient in replica_gradients:
+            torch.testing.assert_close(replica_gradient, torch.tensor([6.0]))

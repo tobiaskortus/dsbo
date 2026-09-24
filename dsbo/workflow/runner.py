@@ -204,11 +204,12 @@ def run_batch_reverse_autograd(
 
     G = workflow.task_graph
     tasks_rev = list(reversed(list(nx.topological_sort(G))))
+    subdirs = candidate_subdirs(len(candidates))
     progress = tqdm(total=len(candidates) * len(tasks_rev), desc=f"Running workflow (reverse) [{workflow.graph_context.mode.value}]", unit="tasks")
 
     if worker is None:
         gradients = []
-        for candidate, candidate_grad_output in zip(candidates, grad_outputs):
+        for index, (candidate, candidate_grad_output) in enumerate(zip(candidates, grad_outputs)):
             try:
                 grad_candidate = candidate.detach().requires_grad_()
                 with torch.enable_grad():
@@ -223,6 +224,8 @@ def run_batch_reverse_autograd(
                             grad_candidate.values,
                             candidate_grad_output if is_sink else None,
                             design_tensor=design_tensor,
+                            subdir=subdirs[index],
+                            file_overlays=file_overlays(G, task, index, subdirs),
                         )
                         progress.update()
                 gradients.append(
@@ -265,6 +268,7 @@ def run_batch_reverse_autograd(
                     task_id, delayed_obj = worker.schedule_backward(
                         task, candidate, grad_output=task_grad_output,
                         dependencies=dependencies, priority=depth,
+                        file_overlays=file_overlays(G, task, i, subdirs),
                     )
                     delayed_map[task] = delayed_obj
                     task_ids.append(task_id)

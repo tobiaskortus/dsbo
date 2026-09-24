@@ -54,6 +54,21 @@ class WorkerSpec(ABC):
     def resources(self) -> dict[str, int]:
         return {self.resource_key: 1}
 
+    def _scope_suffix(self) -> str:
+        """Disambiguate specs that share hardware but differ in scheduling scope.
+
+        Two specs with the same cores/memory but different scaling bounds (or SLURM
+        accounts that collide after sanitising) must not share a cluster spec key,
+        otherwise their worker pools are silently merged.
+        """
+        suffix = ""
+        if self.min_worker is not None or self.max_worker is not None:
+            suffix += f"__workers_{self.min_worker}_{self.max_worker}"
+        account = getattr(self, "account", None)
+        if account is not None:
+            suffix += f"__account_{account.encode().hex()}"
+        return suffix
+
     @classmethod
     def default_local(cls) -> LocalWorkerSpec:
         def _format_memory(value: float) -> str:
@@ -85,7 +100,7 @@ class LocalWorkerSpec(WorkerSpec):
 
     @property
     def spec_key(self) -> str:
-        return sanitize(f"local_{self.cores}c_{self.processes}p_{self.memory}")
+        return sanitize(f"local_{self.cores}c_{self.processes}p_{self.memory}") + self._scope_suffix()
     
 
     def get_spec_dict(self) -> dict[str, any]:
@@ -121,7 +136,7 @@ class SLURMWorkerSpec(WorkerSpec):
             str(self.cores),
             str(self.gpu_resources or ""),
         ])
-        return sanitize(raw)
+        return sanitize(raw) + self._scope_suffix()
     
     def get_spec_dict(self) -> dict[str, any]:
         return {self.spec_key: {

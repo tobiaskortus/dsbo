@@ -133,7 +133,15 @@ class DaskWorkerBase:
 
         return task_id, delayed_obj
 
-    def schedule_backward(self, module: Module, candidate, grad_output=None, dependencies: Iterable = (), priority: int | None = None) -> tuple[uuid.UUID, Delayed]:
+    def schedule_backward(
+        self,
+        module: Module,
+        candidate,
+        grad_output=None,
+        dependencies: Iterable = (),
+        priority: int | None = None,
+        file_overlays=None,
+    ) -> tuple[uuid.UUID, Delayed]:
         suffix = get_file_suffix()
         subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
@@ -152,6 +160,7 @@ class DaskWorkerBase:
                     grad_candidate.values, grad_output,
                     design_tensor=design_tensor,
                     workdir=workdir, suffix=suffix, subdir=subdir,
+                    file_overlays=file_overlays,
                 )
             return task_id, grad_candidate.grad.clone() if grad_candidate.grad is not None else None
 
@@ -193,10 +202,7 @@ class HeterogeneousDaskWorker(DaskWorkerBase):
             adapt_config[spec.spec_key] = (spec.min_worker, spec.max_worker)
 
         self.cluster = HybridCluster(spec=cluster_spec, log_directory=logdir)
-        if all(minimum == maximum for minimum, maximum in adapt_config.values()):
-            self.cluster.scale({key: minimum for key, (minimum, _) in adapt_config.items()})
-        else:
-            self.cluster.adapt(adapt_config)
+        self.cluster.adapt(adapt_config, interval="5s", wait_count=6)
         super().__init__(self.cluster)
 
     @classmethod

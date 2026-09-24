@@ -148,6 +148,30 @@ class HDF5File(AutogradFileInterface):
 
     @classmethod
     def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
+        primal_path = cls._primal_path(grad_path)
+        cls._save_gradient_file(grad_path, gradient, columns)
+        cls._propagate_vds_gradient(primal_path, gradient, columns)
+
+    @classmethod
+    def _propagate_vds_gradient(
+        cls,
+        primal_path: str,
+        gradient: np.ndarray,
+        columns: list[str] | None = None,
+    ) -> None:
+        if columns is None:
+            with h5py.File(primal_path, "r") as file:
+                primal = file["primal"]
+                columns = cls._stored_columns(primal) if isinstance(primal, h5py.Group) else None
+
+        for source_path, source_gradient in cls._split_vds_gradient(primal_path, gradient, columns):
+            source_grad_path = cls._gradient_path(source_path)
+            cls._save_gradient_file(source_grad_path, source_gradient, columns)
+            cls._gradient_written.add(source_grad_path)
+            cls._propagate_vds_gradient(source_path, source_gradient, columns)
+
+    @classmethod
+    def _save_gradient_file(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
         if columns is None:
             columns = cls._gradient_primal_columns(grad_path)
         if columns is not None and grad_path in cls._gradient_written:
@@ -168,15 +192,74 @@ class HDF5File(AutogradFileInterface):
         cls._write_datasets(grad_path, columns=columns, gradient=gradient)
 
     @classmethod
+    def _split_vds_gradient(
+        cls,
+        primal_path: str,
+        gradient: np.ndarray,
+        columns: list[str] | None,
+    ) -> list[tuple[str, np.ndarray]]:
+        with h5py.File(primal_path, "r") as file:
+            manifest = file.attrs.get(cls.VDS_SOURCES_ATTRIBUTE)
+            if manifest is None:
+                return []
+            cls._validate_vds_sources(file)
+            relative_sources = json.loads(manifest)
+            primal = file["primal"]
+            selected_columns = (
+                cls._validate_columns(columns)
+                if columns is not None else cls._stored_columns(primal)
+                if isinstance(primal, h5py.Group) else None
+            )
+
+        source_paths = [
+            os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(primal_path)), source))
+            for source in relative_sources
+        ]
+        if selected_columns is None:
+            shapes = []
+            for source_path in source_paths:
+                with h5py.File(source_path, "r") as source:
+                    shapes.append(source["primal"].shape)
+            return list(zip(source_paths, cls._split_values(gradient, shapes), strict=True))
+
+        source_gradients: list[list[np.ndarray]] = [[] for _ in source_paths]
+        for column_index, column in enumerate(selected_columns):
+            shapes = []
+            for source_path in source_paths:
+                with h5py.File(source_path, "r") as source:
+                    shapes.append(source[f"primal/{column}"].shape)
+            for values, source_values in zip(
+                source_gradients,
+                cls._split_values(gradient[column_index], shapes),
+                strict=True,
+            ):
+                values.append(source_values)
+        return [
+            (source_path, np.stack(values, axis=0))
+            for source_path, values in zip(source_paths, source_gradients, strict=True)
+        ]
+
+    @staticmethod
+    def _split_values(values: np.ndarray, shapes: list[tuple[int, ...]]) -> list[np.ndarray]:
+        if shapes[0] == ():
+            return [np.asarray(value) for value in values]
+        boundaries = np.cumsum([shape[0] for shape in shapes[:-1]])
+        return list(np.split(values, boundaries, axis=0))
+
+    @classmethod
     def _gradient_primal_columns(cls, grad_path: str) -> list[str] | None:
-        base, extension = os.path.splitext(grad_path)
-        suffix = "_gradient"
-        if not base.endswith(suffix):
+        primal_path = cls._primal_path(grad_path)
+        if primal_path == grad_path:
             return None
-        primal_path = f"{base[:-len(suffix)]}{extension}"
         with h5py.File(primal_path, "r") as file:
             primal = file["primal"]
             return cls._stored_columns(primal) if isinstance(primal, h5py.Group) else None
+
+    @staticmethod
+    def _primal_path(grad_path: str) -> str:
+        base, extension = os.path.splitext(grad_path)
+        suffix = "_gradient"
+        return f"{base[:-len(suffix)]}{extension}" if base.endswith(suffix) else grad_path
 
     @classmethod
     def read_backward_gradient(cls, fpath: str) -> torch.Tensor:
