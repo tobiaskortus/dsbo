@@ -1,7 +1,7 @@
 import pytest
 import torch
 from unittest.mock import MagicMock
-from dsbo.workflow import FusedModule
+from dsbo.modules import FusedModule
 from tests.workflow.conftest import SimpleModule
 
 

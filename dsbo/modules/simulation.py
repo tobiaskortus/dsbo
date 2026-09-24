@@ -7,7 +7,6 @@ from dask.distributed import Client, LocalCluster
 
 from dsbo.modules import Module
 from dsbo.container import ContainerWrapperBase
-from dsbo.transforms import SimulationTransform
 from dsbo.utils.io import Workdir, get_file_suffix, get_subdir, get_workdir, with_remote_workdir
 
 

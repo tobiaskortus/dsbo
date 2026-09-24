@@ -1,7 +1,10 @@
 from __future__ import annotations
 import functools
 
+import uuid
 import torch
+import tempfile
+import warnings
 import contextvars
 import numpy as np
 import networkx as nx
@@ -11,7 +14,7 @@ from contextlib import contextmanager
 from typing import Callable, Dict, Generator, List, Mapping, Optional, TYPE_CHECKING
 
 from dsbo.utils.functools import auto_wrap
-from dsbo.storage.artifact import Artifact
+from dsbo.storage.artifact import Artifact, ArtifactRef
 
 if TYPE_CHECKING:
     from dsbo.utils.plugins import TaskStreamPlugin
@@ -30,6 +33,7 @@ class TransitionWriter(ABC):
         exec_id: str,
         log: str,
         status: JobStatus,
+        tag: str = "",
     ) -> None:
         pass
 
@@ -38,16 +42,41 @@ _current_storage: contextvars.ContextVar[StudyStorageBase | None] = contextvars.
 
 
 @contextmanager
-def use_storage(storage: StudyStorageBase) -> Generator[StudyStorageBase, None, None]:
+def use_storage(storage: StudyStorageBase | None) -> Generator[StudyStorageBase | None, None, None]:
+    if storage is None:
+        yield None
+        return
+
     token = _current_storage.set(storage)
     try:
         yield storage
     finally:
         _current_storage.reset(token)
-    
 
-def get_current_storage() -> Optional[StudyStorageBase]:
-    return _current_storage.get()
+
+def get_current_storage(create: bool = True) -> Optional[StudyStorageBase]:
+    storage = _current_storage.get()
+    if storage is not None:
+        return storage
+
+    if not create:
+        return None
+
+    from dsbo.storage.sqlmodel import StudyStorage
+    storage = StudyStorage.create(default_storage_path())
+    _current_storage.set(storage)
+    warnings.warn(
+        "No study storage is set; generated a new temporary storage, which is "
+        "maintained as the default for the current session and is not reset. "
+        "It persists on disk in the system temp directory, which may cause "
+        "side effects. Set an explicit storage with use_storage(...) to avoid this.",
+        stacklevel=2,
+    )
+    return storage
+
+
+def default_storage_path() -> Path:
+    return Path(tempfile.gettempdir()) / f"study_storage_{uuid.uuid4()}.db"
 
 
 
@@ -92,11 +121,11 @@ class WorkflowStorageBase(ABC):
     def get_job_traces(self, exec_id: str, after_trace_id: Optional[int] = None) -> List[JobTrace]:
         pass
 
-    def create_task_stream_plugin(self, task_map: Dict[str, str] | None = None, name_map: Dict[str, str] | None = None) -> TaskStreamPlugin:
+    def create_task_stream_plugin(self, task_map: Dict[str, str | tuple[str, ...]] | None = None, name_map: Dict[str, str] | None = None, tag: str = "") -> TaskStreamPlugin:
         from dsbo.utils.plugins import TaskStreamPlugin
         if self._readonly:
             raise RuntimeError("Cannot create TaskStreamPlugin from readonly StudyStorage.")
-        return TaskStreamPlugin(writer=self._make_transition_writer(), task_map=task_map, name_map=name_map)
+        return TaskStreamPlugin(writer=self._make_transition_writer(), task_map=task_map, name_map=name_map, tag=tag)
 
     @abstractmethod
     def _make_transition_writer(self) -> TransitionWriter:
@@ -201,14 +230,6 @@ class ArtifactStorageBase(ABC):
         pass
 
     @abstractmethod
-    def write_artifact_metadata(self, tag: str, step: int, metadata: dict) -> None:
-        pass
-
-    @abstractmethod
-    def load_artifact_metadata(self, tag: str, step: int | None = None) -> Optional[dict]:
-        pass
-
-    @abstractmethod
     def create_artifact(self, name: str, type: str, metadata: dict | None = None) -> "Artifact":
         pass
 
@@ -228,3 +249,11 @@ class ArtifactStorageBase(ABC):
     @abstractmethod
     def list_artifacts(self, type: str | None = None) -> list[dict]:
         pass
+
+    def load_file(self, ref: ArtifactRef, name: str) -> Path:
+        artifact = self.load_artifact(
+            ref.name,
+            version=ref.version,
+            stage=ref.stage,
+        )
+        return artifact.get_file(name)

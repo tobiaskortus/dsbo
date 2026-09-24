@@ -11,10 +11,10 @@ import numpy as np
 from enum import Enum
 import networkx as nx
 from dataclasses import dataclass
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, Callable, cast, Sequence, TYPE_CHECKING
 import torch.autograd.forward_ad as fw
 
-from dsbo.modules import Module
+from dsbo.modules import Module, BatchFusedModule
 from dsbo.surrogates.graph_transformations import GraphMode
 from dsbo.parameters import Candidate, CandidateBatch
 
@@ -70,6 +70,9 @@ def code_hash(code_obj):
 
 
 def module_code(node: Module, include_seed: bool = True) -> str:
+    if isinstance(node, BatchFusedModule):
+        return f"batch_fuse:{module_code(node.inner, include_seed=include_seed)}"
+    
     cls = type(node)
     identity = f"{cls.__module__}.{cls.__qualname__}"
     state = f"seed={node._seed},no_grad={node._no_grad_op}" if include_seed else f"no_grad={node._no_grad_op}"
@@ -245,6 +248,22 @@ class WorkflowExecutionCache:
             misses.append(c)
 
         return results, misses, indices
+
+    def load_or_compute(
+        self,
+        candidates: Candidates,
+        compute: Callable[[list[Candidate]], list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        results, misses, miss_indices = self.match_partial(candidates)
+        if misses:
+            computed = compute(misses)
+            if len(computed) != len(misses):
+                raise ValueError("Computed result count does not match cache miss count")
+            self.save_all(misses, computed)
+            for index, result in zip(miss_indices, computed):
+                results[index] = result
+
+        return cast(list[dict[str, Any]], results)
 
     def load_all(self, candidates: Candidates) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []

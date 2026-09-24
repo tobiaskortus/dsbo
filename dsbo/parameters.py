@@ -324,8 +324,8 @@ class ParameterSpace:
         
         return Candidate(self, t)
 
-    def sample_batch(self, sampler: Sampler = None, batch_size: int = 16, requires_grad: bool = False) -> list[Candidate]:
-        return [self.sample(sampler, requires_grad) for _ in range(batch_size)]
+    def sample_batch(self, sampler: Sampler = None, batch_size: int = 16, requires_grad: bool = False) -> CandidateBatch:
+        return CandidateBatch([self.sample(sampler, requires_grad) for _ in range(batch_size)])
 
     def dims(self, encoding: Encoding | str = Encoding.ORDINAL, include_constants: bool = False) -> int:
         match encoding:

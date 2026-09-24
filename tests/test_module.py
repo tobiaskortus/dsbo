@@ -1,9 +1,10 @@
 import time
+import cloudpickle
 import pytest
 from unittest.mock import patch
 
 from dsbo.modules import Module, dynamic_submodule
-from dsbo.utils.io import AbstractFilePath, DefaultPaths
+from dsbo.utils.io import AbstractFilePath, DefaultPaths, Input, Output, Workdir
 
 class EmptyModuleMock(Module):
     def __init__(self):
@@ -19,7 +20,120 @@ class DefaultModuleMock(Module):
     def __call__(self, *args, **kwds):
         time.sleep(0.01)
         return {"result": 42}
-    
+
+
+def test_dynamic_submodule_inherits_parent_registered_files():
+    class Parent(Module):
+        def __init__(self):
+            super().__init__()
+            self.train_input = Input(Workdir.register_file("simulation", "train.h5"))
+            self.val_input = Input(Workdir.register_file("simulation", "val.h5"))
+            self.model = Output(Workdir.register_file("reconstruction", "model.pt"))
+
+        @dynamic_submodule
+        def train(self, design):
+            pass
+
+    parent = Parent()
+    assert parent.train.registered_inputs == parent.registered_inputs
+    assert parent.train.registered_outputs == parent.registered_outputs
+
+
+def test_dynamic_submodule_binds_candidates_and_reads_files_from_parent():
+    class Parent(Module):
+        def __init__(self):
+            super().__init__()
+
+        @dynamic_submodule
+        def train(self, design, candidates):
+            return {
+                "candidates": candidates,
+                "data_file": self.data_file,
+                "model_file": self.model_file,
+            }
+
+    parent = Parent()
+    data_file = Input(Workdir.register_file("simulation", "train.h5"))
+    model_file = Output(Workdir.register_file("surrogate", "model.pt"))
+    parent.data_file = data_file
+    parent.model_file = model_file
+    train = parent.train.bind(candidates=[1, 2])
+
+    result = train({})
+
+    assert result == {
+        "candidates": [1, 2],
+        "data_file": data_file,
+        "model_file": model_file,
+    }
+    assert train.registered_inputs == [data_file.path]
+    assert train.registered_outputs == [model_file.path]
+    assert train.binding("candidates") == [1, 2]
+
+
+def test_dynamic_submodule_setting_attribute_registers_input():
+    class Parent(Module):
+        def __init__(self):
+            super().__init__()
+
+        @dynamic_submodule
+        def train(self, design):
+            pass
+
+    parent = Parent()
+    data_file = Input(Workdir.register_file("simulation", "first.h5"))
+    parent.data_file = data_file
+    train = parent.train
+    assert train.registered_inputs == [data_file.path]
+    assert train.data_file is data_file
+
+
+def test_dynamic_submodule_registered_files_aggregate_parent():
+    class Parent(Module):
+        def __init__(self):
+            super().__init__()
+            self.input_file = Input(Workdir.register_file("simulation", "parent.h5"))
+
+        @dynamic_submodule
+        def train(self, design):
+            pass
+
+    parent = Parent()
+    model_file = Output(Workdir.register_file("surrogate", "model.pt"))
+    parent.model_file = model_file
+    train = parent.train
+
+    assert train.registered_files["input_file"] is parent.input_file.path
+    assert train.registered_files["model_file"] is model_file.path
+
+
+def test_dynamic_submodule_unbound_raises_keyerror():
+    class Parent(Module):
+        def __init__(self):
+            super().__init__()
+
+        @dynamic_submodule
+        def train(self, design, candidates):
+            pass
+
+    with pytest.raises(KeyError):
+        Parent().train.binding("candidates")
+
+
+def test_dynamic_submodule_bound_candidates_serialization():
+    class Parent(Module):
+        def __init__(self):
+            super().__init__()
+
+        @dynamic_submodule
+        def train(self, design, candidates):
+            return {"count": len(candidates)}
+
+    train = Parent().train.bind(candidates=[1, 2, 3])
+    restored = cloudpickle.loads(cloudpickle.dumps(train))
+
+    assert restored({}) == {"count": 3}
+    assert restored.binding("candidates") == [1, 2, 3]
 
 
 @patch('dsbo.modules.dryrunnable', return_value=False)

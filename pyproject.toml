@@ -5,45 +5,47 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dsbo"
 version = "0.1.0"
-description = "Detector Suroogate-Based Optimization"
+description = "Detector Surrogate-Based Optimization"
 requires-python = ">=3.10"
 
 dependencies = [
-    "tqdm",
     "attrs",
-    "torch",
-    "numpy",
-    "pandas",
     "dask[distributed]",
     "dask-jobqueue",
-    "grpcio",
-    "grpcio-tools",
-    "graphviz",
-    "matplotlib",
-    "lancedb",
+    "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main",
+    "diffusers",
     "duckdb",
     "duckdb-engine",
+    "filelock",
+    "graphviz",
+    "grpcio",
+    "h5py",
+    "lancedb",
+    "lightning",
+    "matplotlib",
+    "networkx",
+    "numpy",
+    "optuna",
+    "optuna-integration[botorch]",
+    "pandas",
+    "psutil",
+    "pyarrow",
+    "pytorch-lightning",
+    "sqlalchemy",
     "sqlmodel",
     "sqlite-vec",
     "ipython",
     "diffusers",
-    "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main"
+    "torch",
+    "tqdm",
+    "uproot>=5,<6",
 ]
 
 [project.optional-dependencies]
-optuna = [
-    "optuna",
-    "optuna-integration[botorch]",
-]
-
-aido = [
-    "diffusers",
-]
-
-all = [
-    "optuna",
-    "optuna-integration[botorch]",
-    "diffusers",
+dev = [
+    "grpcio-tools",
+    "pre-commit",
+    "pytest",
 ]
 
 [tool.setuptools.packages.find]

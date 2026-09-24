@@ -4,6 +4,7 @@ import pytest
 import sys
 import torch
 import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
@@ -12,7 +13,8 @@ from dsbo.modules import Module
 from dsbo.modules.dsl import DependencyDict
 from dsbo.workflow import Workflow
 from dsbo.worker.dask import DaskWorkerBase
-from dsbo.utils.io import Workdir
+from dsbo.utils.io import Workdir, Input, Output
+from dsbo.utils.io.storage.hdf5 import HDF5File
 from dask_jobqueue.local import LocalCluster
 
 
@@ -22,6 +24,7 @@ from dask_jobqueue.local import LocalCluster
 class MockDaskWorker(DaskWorkerBase):
     def __init__(self):
         self.client = MagicMock()
+        self.client.run_on_scheduler.return_value = False
         self.cluster = MagicMock()
         self.task_counter = 0
         self.scheduled = []
@@ -29,7 +32,10 @@ class MockDaskWorker(DaskWorkerBase):
         self._gather_results = None
         self._gather_forward_results = True  # if True, gather returns dicts
 
-    def schedule(self, module, design, dependencies=(), priority=None):
+    def schedule(
+        self, module, design, dependencies=(), design_tensor=None,
+        priority=None, file_overlays=None,
+    ):
         tid = UUID(int=self.task_counter, version=4)
         self.task_counter += 1
         delayed = MagicMock()
@@ -78,7 +84,7 @@ def make_mock_worker(**attrs):
 
 class LocalDaskWorker(DaskWorkerBase):
     def __init__(self):
-        self.cluster = LocalCluster(cores=1, memory="500MB")
+        self.cluster = LocalCluster(cores=1, memory="2GB")
         self.cluster.scale(2)
         super().__init__(self.cluster)
 
@@ -123,6 +129,34 @@ class FailingModule(Module):
     def __call__(self, design, **kwargs):
         raise ValueError("simulated failure")
 
+
+class DataProducer(Module):
+    def __init__(self):
+        super().__init__()
+        self.output = Output(Workdir.register_file("simulation", "events.h5"))
+
+    def __call__(self, design, **kwargs):
+        HDF5File.write(self.output(), design["x"].reshape(1))
+
+
+class FileTrainer(Module):
+    def __init__(self):
+        super().__init__()
+        self.input = Input(Workdir.register_file("simulation", "events.h5"))
+        self.model = Output(Workdir.register_file("reconstruction", "model.pt"))
+
+    def __call__(self, design, **kwargs):
+        loss = HDF5File.open(self.input(), "cpu").sum()
+        torch.save(loss, self.model())
+        return {"loss": loss}
+
+
+class DataConsumer(Module):
+    def __init__(self):
+        super().__init__()
+        self.input = Input(Workdir.register_file("simulation", "events.h5"))
+
+
 class SurrogateModule(Module):
     """A real Module used as a module surrogate in tests."""
     def __init__(self):
@@ -140,15 +174,15 @@ class SurrogateModule(Module):
     @property
     def is_available(self):
         return True
-    def fit(self, candidate, workflow_callback):
-        pass
+    def select_training_task(self, candidate):
+        return None
 
 
 # ────────── Fixtures ──────────
 
 @pytest.fixture
 def simple_space():
-    return ParameterSpace(x=Continuous(0, 10, 1))
+    return ParameterSpace(x=Continuous(0, 10))
 
 @pytest.fixture
 def candidate(simple_space):
@@ -190,12 +224,12 @@ def mock_cache():
     instance = MagicMock()
     instance.config = MagicMock()
     instance.config.should_cache.return_value = True
-    instance.match_partial.return_value = ([None, None, None], [], [])
+    instance.load_or_compute.side_effect = lambda candidates, compute: compute(candidates)
     yield instance
 
 @pytest.fixture
 def mock_run_batch():
-    with patch("dsbo.workflow.run_batch") as mock:
+    with patch("dsbo.workflow.runner.run_batch") as mock:
         mock.side_effect = lambda wf, misses, catch: [
             {"out": torch.tensor(float(c.tensor.item() * 10.0))} for c in misses
         ]
@@ -219,3 +253,18 @@ def _suppress_tqdm():
     """Redirect stderr to devnull to suppress tqdm progress bar output during tests."""
     with open(os.devnull, "w") as null, patch.object(sys, "stderr", null):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_study_storage():
+    """Give each test a fresh study storage instead of the session default."""
+    from dsbo.storage import use_storage
+    from dsbo.storage.sqlmodel import StudyStorage
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = StudyStorage.create(Path(tmpdir) / "study.db")
+        try:
+            with use_storage(storage):
+                yield storage
+        finally:
+            storage.close()

@@ -1,5 +1,7 @@
+import functools
 import logging
 import os
+import os.path
 import shutil
 import subprocess
 import warnings
@@ -233,6 +235,8 @@ class DockerImageProvider(ImageProvider):
     def prepare_image(self, image_def: ImageRef | ImageFile | DefinitionFile,
                       output_dir: str = "") -> str:
         if isinstance(image_def, ImageRef):
+            if not self.exists(image_def.uri):
+                self.pull(image_def.uri)
             return image_def.uri
         if isinstance(image_def, ImageFile):
             raise RuntimeError(
@@ -346,23 +350,41 @@ class ContainerConfig:
     cuda_enabled: bool = False
     bind_mounts: tuple[tuple[str, str], ...] = ()
     extra_flags: tuple[str, ...] = ()
+    workdir: str | None = None
 
     def enable_cuda(self) -> "ContainerConfig":
         if self.cuda_enabled:
             return self
         return type(self)(cuda_enabled=True,
                           bind_mounts=self.bind_mounts,
-                          extra_flags=self.extra_flags)
+                          extra_flags=self.extra_flags,
+                          workdir=self.workdir)
+
+    def disable_cuda(self) -> "ContainerConfig":
+        if not self.cuda_enabled:
+            return self
+        return type(self)(cuda_enabled=False,
+                          bind_mounts=self.bind_mounts,
+                          extra_flags=self.extra_flags,
+                          workdir=self.workdir)
 
     def with_extra_flags(self, *flags: str) -> "ContainerConfig":
         return type(self)(cuda_enabled=self.cuda_enabled,
                           bind_mounts=self.bind_mounts,
-                          extra_flags=self.extra_flags + flags)
+                          extra_flags=self.extra_flags + flags,
+                          workdir=self.workdir)
 
     def with_bind_mount(self, *mounts: tuple[str, str]) -> "ContainerConfig":
         return type(self)(cuda_enabled=self.cuda_enabled,
                           bind_mounts=self.bind_mounts + mounts,
-                          extra_flags=self.extra_flags)
+                          extra_flags=self.extra_flags,
+                          workdir=self.workdir)
+
+    def with_workdir(self, workdir: str) -> "ContainerConfig":
+        return type(self)(cuda_enabled=self.cuda_enabled,
+                          bind_mounts=self.bind_mounts,
+                          extra_flags=self.extra_flags,
+                          workdir=workdir)
 
 
 class ContainerRuntime(ABC):
@@ -400,6 +422,8 @@ class ContainerRuntime(ABC):
     def _bind_mount_flags(self) -> List[str]:
         flags = []
         for src, dst in self._config.bind_mounts:
+            src = os.path.abspath(src) if not os.path.isabs(src) else src
+            dst = os.path.abspath(dst) if not os.path.isabs(dst) else dst
             flags.extend(self._backend_bind_mount_flag(src, dst))
         return flags
 
@@ -413,10 +437,23 @@ class ContainerRuntime(ABC):
     def _get_executable(self) -> str:
         return self._image_provider._get_executable()  # type: ignore[attr-defined]
 
+    def _workdir_flag(self) -> List[str]:
+        wd = self._config.workdir
+        if wd is None:
+            return []
+        if not os.path.isabs(wd):
+            wd = os.path.abspath(wd)
+        return self._backend_workdir_flag(wd)
+
+    @abstractmethod
+    def _backend_workdir_flag(self, workdir: str) -> List[str]:
+        pass
+
     def _build_command_prefix(self, command: str, image: str) -> List[str]:
         executable = self._get_executable()
         return [executable, command, *self._cuda_flags(),
                 *self._bind_mount_flags(),
+                *self._workdir_flag(),
                 *list(self._config.extra_flags), self._resolve_image(image)]
 
 
@@ -430,6 +467,9 @@ class DockerContainerRuntime(ContainerRuntime):
 
     def _backend_bind_mount_flag(self, src: str, dst: str) -> List[str]:
         return ["-v", f"{src}:{dst}"]
+
+    def _backend_workdir_flag(self, workdir: str) -> List[str]:
+        return ["--workdir", workdir]
 
     def build_run_command(self, image: str, args: List[str]) -> List[str]:
         prefix = self._build_command_prefix("run", image)
@@ -462,6 +502,9 @@ class SingularityContainerRuntime(ContainerRuntime):
 
     def _backend_bind_mount_flag(self, src: str, dst: str) -> List[str]:
         return ["--bind", f"{src}:{dst}"]
+
+    def _backend_workdir_flag(self, workdir: str) -> List[str]:
+        return ["--pwd", workdir]
 
     def build_run_command(self, image: str, args: List[str]) -> List[str]:
         return self._build_command_prefix("run", image) + args
@@ -506,11 +549,12 @@ def get_runtime_for_type(container_type: ContainerType, image: str,
 
 
 def warm_container_dependencies(workflow: "Workflow", verbose: bool = True) -> dict[ImageRef | ImageFile | DefinitionFile, str]:
-    from tqdm import tqdm
+    from tqdm.auto import tqdm
+    from dsbo.modules.fused import inner_module
 
     result = dict.fromkeys(
-        n._image_def for n in workflow.task_graph.nodes
-        if isinstance(n, ContainerWrapperBase)
+        inner_module(node)._image_def for node in workflow.task_graph.nodes
+        if isinstance(inner_module(node), ContainerWrapperBase)
     )
 
     for d in tqdm(result, desc="Warming containers", unit="container", disable=not verbose):
@@ -523,6 +567,21 @@ def warm_container_dependencies(workflow: "Workflow", verbose: bool = True) -> d
 
 
 class ContainerWrapperBase:
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        orig_init = cls.__init__
+
+        @functools.wraps(orig_init)
+        def wrapped_init(self, *args, **init_kwargs):
+            orig_init(self, *args, **init_kwargs)
+            if not getattr(self, "_container_inited", False):
+                raise RuntimeError(
+                    f"{type(self).__name__} inherits from ContainerWrapperBase but did not call "
+                    "ContainerWrapperBase.__init__() or super().__init__() in its __init__."
+                )
+
+        cls.__init__ = wrapped_init
+
     def __init__(self, container_path: ImageRef | ImageFile | DefinitionFile,
                  container_extra_flags: Optional[str] = None,
                  config: Optional[ContainerConfig] = None,
@@ -537,6 +596,7 @@ class ContainerWrapperBase:
                 DeprecationWarning, stacklevel=3,
             )
 
+        self._container_inited = True
         super().__init__(**kwargs)
         self._verbose = verbose
         self._runtime: Optional[ContainerRuntime] = None
@@ -576,9 +636,24 @@ class ContainerWrapperBase:
 
         image_ref = provider.prepare_image(self._image_def, image_dir or "")
 
-        self._runtime = self._get_runtime_for_type(selected_env, image_ref, provider, self._config)
+        runtime_config = self._config
+        if runtime_config.cuda_enabled and not self._worker_has_gpu():
+            runtime_config = runtime_config.disable_cuda()
+
+        self._runtime = self._get_runtime_for_type(selected_env, image_ref, provider, runtime_config)
         self._container_path = image_ref
         return self._runtime
+
+    def _worker_has_gpu(self) -> bool:
+        resources = getattr(self, "resources", None)
+        if resources is not None:
+            return getattr(resources, "gpu_resources", None) is not None
+
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            return False
 
     def __construct_cmd(self, args: List[str], is_exec: bool = False) -> List[str]:
         runtime = self._ensure_runtime()
@@ -610,6 +685,9 @@ class ContainerWrapperBase:
 
     def bind_mount(self, *mounts: tuple[str, str]) -> None:
         self._config = self._config.with_bind_mount(*mounts)
+
+    def set_workdir(self, workdir: str) -> None:
+        self._config = self._config.with_workdir(workdir)
 
     @property
     def container_path(self) -> str:

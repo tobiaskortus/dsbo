@@ -4,7 +4,8 @@ import contextvars
 from contextlib import contextmanager
 from typing import Any, Generator
 
-from dsbo.utils.io.autograd import AutogradFileInterface, NumpyFile
+from dsbo.utils.io.storage.autograd import AutogradFileInterface
+from dsbo.utils.io.storage.hdf5 import HDF5File
 
 _config_var: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "dsbo_config", default={}
@@ -52,4 +53,4 @@ def get_active_file_backend() -> type[AutogradFileInterface]:
     if backend is not None:
         return backend
 
-    return NumpyFile
+    return HDF5File

@@ -6,6 +6,7 @@ import pytest
 from dsbo.workflow import Workflow
 from dsbo.modules import Module
 from dsbo.modules.dsl import DependencyDict
+from dsbo.worker.spec import LocalWorkerSpec, SLURMWorkerSpec
 
 from dsbo.container import (
     ContainerConfig,
@@ -556,6 +557,38 @@ class TestBackendRegistry:
 
 
 class TestContainerWrapperBase:
+    @pytest.mark.parametrize(
+        ("resources", "expected"),
+        [
+            (LocalWorkerSpec(cores=1, processes=1, memory="1GB"), False),
+            (SLURMWorkerSpec(cores=1, processes=1, memory="1GB", walltime="00:10:00"), False),
+            (SLURMWorkerSpec(cores=1, processes=1, memory="1GB", walltime="00:10:00", gpu_resources="gpu:1"), True),
+        ],
+    )
+    def test_worker_has_gpu_from_resources(self, resources, expected):
+        wrapper = ContainerWrapperBase(ImageRef(uri="ubuntu:22.04"))
+        wrapper.resources = resources
+
+        assert wrapper._worker_has_gpu() is expected
+
+    @patch("dsbo.container.discover_container_environments", return_value={"docker": True})
+    def test_cpu_worker_disables_cuda_for_runtime(self, mock_discover):
+        wrapper = ContainerWrapperBase(ImageRef(uri="ubuntu:22.04"), cuda_enabled=True)
+        wrapper.resources = LocalWorkerSpec(cores=1, processes=1, memory="1GB")
+        provider = MockImageProvider()
+        wrapper._make_provider = MagicMock(return_value=provider)
+
+        cmd = wrapper._ContainerWrapperBase__construct_cmd(["echo"])
+
+        assert "--gpus all" not in cmd
+
+    @patch("torch.cuda.is_available", return_value=False)
+    def test_worker_has_gpu_uses_local_torch_when_unassigned(self, mock_is_available):
+        wrapper = ContainerWrapperBase(ImageRef(uri="ubuntu:22.04"))
+
+        assert wrapper._worker_has_gpu() is False
+        mock_is_available.assert_called_once_with()
+
     def test_explicit_container_type_override(self):
         wrapper = ContainerWrapperBase(
             ImageRef(uri="ubuntu:22.04"), container_type=ContainerType.SINGULARITY,
@@ -832,21 +865,23 @@ class TestPullImageRefToSif:
         assert provider._ensure_docker_scheme("library/ubuntu:22.04") == "docker://library/ubuntu:22.04"
 
 
-    @patch("shutil.which", return_value="/usr/bin/docker")
-    def test_docker_prepare_image_with_plain_uri(self, mock_which):
+    @patch.object(DockerImageProvider, "exists", return_value=True)
+    def test_docker_prepare_image_with_plain_uri(self, mock_exists):
         """Docker should pass plain URIs through as-is."""
         provider = DockerImageProvider()
         ref = ImageRef(uri="ubuntu:22.04")
         result = provider.prepare_image(ref)
         assert result == "ubuntu:22.04"
+        mock_exists.assert_called_once_with("ubuntu:22.04")
 
-    @patch("shutil.which", return_value="/usr/bin/docker")
-    def test_docker_prepare_image_with_docker_scheme_uri(self, mock_which):
+    @patch.object(DockerImageProvider, "exists", return_value=True)
+    def test_docker_prepare_image_with_docker_scheme_uri(self, mock_exists):
         """Docker should pass docker:// URIs through as-is (Docker handles both)."""
         provider = DockerImageProvider()
         ref = ImageRef(uri="docker://ubuntu:22.04")
         result = provider.prepare_image(ref)
         assert result == "docker://ubuntu:22.04"
+        mock_exists.assert_called_once_with("docker://ubuntu:22.04")
 
 
 class TestImageDefinitionFile:

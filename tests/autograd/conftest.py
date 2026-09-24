@@ -3,16 +3,16 @@ import torch
 import pytest
 import numpy as np
 
+from dsbo.utils.io.storage.hdf5 import HDF5File
 from dsbo.worker.dask import DaskWorkerBase
 from dsbo.workflow import Workflow
 from dsbo.utils.io.workdir import Workdir
 from dsbo.modules import Module, Input, Output
 from dsbo.parameters import Continuous, ParameterSpace, Sampler
-from dsbo.utils.io.autograd import NumpyFile
 
 class LocalDaskWorker(DaskWorkerBase):
     def __init__(self):
-        self.cluster = LocalCluster(cores=1, memory="500MB")
+        self.cluster = LocalCluster(cores=1, memory="2GB")
         self.cluster.scale(2)
         super().__init__(self.cluster)
 
@@ -22,12 +22,12 @@ def workflow():
     class ModuleA(Module):
         def __init__(self):
             super().__init__()
-            self.out = Output(Workdir.register_file("a", "a_out.npz"))
+            self.out = Output(Workdir.register_file("a", "a_out.h5"))
         def __call__(self, design, **kwargs):
             out = design["x"] * design["y"]
-            NumpyFile.write(self.out(), out)
+            HDF5File.write(self.out(), out)
         def backward(self, design, grad_output=None):
-            grad_out = NumpyFile.read_backward_gradient(self.out())
+            grad_out = HDF5File.read_backward_gradient(self.out())
             out = design["x"] * design["y"]
             out.backward(grad_out)
 
@@ -35,16 +35,16 @@ def workflow():
         def __init__(self, a_out_path):
             super().__init__()
             self.inp = Input(a_out_path)
-            self.out = Output(Workdir.register_file("b", "b_out.npz"))
+            self.out = Output(Workdir.register_file("b", "b_out.h5"))
 
         def __call__(self, design, **kwargs):
-            x = NumpyFile.open(self.inp(), "cpu")
+            x = HDF5File.open(self.inp(), "cpu")
             y = torch.sin(x)
-            NumpyFile.write(self.out(), y)
+            HDF5File.write(self.out(), y)
 
         def backward(self, design, grad_output=None):
-            grad_out = NumpyFile.read_backward_gradient(self.out())
-            x = NumpyFile.open(self.inp(), "cpu")
+            grad_out = HDF5File.read_backward_gradient(self.out())
+            x = HDF5File.open(self.inp(), "cpu")
             y = torch.sin(x)
             y.backward(grad_out)
 
@@ -52,16 +52,16 @@ def workflow():
         def __init__(self, a_out_path):
             super().__init__()
             self.inp = Input(a_out_path)
-            self.out = Output(Workdir.register_file("c", "c_out.npz"))
+            self.out = Output(Workdir.register_file("c", "c_out.h5"))
 
         def __call__(self, design, **kwargs):
-            x = NumpyFile.open(self.inp(), "cpu")
+            x = HDF5File.open(self.inp(), "cpu")
             y = torch.exp(x)
-            NumpyFile.write(self.out(), y)
+            HDF5File.write(self.out(), y)
 
         def backward(self, design, grad_output=None):
-            grad_out = NumpyFile.read_backward_gradient(self.out())
-            x = NumpyFile.open(self.inp(), "cpu")
+            grad_out = HDF5File.read_backward_gradient(self.out())
+            x = HDF5File.open(self.inp(), "cpu")
             y = torch.exp(x)
             y.backward(grad_out)
 
@@ -72,15 +72,15 @@ def workflow():
             self.inp_c = Input(c_out_path)
 
         def __call__(self, design, **kwargs):
-            b = NumpyFile.open(self.inp_b(), "cpu")
-            c = NumpyFile.open(self.inp_c(), "cpu")
+            b = HDF5File.open(self.inp_b(), "cpu")
+            c = HDF5File.open(self.inp_c(), "cpu")
             return {"final": (b * c).sum()}
 
         def backward(self, design, grad_output=None):
             if grad_output is None:
                 return
-            b = NumpyFile.open(self.inp_b(), "cpu")
-            c = NumpyFile.open(self.inp_c(), "cpu")
+            b = HDF5File.open(self.inp_b(), "cpu")
+            c = HDF5File.open(self.inp_c(), "cpu")
             outputs = {"final": (b * c).sum()}
             tensors = [outputs[k] for k in grad_output]
             grads = [grad_output[k] for k in grad_output]

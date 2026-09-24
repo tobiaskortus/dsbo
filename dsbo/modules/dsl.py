@@ -85,6 +85,7 @@ class DependencyDict(dict):
         super().__init__(mapping)
         self.groups: list[DependencyGroup] = []
         self.annotated_groups: list[AnnotatedDependencyGroup] = []
+        self._replica_count = 0
 
     @property
     def template_to_nodes(self) -> dict[object, list[ModuleDslMixin]]:
@@ -133,16 +134,22 @@ class DependencyDict(dict):
             all_nodes = list(set(self.keys()) | set(x for vs in self.values() for x in vs))
             max_inner = max((n.i for n in all_nodes if isinstance(getattr(n, 'i', None), int)), default=-1)
             stride = max_inner + 1 if max_inner >= 0 else 1
+            start = self._replica_count
             out = {}
             node_to_template: dict[ModuleDslMixin, ModuleDslMixin] = {}
             for outer_i in range(other):
                 copied = {
-                    orig: orig.replicate(outer_i * stride + orig.i if isinstance(getattr(orig, 'i', None), int) else outer_i)
+                    orig: orig.replicate(
+                        start + outer_i * stride + orig.i
+                        if isinstance(getattr(orig, 'i', None), int)
+                        else start + outer_i * stride
+                    )
                     for orig in all_nodes
                 }
                 node_to_template.update({copy: orig for orig, copy in copied.items()})
                 for orig_k, orig_vs in self.items():
                     out[copied[orig_k]] = [copied[v] for v in orig_vs]
+            self._replica_count = start + other * stride
             dd = DependencyDict(out)
             dd.groups = list(self.groups) + [DependencyGroup(
                 template=self,
@@ -252,6 +259,17 @@ class DependencyDict(dict):
         return _make_depdict(result)
 
 
+def with_no_grad(dep: ModuleDslMixin | DependencyDict) -> DependencyDict:
+    if isinstance(dep, ModuleDslMixin):
+        dep.op_propagates_grad_(False)
+        return dep
+
+    for module in dep.nodes:
+        module.op_propagates_grad_(False)
+
+    return dep
+
+
 class Dynamic:
     def __init__(self):
         self.module: ModuleDslMixin | None = None
@@ -352,6 +370,13 @@ class DependencyGroup:
         for node, tmpl in node_to_template.items():
             template_to_nodes.setdefault(tmpl, []).append(node)
         return template_to_nodes
+
+    def relabel(self, mapping: dict[ModuleDslMixin, ModuleDslMixin]) -> DependencyGroup:
+        node_to_template = {
+            mapping.get(node, node): template
+            for node, template in self.node_to_template.items()
+        }
+        return DependencyGroup(self.template, self.count, node_to_template)
     
 
 class AnnotatedDependencyGroup:
