@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch.autograd.forward_ad as fw
 
 from dsbo.config import config, get_active_file_backend
+from dsbo.utils.io import Workdir
 from dsbo.utils.io.storage.autograd import InMemoryFile
 from dsbo.utils.io.datasets import ModuleSurrogateDataset, WorkflowSurrogateDataset
 from dsbo.utils.io.storage.hdf5 import HDF5File
@@ -711,3 +712,39 @@ def test_hdf5_nested_reduced_gradient_reaches_leaf_sources():
 
         for source in sources:
             torch.testing.assert_close(HDF5File.read_backward_gradient(source), torch.tensor([1.0]))
+
+
+@pytest.mark.parametrize("backend", [HDF5File, ROOTFile])
+def test_reduced_shared_leaf_accumulates_all_parents(backend):
+    backend.reset_gradient_state()
+    suffix = backend.default_extension()
+    with TemporaryDirectory() as tempdir:
+        leaf = os.path.join(tempdir, f"leaf{suffix}")
+        other = os.path.join(tempdir, f"other{suffix}")
+        backend.write(leaf, torch.tensor([1.0]))
+        backend.write(other, torch.tensor([2.0]))
+        first = os.path.join(tempdir, f"first{suffix}")
+        second = os.path.join(tempdir, f"second{suffix}")
+        backend.reduce([leaf, other], first)
+        backend.reduce([leaf, other], second)
+
+        backend.open(first, "cpu").sum().backward()
+        backend.open(second, "cpu").sum().backward()
+
+        torch.testing.assert_close(backend.read_backward_gradient(leaf), torch.tensor([2.0]))
+
+
+@pytest.mark.parametrize("backend", [HDF5File, ROOTFile])
+def test_multiple_writers_aggregate_without_shared_file_rmw(backend):
+    backend.reset_gradient_state()
+    suffix = backend.default_extension()
+    with TemporaryDirectory() as tempdir:
+        path = os.path.join(tempdir, f"x{suffix}")
+        backend.write(path, torch.tensor([1.0, 2.0]))
+
+        for worker, scale in (("worker_a", 2.0), ("worker_b", 3.0)):
+            with Workdir.use_file_suffix(worker), torch.enable_grad():
+                value = backend.open(path, "cpu")
+                (value * scale).sum().backward()
+
+        torch.testing.assert_close(backend.read_backward_gradient(path), torch.tensor([5.0, 5.0]))

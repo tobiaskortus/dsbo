@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import uproot
 
-from dsbo.utils.io.storage.autograd import AutogradFileInterface
+from dsbo.utils.io.storage.autograd import AutogradFileInterface, GradientBlock
 from dsbo.utils.io.datasets.views import (
     STORE_COLUMN,
     STORE_FLAT,
@@ -184,77 +184,54 @@ class ROOTFile(AutogradFileInterface):
         return value.reshape(shape)
 
     @classmethod
-    def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
-        primal_metadata = cls._gradient_primal_metadata(grad_path)
-        primal_columns = primal_metadata["columns"]
-        if primal_columns is None:
-            return cls._read_dataset(grad_path, "gradient", columns=columns)
-
-        selected = cls._validate_columns(columns) if columns is not None else list(primal_columns)
-        missing = [column for column in selected if column not in primal_columns]
-        if missing:
-            raise KeyError(f"ROOT primal TTree has no column '{missing[0]}'.")
-
-        gradient_metadata, _ = cls._load_container(grad_path)
-        stored_columns = gradient_metadata["datasets"]["gradient"]["columns"]
-        if stored_columns is None:
-            raise ValueError("Cannot load named gradients from an unnamed ROOT gradient TTree.")
-        present = [column for column in selected if column in stored_columns]
-        present_values = cls._read_dataset(grad_path, "gradient", columns=present) if present else None
-        values_by_column = dict(zip(present, present_values, strict=True)) if present_values is not None else {}
-        dtype = np.dtype(gradient_metadata["datasets"]["gradient"]["dtype"])
-        column_shape = tuple(primal_metadata["shape"])[1:]
-        values = [values_by_column.get(column, np.zeros(column_shape, dtype=dtype)) for column in selected]
-        return np.stack(values, axis=0)
+    def primal_columns(cls, primal_path: str) -> list[str] | None:
+        metadata, _ = cls._load_container(primal_path)
+        primal = metadata["datasets"]["primal"]
+        return None if primal["columns"] is None else list(primal["columns"])
 
     @classmethod
-    def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
-        primal_metadata = cls._gradient_primal_metadata(grad_path)
-        primal_columns = primal_metadata["columns"]
-        if primal_columns is None:
-            cls._write_datasets(grad_path, gradient=gradient)
-            return
-
-        selected = list(primal_columns) if columns is None else cls._validate_columns(columns, gradient)
-        missing = [column for column in selected if column not in primal_columns]
-        if missing:
-            raise KeyError(f"ROOT primal TTree has no column '{missing[0]}'.")
-
-        if grad_path not in cls._gradient_written or not os.path.isfile(grad_path):
-            cls._write_datasets(grad_path, columns=selected, gradient=gradient)
-            return
-
-        metadata, _ = cls._load_container(grad_path)
-        stored_columns = metadata["datasets"]["gradient"]["columns"]
-        if stored_columns is None:
-            raise ValueError("Cannot accumulate named gradients into an unnamed ROOT gradient TTree.")
-        stored_values = cls._read_dataset(grad_path, "gradient")
-        values = dict(zip(stored_columns, stored_values, strict=True))
-        values.update(dict(zip(selected, gradient, strict=True)))
-        merged_columns = list(stored_columns) + [column for column in selected if column not in stored_columns]
-        merged_gradient = np.stack([values[column] for column in merged_columns], axis=0)
-        cls._write_datasets(grad_path, columns=merged_columns, gradient=merged_gradient)
+    def primal_shape(cls, primal_path: str) -> tuple[int, ...]:
+        metadata, _ = cls._load_container(primal_path)
+        return tuple(metadata["datasets"]["primal"]["shape"])
 
     @classmethod
-    def _gradient_primal_metadata(cls, grad_path: str) -> dict:
-        base, extension = os.path.splitext(grad_path)
-        suffix = "_gradient"
-        if not base.endswith(suffix):
-            raise ValueError(f"ROOT gradient path '{grad_path}' does not end in '{suffix}{extension}'.")
-        primal_path = f"{base[:-len(suffix)]}{extension}"
+    def primal_column_shapes(cls, primal_path: str, columns: list[str]) -> dict[str, tuple[int, ...]]:
+        metadata, _ = cls._load_container(primal_path)
+        column_shape = tuple(metadata["datasets"]["primal"]["shape"])[1:]
+        return {column: column_shape for column in columns}
+
+    @classmethod
+    def reduction_sources(cls, primal_path: str) -> list[str] | None:
+        _, sources = cls._load_container(primal_path)
+        return None if sources is None else cls._resolved_sources(primal_path, sources)
+
+    @classmethod
+    def validate_primal(cls, primal_path: str) -> None:
         metadata, _ = cls._load_container(primal_path)
         if "primal" not in metadata["datasets"]:
             raise ValueError("Saved ROOT file must contain a 'primal' TTree.")
-        return metadata["datasets"]["primal"]
 
     @classmethod
-    def read_backward_gradient(cls, fpath: str) -> torch.Tensor:
-        metadata, _ = cls._load_container(fpath)
-        if "primal" not in metadata["datasets"]:
-            raise ValueError("Saved ROOT file must contain a 'primal' TTree.")
-        primal_metadata = metadata["datasets"]["primal"]
-        gradient = cls._load_gradient(cls._gradient_path(fpath), columns=primal_metadata["columns"])
-        return torch.from_numpy(gradient).float()
+    def write_gradient(cls, grad_path: str, block: GradientBlock) -> None:
+        cls._write_datasets(grad_path, columns=block.columns, gradient=block.values)
+
+    @classmethod
+    def gradient_columns(cls, grad_path: str) -> list[str] | None:
+        metadata, _ = cls._load_container(grad_path)
+        return metadata["datasets"]["gradient"]["columns"]
+
+    @classmethod
+    def read_flat_gradient(cls, grad_path: str) -> np.ndarray:
+        return cls._read_dataset(grad_path, "gradient")
+
+    @classmethod
+    def read_gradient_columns(cls, grad_path: str, columns: list[str]) -> list[np.ndarray]:
+        return list(cls._read_dataset(grad_path, "gradient", columns=columns))
+
+    @classmethod
+    def gradient_dtype(cls, grad_path: str) -> np.dtype:
+        metadata, _ = cls._load_container(grad_path)
+        return np.dtype(metadata["datasets"]["gradient"]["dtype"])
 
     @classmethod
     def _write_datasets(
