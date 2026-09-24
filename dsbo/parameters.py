@@ -129,7 +129,7 @@ class CandidateTensor(torch.Tensor):
     """Flat candidate tensor whose gradients are shared with the candidate's parameters."""
     @property
     def grad(self):
-        grad = torch.Tensor.grad.__get__(self)
+        grad = torch.Tensor.grad.__get__(self) if self.is_leaf else None
         if grad is not None:
             return grad
         candidate = getattr(self, "candidate", None)
