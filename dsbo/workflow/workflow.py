@@ -6,6 +6,7 @@ import torch.autograd.forward_ad as fw
 from typing import Any, Iterable, Sequence, TYPE_CHECKING, overload
 
 from dsbo.config import config
+from dsbo.autograd import get_tangent_sampler
 from dsbo.modules import Module
 from dsbo.utils.io import get_workdir
 from dsbo.parameters import CandidateBatch
@@ -136,6 +137,11 @@ class Workflow:
                 if cache and not any(is_batch_fused(task) for task in self.task_graph)
                 else False
             )
+            tangent_sampler = get_tangent_sampler()
+            if tangent_sampler is not None:
+                if fw._current_level == -1:
+                    raise ValueError("A tangent sampler requires an active forward AD level.")
+                use_cache = False
 
             if fw._current_level > -1 or not torch.is_grad_enabled():
                 with torch.no_grad():

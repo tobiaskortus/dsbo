@@ -11,6 +11,7 @@ import torch.autograd.forward_ad as fw
 from typing import Any, List, Sequence, TYPE_CHECKING
 
 from dsbo.modules import Module
+from dsbo.autograd import get_tangent_sampler
 from dsbo.parameters import Candidate
 from dsbo.utils.io import Workdir, get_subdir, get_workdir
 from dsbo.utils.random import get_random_engine
@@ -76,6 +77,11 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
         worker = WorkerContext.get_current_worker()
         if not candidates:
             return []
+        tangent_sampler = get_tangent_sampler()
+        if tangent_sampler is not None:
+            if len(candidates) != 1:
+                raise ValueError("A tangent sampler currently supports exactly one candidate per workflow run.")
+            tangent_sampler.reset()
 
         count = len(candidates)
         task_graph = workflow.task_graph
@@ -97,14 +103,19 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
 
             for _, task, index, targets in execution_plan():
                 try:
+                    design = candidates[0 if index is None else index].values
                     task_kwargs = dict(
-                        design=candidates[0 if index is None else index].values,
+                        design=design,
                         subdir="batch_reduce" if index is None else subdirs[index],
                         file_overlays=file_overlays(task_graph, task, index, subdirs),
                         is_forward_ad=fw._current_level > -1,
                         is_grad_enabled=torch.is_grad_enabled(),
                         unpack_design=True,
                     )
+                    if tangent_sampler is not None:
+                        task_sampler = tangent_sampler.for_task(task, design)
+                        if task_sampler is not None:
+                            task_kwargs["tangent_sampler"] = task_sampler
                     if task.requires_design_tensor:
                         task_kwargs["design_tensor"] = candidates[0 if index is None else index].tensor
                     result = task.run(**task_kwargs)
@@ -146,11 +157,11 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
             subdir = "batch_reduce" if index is None else subdirs[index]
             overlays = file_overlays(task_graph, task, index, subdirs)
 
+            design = candidates[0 if index is None else index].values
+            task_sampler = tangent_sampler.for_task(task, design) if tangent_sampler is not None else None
+
             with Workdir.create_subdir(subdir) if subdir else nullcontext():
-                task_id, delayed = worker.schedule(
-                    task,
-                    candidates[0 if index is None else index].values,
-                    deps,
+                schedule_kwargs = dict(
                     design_tensor=(
                         candidates[0 if index is None else index].tensor
                         if task.requires_design_tensor
@@ -159,6 +170,9 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                     priority=depth,
                     file_overlays=overlays,
                 )
+                if task_sampler is not None:
+                    schedule_kwargs["tangent_sampler"] = task_sampler
+                task_id, delayed = worker.schedule(task, design, deps, **schedule_kwargs)
 
             delayed_map[(task, index)] = delayed
             scheduled_tasks.append((task_id, task, index, delayed))

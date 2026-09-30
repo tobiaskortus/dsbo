@@ -90,6 +90,7 @@ class DaskWorkerBase:
         design_tensor: torch.Tensor | None = None,
         priority: int | None = None,
         file_overlays=None,
+        tangent_sampler=None,
     ) -> tuple[uuid.UUID, Delayed]:
         suffix = get_file_suffix()
         subdir = get_subdir()
@@ -106,7 +107,7 @@ class DaskWorkerBase:
 
         task_id = uuid.uuid4()
 
-        def _module_wrapper(module, design_arg, design_tensor_arg, *deps):
+        def _module_wrapper(module, design_arg, design_tensor_arg, tangent_sampler, *deps):
             dsbo.config._set(config_state)
             task_kwargs = dict(
                 design=design_arg,
@@ -118,6 +119,7 @@ class DaskWorkerBase:
                 is_grad_enabled=is_grad_enabled,
                 pack_result=is_forward_ad,
                 unpack_design=True,
+                tangent_sampler=tangent_sampler,
             )
             design_tensor = _unpack_tensor(design_tensor_arg)
             if design_tensor is not None:
@@ -128,7 +130,7 @@ class DaskWorkerBase:
 
         with dask.annotate(resources=(resources or {}), priority=priority):
             delayed_obj = delayed(_module_wrapper, name=module.name)(
-                module, packed_design, packed_design_tensor, *dependencies
+                module, packed_design, packed_design_tensor, tangent_sampler, *dependencies
             )
 
         return task_id, delayed_obj
