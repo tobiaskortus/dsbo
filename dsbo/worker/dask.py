@@ -10,8 +10,8 @@ from collections import ChainMap
 from dask.delayed import Delayed, delayed
 from dask.distributed import Client, Future
 
-import dsbo
 from contextlib import contextmanager
+from dsbo.config import config
 from dsbo.storage import get_current_storage, use_storage
 from dsbo.autograd import _pack, _unpack
 from dask_heterogeneous.hybrid import HybridCluster
@@ -102,13 +102,13 @@ class DaskWorkerBase:
         is_forward_ad = fw._current_level > -1
         is_grad_enabled = torch.is_grad_enabled()
 
-        config_state = dsbo.config.state()
+        config_state = config.state()
         storage = get_current_storage(create=False)
 
         task_id = uuid.uuid4()
 
         def _module_wrapper(module, design_arg, design_tensor_arg, tangent_sampler, *deps):
-            dsbo.config._set(config_state)
+            config._set(config_state)
             task_kwargs = dict(
                 design=design_arg,
                 workdir=workdir,
@@ -149,12 +149,12 @@ class DaskWorkerBase:
         workdir = getattr(get_workdir(), "workdir_root", None)
         resources = getattr(module.resources, "resources", None)
 
-        config_state = dsbo.config.state()
+        config_state = config.state()
         storage = get_current_storage(create=False)
         task_id = uuid.uuid4()
 
         def _backward_wrapper(module, candidate, *deps):
-            dsbo.config._set(config_state)
+            config._set(config_state)
             grad_candidate = candidate.detach().requires_grad_()
             design_tensor = grad_candidate.tensor if getattr(module, "requires_design_tensor", False) else None
             with use_storage(storage), torch.enable_grad():
