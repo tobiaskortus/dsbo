@@ -25,7 +25,7 @@ class Continuous:
     log: bool = False
 
     def repeat(self, size: int) -> "Vector":
-        return Vector(self.lower, self.upper, size, self.log)
+        return Vector(self.lower, self.upper, size, self.log, shared=True)
 
 @dataclass(frozen=True)
 class Integer:
@@ -44,6 +44,7 @@ class Vector:
     upper: float
     size: int
     log: bool = False
+    shared: bool = False
 
 
 @dataclass(frozen=True)
@@ -163,7 +164,12 @@ class Candidate:
             for n, p in self.space._params.items():
                 if isinstance(p, Constant):
                     continue
-                w = len(p.choices) if hasattr(p, 'choices') else 1
+                if hasattr(p, 'choices'):
+                    w = len(p.choices)
+                elif isinstance(p, Vector) and not p.shared:
+                    w = p.size
+                else:
+                    w = 1
                 pid = id(p)
                 if pid in seen:
                     index[n] = seen[pid]
@@ -228,8 +234,11 @@ class Candidate:
                             result[self.space._key_fn(parts)] = p.value
                         case Vector():
                             key = self.space._key_fn(parts)
-                            offset, _ = self._index[key]
-                            result[key] = self.tensor[offset:offset + 1].expand(p.size)
+                            offset, width = self._index[key]
+                            if p.shared:
+                                result[key] = self.tensor[offset:offset + 1].expand(p.size)
+                            else:
+                                result[key] = self.tensor[offset:offset + width]
                         case Categorical():
                             key = self.space._key_fn(parts)
                             offset, w = self._index[key]
@@ -369,14 +378,22 @@ class ParameterSpace:
                     parts.append(torch.tensor(one_hot, dtype=torch.float32))
                 case Vector():
                     v = values[src]
-                    if isinstance(v, torch.Tensor) and v.numel() != 1:
-                        raise ValueError(
-                            f"Vector parameter '{name}' expects a single value (homogeneous), "
-                            f"got {v.numel()} elements."
-                        )
                     if not isinstance(v, torch.Tensor):
                         v = torch.tensor(v, dtype=torch.float32)
-                    parts.append(v.reshape(1))
+                    if p.shared:
+                        if v.numel() != 1:
+                            raise ValueError(
+                                f"Vector parameter '{name}' expects a single value (homogeneous), "
+                                f"got {v.numel()} elements."
+                            )
+                        parts.append(v.reshape(1))
+                    else:
+                        if v.numel() != p.size:
+                            raise ValueError(
+                                f"Vector parameter '{name}' expects {p.size} values, "
+                                f"got {v.numel()} elements."
+                            )
+                        parts.append(v.reshape(p.size))
                 case _:
                     v = values[src]
                     if not isinstance(v, torch.Tensor):
@@ -424,11 +441,16 @@ class ParameterSpace:
             unique.append(p)
         match encoding:
             case Encoding.ORDINAL | "ordinal":
-                return sum(0 if isinstance(p, Constant) and not include_constants else 1 for p in unique)
+                return sum(
+                    0 if isinstance(p, Constant) and not include_constants else
+                    p.size if isinstance(p, Vector) and not p.shared else 1
+                    for p in unique
+                )
             case Encoding.ONE_HOT | "one_hot":
                 return sum(
                     0 if isinstance(p, Constant) and not include_constants else
-                    len(p.choices) if isinstance(p, Categorical) else 1
+                    len(p.choices) if isinstance(p, Categorical) else
+                    p.size if isinstance(p, Vector) and not p.shared else 1
                     for p in unique
                 )
             case _:
