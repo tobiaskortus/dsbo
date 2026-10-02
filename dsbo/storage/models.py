@@ -63,15 +63,16 @@ class JobTrace(SQLModel, table=True):
 
 
 class Intermediate(SQLModel, table=True):
-    id:       str   = Field(default_factory=_new_id, primary_key=True)
-    tag:      str   = Field(index=True)
-    step:     int
-    value:    float
-    walltime: float = Field(sa_column=Column(Double))
+    id:        str   = Field(default_factory=_new_id, primary_key=True)
+    timestamp: float = Field(sa_column=Column(Double), default_factory=time.time)
+    tag:       str   = Field(index=True)
+    step:      int
+    value:     float
 
 
 class Trial(SQLModel, table=True):
     id:         str     = Field(default_factory=_new_id, primary_key=True)
+    timestamp:  float   = Field(sa_column=Column(Double), default_factory=time.time)
     step:       int
     feasible:   bool    = Field(index=True)
     design:     bytes   = Field(sa_column=Column(LargeBinary))

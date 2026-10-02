@@ -262,7 +262,9 @@ class IntermediatesStorage(IntermediatesStorageBase):
             raise RuntimeError("Cannot write to readonly StudyStorage.")
         
         with Session(self._engine) as session:
-            session.add(Intermediate(tag=tag, step=step, value=value, walltime=time.time()))
+            session.add(Intermediate(
+                timestamp=time.time(), tag=tag, step=step, value=value
+            ))
             session.commit()
 
     def get_scalars(self, tag: str | None = None) -> list[float] | dict[str, list[float]]:
@@ -310,7 +312,7 @@ class TrialStorage(TrialStorageBase):
 
         arr = np.asarray(design_vec, dtype=np.float32)
         with Session(self._engine) as session:
-            trial = Trial(step=int(step), design=arr.tobytes(), 
+            trial = Trial(timestamp=time.time(), step=int(step), design=arr.tobytes(),
                           objectives=objectives, constraints=constraints, 
                           feasible=feasible)
             
