@@ -217,7 +217,9 @@ def run_batch_reverse_autograd(
     worker = WorkerContext.get_current_worker()
 
     G = workflow.task_graph
-    tasks_rev = list(reversed(list(nx.topological_sort(G))))
+    tasks_rev = [task for task in reversed(list(nx.topological_sort(G)))
+                 if not task._no_grad_op]
+    
     subdirs = candidate_subdirs(len(candidates))
     progress = tqdm(total=len(candidates) * len(tasks_rev), desc=f"Running workflow (reverse) [{workflow.graph_context.mode.value}]", unit="tasks")
 
@@ -230,8 +232,6 @@ def run_batch_reverse_autograd(
                     get_active_file_backend().reset_gradient_state()
                     for task in tasks_rev:
                         is_sink = len(list(G.successors(task))) == 0
-                        if task._no_grad_op:
-                            continue
 
                         design_tensor = grad_candidate.tensor if getattr(task, "requires_design_tensor", False) else None
                         task.run_backward(
@@ -271,9 +271,6 @@ def run_batch_reverse_autograd(
                 exec_ids.append(exec_id)
 
                 for depth, task in enumerate(tasks_rev):
-                    if task._no_grad_op:
-                        continue
-
                     forward_succs = list(G.successors(task))
                     is_sink = len(forward_succs) == 0
                     dependencies = [delayed_map[s] for s in forward_succs if s in delayed_map]

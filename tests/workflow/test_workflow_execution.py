@@ -167,6 +167,23 @@ class TestRunBatchReverseAutograd:
         assert len(grads) == 1
         assert grads[0].shape == (1,)
 
+    def test_progress_excludes_no_grad_modules(self, simple_space):
+        no_grad = NoGradModule()
+        backward = BackwardModule()
+        workflow = Workflow(DependencyDict({no_grad: [backward]}))
+        candidate = Candidate(simple_space, torch.tensor([3.0], requires_grad=True))
+        progress = MagicMock()
+
+        with patch("dsbo.workflow.runner.tqdm", return_value=progress) as tqdm_mock:
+            run_batch_reverse_autograd(
+                workflow,
+                [candidate],
+                [{"out": torch.tensor(1.0)}],
+            )
+
+        assert tqdm_mock.call_args.kwargs["total"] == 1
+        progress.update.assert_called_once_with()
+
     def test_multiple_candidates(self, simple_space):
         m = BackwardModule()
         wf = Workflow(m)
