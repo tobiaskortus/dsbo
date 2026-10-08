@@ -95,7 +95,11 @@ class TaskStreamPlugin(SchedulerPlugin):
                     return
 
                 worker = self._scheduler.workers[kwargs["worker"]]
-                startstop = kwargs["startstops"][0]
+                startstops = kwargs["startstops"]
+                startstop = next(
+                    (span for span in startstops if span.get("action") == "compute"),
+                    startstops[0],
+                )
                 name = self._name_map.get(key, key)
                 messages = self._log_buffer.pop(key, [])
                 log = "\n".join(messages)
