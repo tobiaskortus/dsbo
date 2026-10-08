@@ -88,9 +88,11 @@ class RandomForwardContext:
     def reset(self) -> None:
         self._generator = torch.Generator(device=self.candidate.tensor.device)
         self._generator.manual_seed(self.seed)
-        self._direction_parts: list[torch.Tensor] = []
+        self._direction_parts: dict[Any, torch.Tensor] = {}
 
     def for_task(self, module: Any, design: dict[str, Any]) -> TangentSamplerPartition | None:
+        if getattr(module, "_no_grad_op", False):
+            return None
         sample_count = getattr(module, "sample_count", None)
         if sample_count is None:
             return None
@@ -105,14 +107,18 @@ class RandomForwardContext:
             generator=self._generator,
             like=self.candidate.tensor,
         )
-        self._direction_parts.append(directions)
+        self._direction_parts[module] = directions
         return TangentSamplerPartition(self.candidate, directions)
 
     @property
     def directions(self) -> torch.Tensor:
+        from dsbo.modules.fused import producer_order_key
+
         if not self._direction_parts:
             return self.candidate.tensor.new_empty((0, self.candidate.tensor.numel()))
-        return torch.cat(self._direction_parts)
+        
+        producers = sorted(self._direction_parts, key=producer_order_key)
+        return torch.cat([self._direction_parts[producer] for producer in producers])
 
     def gradient(self, directional: torch.Tensor) -> torch.Tensor:
         directions = self.directions

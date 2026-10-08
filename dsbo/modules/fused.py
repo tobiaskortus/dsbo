@@ -19,6 +19,11 @@ def is_batch_fused(module: Module) -> bool:
     return getattr(module, "_is_batch_fused", False)
 
 
+def producer_order_key(module) -> int:
+    index = getattr(inner_module(module), "i", None)
+    return index if index is not None else -1
+
+
 def match_outputs_for(module: Module, input_path: AbstractFilePath) -> list[AbstractFilePath]:
     return [path for path in module.registered_outputs if path == input_path]
 
@@ -53,7 +58,7 @@ def resolve_input_overlay_paths(graph, task, input_path, index, candidate_subdir
 
     producers_sorted = sorted(
         candidate_producers,
-        key=lambda item: item[0].i if item[0].i is not None else -1,
+        key=lambda item: producer_order_key(item[0]),
     )
 
     if not producers_sorted:
