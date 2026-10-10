@@ -202,6 +202,10 @@ class StudyStorageBase:
         self._intermediates_storage: Optional[IntermediatesStorageBase] = None
 
     @property
+    def created_at(self) -> float | None:
+        raise NotImplementedError
+
+    @property
     def workflow(self) -> WorkflowStorageBase:
         return self._workflow_storage
     
