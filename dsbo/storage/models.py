@@ -24,6 +24,11 @@ class JobStatus(str, enum.Enum):
     FAILED  = "FAILED"
 
 
+class StudyMetadata(SQLModel, table=True):
+    id:         int   = Field(default=1, primary_key=True)
+    created_at: float = Field(sa_column=Column(Double, nullable=False))
+
+
 class Workflow(SQLModel, table=True):
     id:        str = Field(default_factory=_new_id, primary_key=True)
     graph:     str

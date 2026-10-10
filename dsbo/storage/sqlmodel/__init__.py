@@ -18,7 +18,7 @@ from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase, ArtifactStorageBase, Artifact
-from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow, ArtifactEntry
+from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow, ArtifactEntry, StudyMetadata
 from dsbo.utils.io.workdir import Workdir
 
 
@@ -557,6 +557,12 @@ class StudyStorage(StudyStorageBase):
         self._intermediates_storage = IntermediatesStorage(engine, readonly)
         self._artifact_storage = ArtifactStorage("artifacts", engine)
 
+    @property
+    def created_at(self) -> float | None:
+        with Session(self._engine) as session:
+            metadata = session.get(StudyMetadata, 1)
+            return metadata.created_at if metadata is not None else None
+
     def __getstate__(self) -> dict:
         url = self._engine.url.render_as_string(hide_password=False)
         if url == "sqlite:///:memory:":
@@ -591,12 +597,18 @@ class StudyStorage(StudyStorageBase):
                 "StudyStorage.open(...) to access the existing study."
             )
         
+        created_at = time.time()
         engine = create_engine(
             f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
         )
         if vector_dim is not None:
             _configure_sqlite_vec(engine, vector_dim)
-        return cls(engine, readonly=readonly, vector_dim=vector_dim)
+        storage = cls(engine, readonly=readonly, vector_dim=vector_dim)
+        StudyMetadata.__table__.create(engine, checkfirst=True)
+        with Session(engine) as session:
+            session.add(StudyMetadata(created_at=created_at))
+            session.commit()
+        return storage
 
     @classmethod
     def open(cls, db_path: Path | str, vector_dim: int | None = None) -> "StudyStorage":
