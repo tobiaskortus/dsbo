@@ -170,6 +170,18 @@ wf = Workflow(
 
 ![Dynamic submodules workflow with the training path excluded from gradient tracking: the ModuleA replica producing the training data and the train stage carry the no-grad flag](../img/workflow-no-grad.png)
 
+## Batch-Fused Stages
+
+Batch evaluation runs every stage once per candidate. Stages that operate on the batch as a whole — a model trained on all candidates' data, for instance — can instead be wrapped with `batch_fuse`. Such a stage runs **once per batch**: the inputs of all candidates are reduced into a single file, and the stage consumes them in a single call:
+
+```python
+from dsbo.modules import batch_fuse
+
+wf = Workflow(module_a >> batch_fuse(module_b))
+```
+
+The wrapped module must register at least one `Input`, and its returned metrics are discarded — results flow through files, which the framework then makes visible to each candidate again. Like `with_no_grad`, batch-fused stages do not propagate gradients.
+
 ## Resource Annotation
 
 Every module can carry a worker specification. Assign it with `.to()`, which returns the module and therefore composes with the DSL:
