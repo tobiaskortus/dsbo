@@ -10,7 +10,7 @@ Detector design requires evaluating thousands of candidate geometries through ex
 
 - **Scales from laptop to cluster**: Run the same workflow without a worker for local debugging, then parallelize across a Dask cluster without any code changes. Per-module CPU/GPU annotations let you route, e.g., simulations to CPU and reconstruction to GPU nodes.
 
-- **Unified surrogate plug-in**: A unified `patch()` interface assigns surrogates to either individual modules or entire workflows. The surrogate handles trust-regions and automatic re-training, while optimization algorithms interact with the workflow exactly as if no surrogate were present.
+- **Unified surrogate plug-in**: A unified `patch()` interface assigns surrogates to either individual modules or entire workflows. The surrogate handles trust-regions and automatic re-training, while optimization algorithms interact with the workflow exactly as if no surrogate was present.
 
 ## Installation
 
