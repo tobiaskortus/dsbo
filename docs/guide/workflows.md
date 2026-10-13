@@ -74,7 +74,7 @@ wf = Workflow(module_a * 30 >> module_b)
 Replicas paired with replicas are matched **one-to-one by replica index**. This runs three independent ModuleA-and-ModuleB pipelines — no cross-connections:
 
 ```python
-CPU_CONFIG = SLURMWorkerSpec(processes=5, cores=5, walltime="48:00:00", memory="48GB", partition="epyc")
+CPU_CONFIG = SLURMWorkerSpec(processes=5, cores=5, walltime="48:00:00", memory="48GB", partition="epyc-256")
 GPU_CONFIG = SLURMWorkerSpec(processes=1, cores=4, gpu_resources="gpu:1", memory="16GB", walltime="48:00:00")
 
 wf = Workflow(module_a.to(CPU_CONFIG) * 3 >> module_b.to(GPU_CONFIG) * 3)
@@ -144,7 +144,7 @@ wf = Workflow(
 
 ![Dynamic submodules as explicit stages: individual ModuleA runs feed train and validate, and validate loads the model written by train](../img/workflow-submodules.png)
 
-At runtime the submodules delegate to their parent: `module_b.train` runs the `train` method on the parent instance, so anything stored on `self` during `train` is visible to `validate` — provided both run in the same process. Like all modules, treat them as stateless across tasks and pass data through files instead (as the `model_file()` above does).
+At runtime the submodules delegate to their parent: `module_b.train` runs the `train` method on the parent instance, so anything stored on `self` during `train` is visible to `validate` — provided both run in the same process. Like all modules, treat them as stateless across tasks and pass data through files instead (as the `model_file()` above does; see [I/O and Autograd](io.md)).
 
 A few rules of thumb:
 
@@ -172,7 +172,7 @@ wf = Workflow(
 
 ## Batch-Fused Stages
 
-Batch evaluation runs every stage once per candidate. Stages that operate on the batch as a whole — a model trained on all candidates' data, for instance — can instead be wrapped with `batch_fuse`. Such a stage runs **once per batch**: the inputs of all candidates are reduced into a single file, and the stage consumes them in a single call:
+Batch evaluation runs every stage once per candidate. Stages that operate on the batch as a whole — a model trained on all candidates' data, for instance — can instead be wrapped with `batch_fuse`. Such a stage runs **once per batch**: the inputs of all candidates are reduced into a single file (see [Combining Replica Outputs](io.md#combining-replica-outputs)), and the stage consumes them in a single call:
 
 ```python
 from dsbo.modules import batch_fuse
@@ -189,7 +189,7 @@ Every module can carry a worker specification. Assign it with `.to()`, which ret
 ```python
 from dsbo.worker.spec import SLURMWorkerSpec
 
-CPU_CONFIG = SLURMWorkerSpec(processes=5, cores=5, walltime="48:00:00", memory="48GB", partition="epyc")
+CPU_CONFIG = SLURMWorkerSpec(processes=5, cores=5, walltime="48:00:00", memory="48GB", partition="epyc-256")
 GPU_CONFIG = SLURMWorkerSpec(processes=1, cores=4, gpu_resources="gpu:1", memory="16GB", walltime="48:00:00")
 
 wf = Workflow(module_a.to(CPU_CONFIG) >> module_b.to(GPU_CONFIG))

@@ -62,6 +62,7 @@ Workflows can be executed locally for debugging or distributed across a heteroge
     - [Writing Modules](guide/modules.md) covers all module types including simulation, reconstruction, and differentiable modules
     - [Building Workflows](guide/workflows.md) explains replication, fan-in, and parallel execution patterns
     - [I/O and Autograd](guide/io.md) details the workdir system and gradient tracking through `NumpyFile`
+    - [Writing Surrogates](guide/surrogates.md) explains surrogate strategies, the training lifecycle, and patching surrogates onto workflows and modules
 
 ## Documentation Structure
 
