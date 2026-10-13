@@ -34,7 +34,10 @@ Install directly from the repository without cloning:
 pip install git+https://github.com/tobiaskortus/dsbo
 ```
 
-**Requirements:** Python 3.10+, PyTorch 2.0+. For GPU support, install PyTorch with CUDA before installing DSBO.
+#### Requirements
+
+- **Python 3.10+**
+- **PyTorch 2.0+**. For GPU support, install PyTorch with CUDA before installing DSBO.
 
 ## Quick Start
 
