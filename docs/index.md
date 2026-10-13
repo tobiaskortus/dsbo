@@ -68,7 +68,6 @@ Workflows can be executed locally for debugging or distributed across a heteroge
 
 | Section | Content |
 |---------|---------|
-| **Core Concepts** | How the system works at a conceptual level: modules, workflows, surrogates |
 | **Guide** | Step-by-step instructions for writing modules, managing I/O, building workflows, and using surrogates |
 | **API Reference** | Precise signatures, method tables, and implementation details |
 | **Examples** | Real detector optimization pipelines (G4Calo, HepEmShow, Proton CT) |
