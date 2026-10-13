@@ -261,4 +261,4 @@ class MyModel(Module):
     @dynamic_submodule
     def train(self, design, **kwargs):
         ...
-```‚‚
+```
