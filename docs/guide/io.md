@@ -77,7 +77,7 @@ with Workdir.use_file_suffix("2"):
 
 A single **file backend** decides the format — how arrays, gradients, and replica reductions are written to and read from disk — keeping the whole workflow consistent without any module knowing about it.
 
-Three backends are available, all implementing the same interface (`dsbo.utils.io.storage.AutogradFileInterface`):
+Two backends are available, all implementing the same interface (`dsbo.utils.io.storage.AutogradFileInterface`):
 
 - `HDF5File` — the default. Stores arrays as HDF5 datasets; widely supported and inspectable with standard tools.
 - `ROOTFile` — stores arrays as ROOT TTrees via uproot; use it when results must be readable from ROOT-based analysis pipelines.
