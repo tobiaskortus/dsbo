@@ -11,6 +11,8 @@ from dsbo.parameters.types import (Categorical, Constant, DesignParameter, Encod
 from dsbo.parameters.sampling import Sampler
 
 
+
+
 class ParameterSpace:
     def __init__(self, *, key_fn: Callable[[Tuple[str, ...]], str] = lambda x: ".".join(x),
                  **spec: Union[DesignParameter, Group]):
@@ -173,7 +175,15 @@ class Candidate:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Candidate):
             return NotImplemented
-        return self.values == other.values
+
+        def eq(a: Any, b: Any) -> bool:
+            if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+                return (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
+                        and a.shape == b.shape and torch.equal(a.detach(), b.detach()))
+            return a == b
+
+        left, right = self.values, other.values
+        return left.keys() == right.keys() and all(eq(v, right[k]) for k, v in left.items())
 
     def __repr__(self) -> str:
         parts = []
