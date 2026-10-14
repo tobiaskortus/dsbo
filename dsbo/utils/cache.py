@@ -108,14 +108,14 @@ def write_npz(cache_entry_path: str, results: dict[str, Any]) -> list[str]:
     npz: dict[str, np.ndarray] = {}
     tangent_keys: list[str] = []
     for k, v in results.items():
-        if isinstance(v, torch.Tensor):
-            dual = fw.unpack_dual(v)
-            npz[f"{k}_primal"] = dual.primal.detach().cpu().numpy()
-            if dual.tangent is not None:
-                npz[f"{k}_tangent"] = dual.tangent.detach().cpu().numpy()
-                tangent_keys.append(k)
-        else:
-            npz[k] = np.asarray(v)
+        if not isinstance(v, torch.Tensor):
+            raise TypeError(f"Cache result '{k}' must be a torch.Tensor, got {type(v).__name__}")
+
+        dual = fw.unpack_dual(v)
+        npz[f"{k}_primal"] = dual.primal.detach().cpu().numpy()
+        if dual.tangent is not None:
+            npz[f"{k}_tangent"] = dual.tangent.detach().cpu().numpy()
+            tangent_keys.append(k)
     np.savez(os.path.join(cache_entry_path, RESULTS_NAME), **npz)
     return tangent_keys
 
