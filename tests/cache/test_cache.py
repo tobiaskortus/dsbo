@@ -1,10 +1,9 @@
 import os
-import json
+import numpy as np
 import torch
 import pytest
-from unittest.mock import patch
 
-from dsbo.modules import batch_fuse, BatchFusedModule
+from dsbo.modules import batch_fuse
 from dsbo.workflow import Workflow
 from dsbo.utils.random import seed_all, get_random_engine
 from dsbo.utils.cache import (
@@ -20,11 +19,8 @@ from dsbo.utils.cache import (
     load_cache_entry,
     check_cache_entry,
     WorkflowExecutionCache,
-    CACHE_DIR,
-    MANIFEST_NAME,
     RESULTS_NAME,
 )
-from dsbo.modules import Module
 from dsbo.parameters import ParameterSpace, Vector, Continuous, Candidate, CandidateBatch
 from dsbo.surrogates.graph_transformations import GraphMode
 
@@ -32,7 +28,6 @@ from tests.cache.conftest import (
     SimpleModule,
     AnotherModule,
     H5Producer,
-    H5Consumer,
     H5InputModule,
 )
 
@@ -256,11 +251,23 @@ def test_write_load_multiple_keys(temp_dir):
     assert torch.allclose(loaded["c"], torch.tensor(3.0))
 
 
-def test_write_non_tensor_results(temp_dir):
-    results = {"scalar": 42, "list_val": [1, 2, 3]}
-    tangent_keys = write_npz(str(temp_dir), results)
-    assert tangent_keys == []
-    assert os.path.isfile(os.path.join(str(temp_dir), RESULTS_NAME))
+@pytest.mark.parametrize("value", [42, 42.0, True, [1, 2, 3], np.array([1, 2, 3]), None],
+                         ids=["int", "float", "bool", "list", "numpy-array", "none"])
+def test_write_rejects_non_tensor_results(temp_dir, value):
+    results = {"tensor": torch.tensor(1.0), "invalid": value}
+
+    with pytest.raises(TypeError, match=f"'invalid' must be a torch\.Tensor, got {type(value).__name__}"):
+        write_npz(str(temp_dir), results)
+
+    # Ensure no file was written
+    assert not os.path.isfile(os.path.join(str(temp_dir), RESULTS_NAME))
+
+
+def test_save_load_tensor_subclass(temp_dir):
+    result = torch.nn.Parameter(torch.tensor(7.0))
+    save_cache_entry(str(temp_dir), "wf1", "cand1", {"out": result})
+    loaded = load_cache_entry(str(temp_dir), "wf1", "cand1")
+    assert torch.allclose(loaded["out"], result)
 
 
 def test_write_load_tangent_and_primal_mixed(temp_dir):
