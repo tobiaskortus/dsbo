@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import pytest
+import torch.autograd.forward_ad as fw
 
 from dsbo.modules import batch_fuse
 from dsbo.workflow import Workflow
@@ -197,6 +198,55 @@ def test_candidate_hash_multi_dim_tensor():
     assert compute_candidate_hash(c) == compute_candidate_hash(c)
 
 
+def test_candidate_hash_includes_tangent_direction_and_magnitude():
+    space = ParameterSpace(x=Vector(0, 10, 2))
+    candidate = Candidate(space, torch.tensor([2.0, 4.0]))
+    with fw.dual_level():
+        # This set creation is used to count the number of unique hashes created.
+        # It should be unique for each of the tangents listed, [1., 0.], [0., 1.], and [2., 0.]
+        hashes = {
+            compute_candidate_hash(candidate.set_tangent(torch.tensor(tangent)))
+            for tangent in ([1.0, 0.0], [0.0, 1.0], [2.0, 0.0])
+        }
+    assert len(hashes) == 3
+
+
+def test_candidate_hash_distinguishes_missing_and_zero_tangent(candidate):
+    with fw.dual_level():
+        missing_hash = compute_candidate_hash(candidate)
+        zero_hash = compute_candidate_hash(candidate.set_tangent(torch.zeros_like(candidate.tensor)))
+    assert missing_hash != zero_hash
+
+
+def test_candidate_hash_includes_forward_ad_mode(candidate):
+    primal_hash = compute_candidate_hash(candidate)
+    with fw.dual_level():
+        forward_hash = compute_candidate_hash(candidate)
+    assert primal_hash != forward_hash
+    assert compute_candidate_hash(candidate) == primal_hash
+
+
+def test_candidate_hash_stable_across_dual_levels(candidate):
+    hashes = []
+    for _ in range(2):
+        with fw.dual_level():
+            dual_candidate = candidate.set_tangent(torch.ones_like(candidate.tensor))
+            clone = Candidate(candidate.space, dual_candidate.tensor.clone())
+            hashes.append(compute_candidate_hash(dual_candidate))
+            assert compute_candidate_hash(clone) == hashes[-1]
+    assert hashes[0] == hashes[1]
+
+
+@pytest.mark.parametrize("tensor_a,tensor_b", [
+    (torch.zeros(4), torch.zeros(2, 2)),
+    (torch.zeros(2, dtype=torch.float32), torch.zeros(2, dtype=torch.int32)),
+], ids=["shape", "dtype"])
+def test_candidate_hash_includes_tensor_metadata(simple_space, tensor_a, tensor_b):
+    assert tensor_a.numpy().tobytes() == tensor_b.numpy().tobytes()
+    assert (compute_candidate_hash(Candidate(simple_space, tensor_a)) !=
+            compute_candidate_hash(Candidate(simple_space, tensor_b)))
+
+
 def test_entry_dir_deterministic():
     assert entry_dir("/base", "a", "b") == entry_dir("/base", "a", "b")
 
@@ -215,7 +265,6 @@ def test_write_load_scalar_results(temp_dir, results):
 
 
 def test_write_load_with_tangent(temp_dir, results_with_tangent):
-    import torch.autograd.forward_ad as fw
     tangent_keys = write_npz(str(temp_dir), results_with_tangent)
     assert "out" in tangent_keys
     manifest = {"result_keys": ["out"], "tangent_keys": tangent_keys}
@@ -271,7 +320,6 @@ def test_save_load_tensor_subclass(temp_dir):
 
 
 def test_write_load_tangent_and_primal_mixed(temp_dir):
-    import torch.autograd.forward_ad as fw
     with fw.dual_level():
         results = {
             "a": fw.make_dual(torch.tensor(1.0), torch.tensor(10.0)),
@@ -288,6 +336,19 @@ def test_write_load_tangent_and_primal_mixed(temp_dir):
         assert torch.allclose(a_primal, torch.tensor(1.0))
         assert torch.allclose(a_tangent, torch.tensor(10.0))
         assert torch.allclose(loaded["b"], torch.tensor(2.0))
+
+
+def test_load_tangent_without_dual_level_returns_miss(temp_dir):
+    with fw.dual_level():
+        save_cache_entry(str(temp_dir), "wf1", "cand1", {
+            "out": fw.make_dual(torch.tensor(10.0), torch.tensor(2.0)),
+            "constant": torch.tensor(7.0),
+        })
+    assert check_cache_entry(str(temp_dir), "wf1", "cand1")
+    manifest = {"result_keys": ["out", "constant"], "tangent_keys": ["out"]}
+    path = entry_dir(str(temp_dir), "wf1", "cand1")
+    assert load_npz(path, manifest) is None
+    assert load_cache_entry(str(temp_dir), "wf1", "cand1") is None
 
 
 def test_check_missing_entry(temp_dir):
@@ -472,6 +533,79 @@ def test_match_partial(temp_dir, candidate_batch, simple_space):
     assert results[2] is None
     assert misses[0].tensor.item() == 3.0
     assert indices == [2]
+
+
+def test_match_partial_empty_result_is_hit(temp_dir, candidate):
+    cache = WorkflowExecutionCache(Workflow(SimpleModule()), workdir_root=str(temp_dir))
+    cache.save(candidate, {})
+    results, misses, indices = cache.match_partial([candidate])
+    assert results == [{}]
+    assert misses == []
+    assert indices == []
+
+
+def test_load_or_compute_recomputes_rejected_entries(temp_dir, simple_space):
+    cache = WorkflowExecutionCache(Workflow(SimpleModule()), workdir_root=str(temp_dir))
+    candidates = [
+        Candidate(simple_space, torch.tensor([value])) for value in (1.0, 2.0, 3.0)
+    ]
+    cache.save(candidates[1], {"out": torch.tensor(20.0)})
+
+    # Put tangent-containing results under a primal key to exercise loader rejection.
+    primal_hash = compute_candidate_hash(candidates[0])
+    with fw.dual_level():
+        save_cache_entry(str(temp_dir), cache.workflow_hash, primal_hash, {
+            "out": fw.make_dual(torch.tensor(10.0), torch.tensor(1.0)),
+        })
+    # The key exists...
+    assert cache.has(candidates[0])
+    # ... but only with a dual, so outside of the dual_level() context, the result is still None
+    assert cache.load(candidates[0]) is None
+
+    results, misses, indices = cache.match_partial(candidates)
+    assert results[0] is None
+    assert torch.equal(results[1]["out"], torch.tensor(20.0))
+    assert results[2] is None
+    assert misses == [candidates[0], candidates[2]]
+    assert indices == [0, 2]
+
+    computed_candidates = []
+
+    def compute(misses):
+        computed_candidates.extend(misses)
+        return [{"out": candidate.tensor[0] * 10} for candidate in misses]
+
+    results = cache.load_or_compute(candidates, compute)
+    assert computed_candidates == [candidates[0], candidates[2]]
+    assert [result["out"].item() for result in results] == [10.0, 20.0, 30.0]
+    assert torch.equal(cache.load(candidates[0])["out"], torch.tensor(10.0))
+    assert cache.has_all(candidates)
+
+
+def test_directional_cache_round_trip_across_instances_and_dual_levels(temp_dir):
+    space = ParameterSpace(x=Vector(0, 10, 2))
+    candidate = Candidate(space, torch.tensor([2.0, 4.0]))
+    cache = WorkflowExecutionCache(Workflow(SimpleModule()), workdir_root=str(temp_dir))
+    directions = [(torch.tensor([1.0, 0.0]), 4.0), (torch.tensor([0.0, 1.0]), 3.0)]
+
+    with fw.dual_level():
+        for tangent, _ in directions:
+            dual_candidate = candidate.set_tangent(tangent)
+            assert not cache.has(dual_candidate)
+            x, y = dual_candidate.tensor.unbind()
+            cache.save(dual_candidate, {"out": x ** 2 + 3 * y, "constant": torch.tensor(7.0)})
+
+    cache = WorkflowExecutionCache(Workflow(SimpleModule()), workdir_root=str(temp_dir))
+    with fw.dual_level():
+        for tangent, expected in directions:
+            dual_candidate = candidate.set_tangent(tangent)
+            assert cache.has(dual_candidate)
+            loaded = cache.load(dual_candidate)
+            assert loaded is not None
+            primal, loaded_tangent = fw.unpack_dual(loaded["out"])
+            assert torch.equal(primal, torch.tensor(16.0))
+            assert torch.equal(loaded_tangent, torch.tensor(expected))
+            assert fw.unpack_dual(loaded["constant"]).tangent is None
 
 
 def test_load_or_compute_merges_and_caches_misses(temp_dir, simple_space):
