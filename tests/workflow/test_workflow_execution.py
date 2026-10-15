@@ -7,7 +7,7 @@ from dsbo.workflow import (
     run_batch, run_batch_reverse_autograd, RunBatchAutogradFn,
     to_1d_tensor, candidates_from_tensor, Workflow,
 )
-from dsbo.utils.io import Input, Output, Workdir
+from dsbo.utils.io import Input, Output, Workdir, get_subdir
 from dsbo.utils.io.storage.hdf5 import HDF5File
 from dsbo.modules import BatchFusedModule, Module, batch_fuse
 from dsbo.utils.io import Workdir
@@ -146,6 +146,44 @@ class TestRunBatchLocal:
         mock_warm.assert_called_once_with(wf, verbose=True)
 
 
+class TestDuplicateResultKeys:
+    """Duplicate result keys make the merged result and its gradient
+    ambiguous, so merging must raise (bugs.md #3 family)."""
+
+    def _duplicate_key_workflow(self):
+        class Dup(Module):
+            def __call__(self, design, **kwargs):
+                return {"out": design["x"] * 2.0}
+
+        return Workflow(Dup() >> Dup())
+
+    def test_local_run_batch_raises_on_duplicate_result_keys(self):
+        wf = self._duplicate_key_workflow()
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
+
+        with pytest.raises(ValueError, match="result keys"):
+            run_batch(wf, [cand])
+
+    def test_distributed_run_batch_raises_on_duplicate_result_keys(self):
+        from tests.workflow.conftest import MockDaskWorker
+        from dsbo.worker.dask import WorkerContext
+
+        wf = self._duplicate_key_workflow()
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
+
+        worker = MockDaskWorker()
+
+        def colliding_gather(futures, catch=()):
+            # Both scheduled tasks report results under the same key.
+            return [(tid, {"out": torch.tensor(1.0)}) for tid, _, _, _ in worker.scheduled]
+
+        worker.gather = colliding_gather
+
+        with WorkerContext.use_worker(worker):
+            with pytest.raises(ValueError, match="result keys"):
+                run_batch(wf, [cand])
+
+
 class TestRunBatchReverseAutograd:
     def test_gradients_for_backward_module(self, simple_space):
         m = BackwardModule()
@@ -209,42 +247,42 @@ class TestRunBatchReverseAutograd:
 
         class DiamondA(Module):
             def __call__(self, design, **kwargs):
-                return {"out": design["x"] * 2.0}
+                return {"out_a": design["x"] * 2.0}
             def backward(self, design, grad_output=None):
                 order.append("A")
                 x = design["x"]
                 out = x * 2.0
-                grad = grad_output["out"] if grad_output is not None else torch.ones_like(out)
+                grad = grad_output["out_a"] if grad_output is not None else torch.ones_like(out)
                 out.backward(grad)
 
         class DiamondB(Module):
             def __call__(self, design, **kwargs):
-                return {"out": design["x"] * 3.0}
+                return {"out_b": design["x"] * 3.0}
             def backward(self, design, grad_output=None):
                 order.append("B")
                 x = design["x"]
                 out = x * 3.0
-                grad = grad_output["out"] if grad_output is not None else torch.ones_like(out)
+                grad = grad_output["out_b"] if grad_output is not None else torch.ones_like(out)
                 out.backward(grad)
 
         class DiamondC(Module):
             def __call__(self, design, **kwargs):
-                return {"out": design["x"] * 4.0}
+                return {"out_c": design["x"] * 4.0}
             def backward(self, design, grad_output=None):
                 order.append("C")
                 x = design["x"]
                 out = x * 4.0
-                grad = grad_output["out"] if grad_output is not None else torch.ones_like(out)
+                grad = grad_output["out_c"] if grad_output is not None else torch.ones_like(out)
                 out.backward(grad)
 
         class DiamondD(Module):
             def __call__(self, design, **kwargs):
-                return {"out": design["x"] * 5.0}
+                return {"out_d": design["x"] * 5.0}
             def backward(self, design, grad_output=None):
                 order.append("D")
                 x = design["x"]
                 out = x * 5.0
-                out.backward(grad_output["out"])
+                out.backward(grad_output["out_d"])
 
         a, b, c, d = DiamondA(), DiamondB(), DiamondC(), DiamondD()
         dd = DependencyDict({a: [b, c], b: [d], c: [d]})
@@ -262,6 +300,133 @@ class TestRunBatchReverseAutograd:
         expected_grad = 5.0 + 3.0 + 4.0 + 2.0
         assert x.grad is not None
         assert abs(x.grad.item() - expected_grad) < 1e-5
+
+
+class TestBackwardWorkdirContext:
+    """The local backward pass must replay each candidate's forward I/O context:
+    per-candidate tasks run under their batch_i subdir and receive the forward
+    file overlays, so registered files resolve to the correct candidate's data."""
+
+    def test_backward_enters_batch_subdirs(self, simple_space):
+        recorded = []
+
+        class SubdirRecorder(Module):
+            def __call__(self, design, **kwargs):
+                return {"out": design["x"]}
+            def backward(self, design, grad_output=None):
+                recorded.append(get_subdir())
+
+        wf = Workflow(SubdirRecorder())
+        cands = [Candidate(simple_space, torch.tensor([1.0], requires_grad=True)),
+                 Candidate(simple_space, torch.tensor([2.0], requires_grad=True))]
+        grads = run_batch_reverse_autograd(wf, cands, [{"out": torch.tensor(1.0)}] * 2)
+        assert recorded == ["batch_0", "batch_1"]
+        assert len(grads) == 2
+
+    def test_backward_single_candidate_has_no_subdir(self, simple_space):
+        recorded = []
+
+        class SubdirRecorder(Module):
+            def __call__(self, design, **kwargs):
+                return {"out": design["x"]}
+            def backward(self, design, grad_output=None):
+                recorded.append(get_subdir())
+
+        wf = Workflow(SubdirRecorder())
+        cand = Candidate(simple_space, torch.tensor([1.0], requires_grad=True))
+        run_batch_reverse_autograd(wf, [cand], [{"out": torch.tensor(1.0)}])
+        assert recorded == [""]
+
+    def test_backward_reads_intermediates_from_batch_subdirs(self, simple_space):
+        class Producer(Module):
+            def __init__(self):
+                super().__init__()
+                self.output = Output(Workdir.register_file("simulation", "events.h5"))
+
+            def __call__(self, design, **kwargs):
+                HDF5File.write(self.output(), (design["x"] * 2.0).reshape(1))
+
+            def backward(self, design, grad_output=None):
+                grad = HDF5File.read_backward_gradient(self.output())
+                (design["x"].reshape(1) * 2.0).backward(grad)
+
+        class Consumer(Module):
+            def __init__(self):
+                super().__init__()
+                self.input = Input(Workdir.register_file("simulation", "events.h5"))
+
+            def __call__(self, design, **kwargs):
+                return {"out": HDF5File.open(self.input(), "cpu").sum()}
+
+            def backward(self, design, grad_output=None):
+                x = HDF5File.open(self.input(), "cpu")
+                x.sum().backward(grad_output["out"])
+
+        wf = Workflow(Producer() >> Consumer())
+        cands = [Candidate(simple_space, torch.tensor([1.0])),
+                 Candidate(simple_space, torch.tensor([2.0]))]
+
+        results = run_batch(wf, cands)
+        assert torch.allclose(results[0]["out"], torch.tensor(2.0))
+        assert torch.allclose(results[1]["out"], torch.tensor(4.0))
+
+        grads = run_batch_reverse_autograd(
+            wf, cands, [{"out": torch.tensor(1.0)}, {"out": torch.tensor(2.0)}]
+        )
+        assert torch.allclose(grads[0], torch.tensor(2.0))
+        assert torch.allclose(grads[1], torch.tensor(4.0))
+
+    def test_backward_replays_file_overlays(self, simple_space):
+        overlays_seen = []
+
+        class Producer(Module):
+            def __init__(self):
+                super().__init__()
+                self.output = Output(Workdir.register_file("simulation", "events.h5"))
+
+            def __call__(self, design, **kwargs):
+                HDF5File.write(self.output(), design["x"].reshape(1))
+
+        class Consumer(Module):
+            def __init__(self):
+                super().__init__()
+                self.input = Input(Workdir.register_file("simulation", "events.h5"))
+
+            def __call__(self, design, **kwargs):
+                return {"out": HDF5File.open(self.input(), "cpu").sum()}
+
+            def backward(self, design, grad_output=None):
+                overlays_seen.append(Workdir.get_file_overlay(self.registered_inputs[0]))
+
+        wf = Workflow(Producer() >> Consumer())
+        cands = [Candidate(simple_space, torch.tensor([1.0])),
+                 Candidate(simple_space, torch.tensor([2.0]))]
+
+        run_batch(wf, cands)
+        run_batch_reverse_autograd(wf, cands, [{"out": torch.tensor(1.0)}] * 2)
+
+        assert overlays_seen[0] is not None and "batch_0" in overlays_seen[0]
+        assert overlays_seen[1] is not None and "batch_1" in overlays_seen[1]
+
+    def test_batch_fused_backward_uses_batch_reduce_subdir(self, simple_space, candidates):
+        recorded = []
+
+        class RecordingFused(BatchFusedModule):
+            def backward(self, design, grad_output=None):
+                recorded.append(get_subdir())
+
+        class Inner(Module):
+            def __init__(self):
+                super().__init__()
+                self.input = Input(Workdir.register_file("simulation", "events.h5"))
+
+            def __call__(self, design, **kwargs):
+                return {}
+
+        wf = Workflow(RecordingFused(Inner()))
+        grad_outputs = [{"out": torch.tensor(1.0)} for _ in candidates]
+        run_batch_reverse_autograd(wf, candidates, grad_outputs)
+        assert recorded == ["batch_reduce"] * len(candidates)
 
 
 class TestWorkflowRunBatchNoAutograd:
@@ -474,7 +639,7 @@ class TestBatchFuse:
                 self.input = Input(Workdir.register_file("simulation", "events.h5"))
 
             def __call__(self, design, **kwargs):
-                return {"total": HDF5File.open(self.input(), "cpu").sum()}
+                return {f"total_{self.i}": HDF5File.open(self.input(), "cpu").sum()}
 
         producers = list((Producer() * 2).keys())
         consumers = list((Consumer() * 3).keys())
@@ -484,7 +649,7 @@ class TestBatchFuse:
         })
 
         results = Workflow(dependencies).run_batch(candidates)
-        assert [result["total"].item() for result in results] == [12.0, 14.0, 16.0]
+        assert [result["total_0"].item() for result in results] == [12.0, 14.0, 16.0]
         for candidate_index, candidate in enumerate(candidates):
             for producer in producers:
                 source = Workdir.resolve_file(
@@ -533,10 +698,11 @@ class TestBatchFuse:
                 self.input = Input(Workdir.register_file("simulation", "events.h5"))
 
             def __call__(self, design, **kwargs):
-                return {"total": HDF5File.open(self.input(), "cpu").sum()}
+                return {f"total_{self.i}": HDF5File.open(self.input(), "cpu").sum()}
 
         producers = list((Producer() * 4).keys())
         consumers = [Consumer(), Consumer()]
+        consumers[0].i, consumers[1].i = 0, 1
         dependencies = DependencyDict({
             producers[0]: [consumers[0]],
             producers[1]: [consumers[0]],

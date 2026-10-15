@@ -79,6 +79,53 @@ def test_file_backend_backward_gradient(file_backend):
         torch.testing.assert_close(grad, 2.0 * primal)
 
 
+@pytest.mark.parametrize("reversed_order", [False, True])
+def test_file_backend_backward_gradient_double_open(file_backend, reversed_order):
+    backend, extension = file_backend
+    backend.reset_gradient_state()
+    with TemporaryDirectory() as tempdir:
+        file_path = os.path.join(tempdir, f"x{extension}")
+        primal = torch.tensor([2.0, 3.0])
+        backend.write(file_path, primal)
+
+        with torch.enable_grad():
+            a = backend.open(file_path, "cpu")
+            b = backend.open(file_path, "cpu")
+            if reversed_order:
+                y = (2 * a + b).sum()
+            else:
+                y = (a + 2 * b).sum()
+            expected = torch.tensor([3.0, 3.0])
+            assert len(backend.handles[file_path]) == 2
+
+            y.backward()
+
+        grad = backend.read_backward_gradient(file_path)
+        torch.testing.assert_close(grad, expected)
+        # Both hooks removed themselves; no dangling handles remain.
+        backend.reset_gradient_state()
+        assert file_path not in backend.handles
+
+
+def test_file_backend_backward_gradient_double_open_partial_participation(file_backend):
+    backend, extension = file_backend
+    backend.reset_gradient_state()
+    with TemporaryDirectory() as tempdir:
+        file_path = os.path.join(tempdir, f"x{extension}")
+        primal = torch.tensor([2.0, 3.0])
+        backend.write(file_path, primal)
+
+        with torch.enable_grad():
+            backend.open(file_path, "cpu")
+            b = backend.open(file_path, "cpu")
+            (b * 3.0).sum().backward()
+
+        grad = backend.read_backward_gradient(file_path)
+        torch.testing.assert_close(grad, torch.tensor([3.0, 3.0]))
+        backend.reset_gradient_state()
+        assert file_path not in backend.handles
+
+
 def test_hdf5_file_named_columns():
     with TemporaryDirectory() as tempdir, torch.no_grad():
         file_path = os.path.join(tempdir, "x.h5")
