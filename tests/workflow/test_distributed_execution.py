@@ -20,11 +20,20 @@ from tests.workflow.conftest import (
 from dsbo.modules.fused import BatchFusedModule
 
 
+class KeyedModule(Module):
+    """SimpleModule variant with a configurable result key."""
+    def __init__(self, key):
+        super().__init__()
+        self.key = key
+    def __call__(self, design, **kwargs):
+        return {self.key: design["x"] * 2.0}
+
+
 class TestDistributedRunBatch:
     def test_correct_delayed_dependencies(self):
-        m1 = SimpleModule()
-        m2 = SimpleModule()
-        m3 = SimpleModule()
+        m1 = KeyedModule("out_1")
+        m2 = KeyedModule("out_2")
+        m3 = KeyedModule("out_3")
         wf = Workflow(m1 >> m2 >> m3)           # chain: m1→m2→m3
         cands = [
             Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([1.0])),
@@ -290,7 +299,7 @@ class TestDistributedRunBatchRealCluster:
 
     def test_run_batch_chain(self, local_worker):
         m1 = SimpleModule()
-        m2 = SimpleModule()
+        m2 = KeyedModule("out_2")
         wf = Workflow(m1 >> m2)
         cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
 
@@ -300,6 +309,7 @@ class TestDistributedRunBatchRealCluster:
         assert len(results) == 1
         # Each module operates on raw candidate design: 3*2=6
         assert torch.allclose(results[0]["out"], torch.tensor(6.0))
+        assert torch.allclose(results[0]["out_2"], torch.tensor(6.0))
 
     def test_run_batch_catches_exceptions(self, local_worker):
         wf = Workflow(FailingModule())

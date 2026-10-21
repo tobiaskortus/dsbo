@@ -57,7 +57,8 @@ def merge_gradients(existing: GradientBlock | None, contribution: GradientBlock)
 
 
 class AutogradFileInterface(ABC):
-    handles: dict[str, RemovableHandle] = {}
+    handles: dict[str, list[RemovableHandle]] = {}
+    _gradient_written: set[str] = set()
     _registered_extensions: set[str] = set()
 
     def __init_subclass__(cls, **kwargs):
@@ -80,8 +81,10 @@ class AutogradFileInterface(ABC):
     @classmethod
     def reset_gradient_state(cls):
         """Call at the start of each backward pass to clear per-pass gradient tracking."""
-        for handle in cls.handles.values():
-            handle.remove()
+        cls._gradient_written.clear()
+        for reader_handles in cls.handles.values():
+            for handle in reader_handles:
+                handle.remove()
         cls.handles.clear()
 
     @classmethod
@@ -99,10 +102,19 @@ class AutogradFileInterface(ABC):
 
             if torch.is_grad_enabled():
                 x.requires_grad_(True)
-                handle = x.register_post_accumulate_grad_hook(
-                    lambda x: cls.write_backward_gradient(x.grad.detach().cpu().numpy(), fpath, columns=columns)
-                )
-                cls.handles[fpath] = handle
+                handle_holder: dict[str, RemovableHandle] = {}
+
+                def _post_accumulate_grad_hook(t: torch.Tensor):
+                    cls.write_backward_gradient(
+                        t.grad.detach().cpu().numpy(),
+                        fpath,
+                        handle=handle_holder["handle"],
+                        columns=columns,
+                    )
+
+                handle = x.register_post_accumulate_grad_hook(_post_accumulate_grad_hook)
+                handle_holder["handle"] = handle
+                cls.handles.setdefault(fpath, []).append(handle)
 
             return x
 
@@ -158,15 +170,31 @@ class AutogradFileInterface(ABC):
         pass
 
     @classmethod
-    def write_backward_gradient(cls, gradient: np.ndarray, fpath: str, columns: list[str] | None = None):
+    def write_backward_gradient(
+        cls,
+        gradient: np.ndarray,
+        fpath: str,
+        handle: RemovableHandle,
+        columns: list[str] | None = None,
+    ):
         if fpath not in cls.handles:
             raise RuntimeError(
                 f"Trying to write backward gradient for '{fpath}', but no autograd hook is "
                 "registered. open() was never called for this file in the current forward pass."
             )
         cls.add_gradient(cls._gradient_path(fpath), GradientBlock(gradient, columns))
-        cls.handles[fpath].remove()
-        del cls.handles[fpath]
+        handle.remove()
+        cls.handles[fpath].remove(handle)
+        if not cls.handles[fpath]:
+            del cls.handles[fpath]
+
+    @classmethod
+    def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
+        return cls.load_gradient(grad_path, columns=columns).values
+
+    @classmethod
+    def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
+        cls.store_gradient(grad_path, GradientBlock(gradient, columns))
 
     @classmethod
     def add_gradient(

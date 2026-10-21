@@ -15,11 +15,6 @@ theme:
     - bash
 nav:
   - Home: index.md
-  - Core Concepts:
-    - Overview: core/overview.md
-    - Modules: core/modules.md
-    - Workflows: core/workflow.md
-    - Surrogates: core/surrogates.md
   - Guide:
     - Writing Modules: guide/modules.md
     - Building Workflows: guide/workflows.md
@@ -37,4 +32,5 @@ nav:
   - Examples:
     - HepEmShow: examples/hepemshow.md
   - Troubleshooting: troubleshooting.md
-  - Contributing: contributing.md
+  - Contributing:
+    - Overview: contributing.md

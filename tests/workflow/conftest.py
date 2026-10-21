@@ -58,10 +58,12 @@ class MockDaskWorker(DaskWorkerBase):
     def gather(self, futures, catch=()):
         if self._gather_results is not None:
             return self._gather_results
-        # Default: return a dict with "out" for each scheduled task
+        # Default: return a unique result key per scheduled task
         if self._gather_forward_results:
-            return [(tid, {"out": torch.tensor(10.0)})
-                    for tid, _, _, _ in self.scheduled]
+            return [
+                (tid, {f"out_{n}": torch.tensor(10.0)})
+                for n, (tid, _, _, _) in enumerate(self.scheduled)
+            ]
         else:
             return [(tid, torch.tensor([10.0]))
                     for tid, _, _, _ in self.backward_scheduled]
@@ -202,8 +204,14 @@ def single_module_workflow():
 
 @pytest.fixture
 def chain_workflow():
+    class ChainedModule(Module):
+        def __init__(self):
+            super().__init__()
+        def __call__(self, design, **kwargs):
+            return {"out_2": design["x"] * 2.0}
+
     m1 = SimpleModule()
-    m2 = SimpleModule()
+    m2 = ChainedModule()
     return Workflow(m1 >> m2)
 
 @pytest.fixture

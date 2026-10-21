@@ -6,11 +6,11 @@ DSBO is a Python framework for **composable, distributed simulation workflows** 
 
 Detector design requires evaluating thousands of candidate geometries through expensive Monte Carlo simulations. DSBO makes this practical by modeling the optimization as a configurable, distributed pipeline:
 
-- **Declarative workflow definition**: The Python DSL (`>>`, `|`, `*`) lets you define complex simulation-to-reconstruction pipelines in a few lines of code. The framework handles execution order, parallelization, and data dependencies automatically.
+- **Declarative workflow definition**: The Python domain-specific language (DSL) (`>>`, `|`, `*`) lets you define complex simulation-to-reconstruction pipelines in a few lines of code. The framework handles execution order, parallelization, and data dependencies automatically.
 
-- **Scales from laptop to cluster**: Run the same workflow without a worker for local debugging, then parallelize across a Dask cluster without any code changes. Per-module CPU/GPU annotations let you route simulations to GPU and reconstruction to CPU nodes.
+- **Scales from laptop to cluster**: Run the same workflow without a worker for local debugging, then parallelize across a Dask cluster without any code changes. Per-module CPU/GPU annotations let you route, e.g., simulations to CPU and reconstruction to GPU nodes.
 
-- **Unified surrogate plug-in**: A unified `patch()` interface assigns surrogates to either individual modules or entire workflows. The surrogate handles trust-regions and automatic re-training, while optimization algorithms interact with the workflow exactly as if no surrogate were present.
+- **Unified surrogate plug-in**: A unified `patch()` interface assigns surrogates to either individual modules or entire workflows. The surrogate handles trust-regions and automatic re-training, while optimization algorithms interact with the workflow exactly as if no surrogate was present.
 
 ## Installation
 
@@ -34,7 +34,10 @@ Install directly from the repository without cloning:
 pip install git+https://github.com/tobiaskortus/dsbo
 ```
 
-**Requirements:** Python 3.10+, PyTorch 2.0+. For GPU support, install PyTorch with CUDA before installing DSBO.
+#### Requirements
+
+- **Python 3.10+**
+- **PyTorch 2.0+**. For GPU support, install PyTorch with CUDA before installing DSBO.
 
 ## Quick Start
 
@@ -59,12 +62,12 @@ Workflows can be executed locally for debugging or distributed across a heteroge
     - [Writing Modules](guide/modules.md) covers all module types including simulation, reconstruction, and differentiable modules
     - [Building Workflows](guide/workflows.md) explains replication, fan-in, and parallel execution patterns
     - [I/O and Autograd](guide/io.md) details the workdir system and gradient tracking through `NumpyFile`
+    - [Writing Surrogates](guide/surrogates.md) explains surrogate strategies, the training lifecycle, and patching surrogates onto workflows and modules
 
 ## Documentation Structure
 
 | Section | Content |
 |---------|---------|
-| **Core Concepts** | How the system works at a conceptual level: modules, workflows, surrogates |
 | **Guide** | Step-by-step instructions for writing modules, managing I/O, building workflows, and using surrogates |
 | **API Reference** | Precise signatures, method tables, and implementation details |
 | **Examples** | Real detector optimization pipelines (G4Calo, HepEmShow, Proton CT) |

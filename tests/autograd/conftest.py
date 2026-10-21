@@ -1,14 +1,13 @@
 from dask_jobqueue.local import LocalCluster
 import torch
 import pytest
-import numpy as np
 
 from dsbo.utils.io.storage.hdf5 import HDF5File
 from dsbo.worker.dask import DaskWorkerBase
 from dsbo.workflow import Workflow
 from dsbo.utils.io.workdir import Workdir
 from dsbo.modules import Module, Input, Output
-from dsbo.parameters import Continuous, ParameterSpace, Sampler
+from dsbo.parameters import Continuous, ParameterSpace, UniformSampler
 
 class LocalDaskWorker(DaskWorkerBase):
     def __init__(self):
@@ -101,13 +100,4 @@ def space():
 
 @pytest.fixture(scope="function")
 def sampler():
-    class UniformSampler(Sampler):
-        def ask(self) -> torch.Tensor:
-            values = {}
-            for name, p in self._space:
-                if isinstance(p, Continuous):
-                    u = np.random.random()
-                    values[name] = float(p.lower + u * (p.upper - p.lower))
-            return self._space.encode(values)
-
     return UniformSampler()

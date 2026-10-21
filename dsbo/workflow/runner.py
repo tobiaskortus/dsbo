@@ -49,7 +49,7 @@ def num_tasks_for_batch(workflow: Workflow, num_candidates: int) -> int:
     return count
 
 
-def _update_task_stream_plugin(name, writer, task_map, name_map, tag, dask_scheduler=None):
+def update_task_stream_plugin(name, writer, task_map, name_map, tag, dask_scheduler=None):
     plugin = dask_scheduler.plugins.get(name)
     if plugin is None:
         return False
@@ -64,10 +64,19 @@ def register_task_stream(worker, graph, exec_ids, batch_path, task_map, name_map
     workflow_record = storage.workflow.add_workflow(graph)
     storage.workflow.add_runs(workflow_record, exec_ids, batch_path)
     writer = storage.workflow._make_transition_writer()
-    if worker.client.run_on_scheduler(_update_task_stream_plugin, name, writer, task_map, name_map, tag):
+    if worker.client.run_on_scheduler(update_task_stream_plugin, name, writer, task_map, name_map, tag):
         return
     plugin = storage.workflow.create_task_stream_plugin(task_map, name_map=name_map, tag=tag)
     worker.client.register_plugin(plugin, name=name)
+
+
+def merged_results(per_task_results: List[dict | None]) -> dict:
+    merged = {}
+    for result in per_task_results:
+        if not result:
+            continue
+        merged.update(result)
+    return merged
 
 
 def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[type[Exception], ...] = ()) -> List[dict]:
@@ -133,8 +142,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                 progress.update()
             progress.close()
 
-            return [dict(chain.from_iterable(r.items() for r in results if r))
-                    for results in batch_results]
+            return [merged_results(r for r in results if r) for results in batch_results]
 
         #Create exec_ids for task stream plugin
         batch_path = Workdir.get_current_dir()
@@ -201,8 +209,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
             if is_batch_fused(task):
                 create_candidate_symlinks(task, subdirs)
 
-        return [dict(chain.from_iterable(lookup.get(tid, {}).items() for tid in tids))
-                for tids in batch_task_ids]
+        return [merged_results(lookup.get(tid) for tid in tids) for tids in batch_task_ids]
 
 
 def run_batch_reverse_autograd(
@@ -217,28 +224,25 @@ def run_batch_reverse_autograd(
     worker = WorkerContext.get_current_worker()
 
     G = workflow.task_graph
-    tasks_rev = [task for task in reversed(list(nx.topological_sort(G)))
-                 if not task._no_grad_op]
-    
+    tasks_rev = [task for task in reversed(list(nx.topological_sort(G))) if not task._no_grad_op]
     subdirs = candidate_subdirs(len(candidates))
     progress = tqdm(total=len(candidates) * len(tasks_rev), desc=f"Running workflow (reverse) [{workflow.graph_context.mode.value}]", unit="tasks")
 
     if worker is None:
         gradients = []
-        for index, (candidate, candidate_grad_output) in enumerate(zip(candidates, grad_outputs)):
+        for i, (candidate, candidate_grad_output) in enumerate(zip(candidates, grad_outputs)):
             try:
                 grad_candidate = candidate.detach().requires_grad_()
                 with torch.enable_grad():
                     get_active_file_backend().reset_gradient_state()
                     for task in tasks_rev:
-                        is_sink = len(list(G.successors(task))) == 0
-
                         design_tensor = grad_candidate.tensor if getattr(task, "requires_design_tensor", False) else None
+                        index = None if is_batch_fused(task) else i
                         task.run_backward(
                             grad_candidate.values,
-                            candidate_grad_output if is_sink else None,
+                            candidate_grad_output,
                             design_tensor=design_tensor,
-                            subdir=subdirs[index],
+                            subdir="batch_reduce" if index is None else subdirs[index],
                             file_overlays=file_overlays(G, task, index, subdirs),
                         )
                         progress.update()
@@ -272,12 +276,10 @@ def run_batch_reverse_autograd(
 
                 for depth, task in enumerate(tasks_rev):
                     forward_succs = list(G.successors(task))
-                    is_sink = len(forward_succs) == 0
                     dependencies = [delayed_map[s] for s in forward_succs if s in delayed_map]
-                    task_grad_output = candidate_grad_output if is_sink else None
 
                     task_id, delayed_obj = worker.schedule_backward(
-                        task, candidate, grad_output=task_grad_output,
+                        task, candidate, grad_output=candidate_grad_output,
                         dependencies=dependencies, priority=depth,
                         file_overlays=file_overlays(G, task, i, subdirs),
                     )
@@ -386,7 +388,7 @@ class RunBatchAutogradFn(torch.autograd.Function):
         )
 
         with ctx.workflow.graph_context.use(ctx.graph_state):
-            gradients = run_batch_reverse_autograd(ctx.workflow, candidates, grad_outputs, catch=(RuntimeError,))
+            gradients = run_batch_reverse_autograd(ctx.workflow, candidates, grad_outputs)
         return None, torch.stack(gradients, dim=0), None, None
 
 
