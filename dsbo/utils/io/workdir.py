@@ -7,8 +7,10 @@ import contextvars
 from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any, Callable, Generator, List, Mapping, Optional, Set, Union
+
+from dsbo.utils.io.reduce import ResolvableSource, resolve_value
 
 
 def _is_dry_run():
@@ -84,6 +86,10 @@ class AbstractFilePath:
     def __call__(self) -> Optional[str]:
         return Workdir.resolve_file(self)
 
+    def gradient(self) -> str:
+        from dsbo.utils.io.gradient import resolve_gradient
+        return resolve_gradient(self)
+
     def _resolve(self, use_overlays: bool = True) -> Optional[str]:
         parts = Workdir._current_file_context.get()
 
@@ -91,9 +97,7 @@ class AbstractFilePath:
             overlay = Workdir._current_file_overlays.get() or {}
             overlay_value = overlay.get(self)
             if overlay_value is not None:
-                if isinstance(overlay_value, str):
-                    return overlay_value
-                return overlay_value.resolve()
+                return resolve_value(overlay_value)
 
         dir_path = self._path()
         if dir_path is None:
@@ -152,6 +156,7 @@ class Workdir(dict):
     _current_file_context = contextvars.ContextVar("current_file_context", default=())
     _current_subdir = contextvars.ContextVar("current_subdir", default=())
     _current_file_overlays = contextvars.ContextVar("current_file_overlays", default=None)
+    _current_gradient_overlays = contextvars.ContextVar("current_gradient_overlays", default=None)
     _registered_paths: Set[str] = set()
     _path_registry: dict[str, PathInfo] = {}
     _registry_by_root: dict[str, list[str]] = {}  # root → [path, …]
@@ -222,7 +227,8 @@ class Workdir(dict):
 
     @classmethod
     @contextmanager
-    def use_file_overlays(cls, overlays: Mapping[AbstractFilePath, str | Callable[[], str]]) -> Generator[None, None, None]:
+    def use_file_overlays(cls, overlays: Mapping[AbstractFilePath, ResolvableSource]) -> Generator[None, None, None]:
+        """Temporarily override file references with prepared paths or resolvers."""
         current = cls._current_file_overlays.get() or {}
         token = cls._current_file_overlays.set({**current, **overlays})
         try:
@@ -231,7 +237,20 @@ class Workdir(dict):
             cls._current_file_overlays.reset(token)
 
     @classmethod
-    def get_file_overlay(cls, file: AbstractFilePath) -> str | Callable[[], str] | None:
+    @contextmanager
+    def use_gradient_overlays(
+        cls,
+        overlays: Mapping[str, ResolvableSource],
+    ) -> Generator[None, None, None]:
+        current = cls._current_gradient_overlays.get() or {}
+        token = cls._current_gradient_overlays.set({**current, **overlays})
+        try:
+            yield
+        finally:
+            cls._current_gradient_overlays.reset(token)
+
+    @classmethod
+    def get_file_overlay(cls, file: AbstractFilePath) -> ResolvableSource | None:
         return (cls._current_file_overlays.get() or {}).get(file)
 
     @classmethod
@@ -392,13 +411,33 @@ def with_remote_workdir(func: Callable) -> Callable:
         suffix = kwargs.pop("suffix", None)
         subdir = kwargs.pop("subdir", None)
         file_overlays = kwargs.pop("file_overlays", None)
+        gradient_overlays = kwargs.pop("gradient_overlays", None)
+        pass_id = kwargs.pop("pass_id", None)
+        gradient_writer_id = kwargs.pop("gradient_writer_id", None)
 
-        with Workdir.load(workdir) if workdir else nullcontext():
-            with Workdir.create_subdir(subdir) if subdir else nullcontext():
-                with Workdir.use_file_suffix(suffix) if suffix else nullcontext():
-                    with Workdir.use_file_overlays(file_overlays) if file_overlays else nullcontext():
-                        return func(*args, **kwargs)
-                
+        with ExitStack() as stack:
+            if gradient_overlays is not None and pass_id is None:
+                raise ValueError("gradient_overlays require a pass_id.")
+            if pass_id is not None:
+                from dsbo.utils.io.gradient import use_gradient_pass
+
+                stack.enter_context(use_gradient_pass(pass_id))
+            if gradient_overlays is not None:
+                stack.enter_context(Workdir.use_gradient_overlays(gradient_overlays))
+            if gradient_writer_id is not None:
+                from dsbo.utils.io.gradient import use_gradient_writer
+
+                stack.enter_context(use_gradient_writer(gradient_writer_id))
+            if workdir:
+                stack.enter_context(Workdir.load(workdir))
+            if subdir:
+                stack.enter_context(Workdir.create_subdir(subdir))
+            if suffix:
+                stack.enter_context(Workdir.use_file_suffix(suffix))
+            if file_overlays:
+                stack.enter_context(Workdir.use_file_overlays(file_overlays))
+            return func(*args, **kwargs)
+
     return wrapper
 
 
@@ -410,7 +449,10 @@ class PathAnnotation:
         return self.path()
 
 class Input(PathAnnotation):
-    pass
+    def gradient(self) -> str:
+        from dsbo.utils.io.gradient import resolve_gradient_output
+        return resolve_gradient_output(self.path)
 
 class Output(PathAnnotation):
-    pass
+    def gradient(self) -> str:
+        return self.path.gradient()

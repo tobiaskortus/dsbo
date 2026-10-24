@@ -173,7 +173,8 @@ class TestDistributedRunBatchReverseAutograd:
 
         worker = MockDaskWorker()
         def mock_schedule_bwd(module, candidate, grad_output=None,
-                              dependencies=(), priority=None):
+                              dependencies=(), priority=None, file_overlays=None,
+                              gradient_overlays=None, pass_id=None, task_id=None):
             scheduled_order.append(module.name)
             tid = UUID(int=len(scheduled_order), version=4)
             delayed = MagicMock()

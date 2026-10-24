@@ -44,7 +44,8 @@ class MockDaskWorker(DaskWorkerBase):
         return tid, delayed
 
     def schedule_backward(self, module, candidate, grad_output=None,
-                          dependencies=(), priority=None):
+                          dependencies=(), priority=None, file_overlays=None,
+                          gradient_overlays=None, pass_id=None, task_id=None):
         tid = UUID(int=self.task_counter, version=4)
         self.task_counter += 1
         delayed = MagicMock()

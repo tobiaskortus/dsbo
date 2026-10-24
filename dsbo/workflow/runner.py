@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 import torch
 import networkx as nx
@@ -17,6 +18,7 @@ from dsbo.utils.random import get_random_engine
 from dsbo.storage import get_current_storage
 from dsbo.modules.fused import (
     file_overlays,
+    gradient_overlays,
     is_batch_fused,
     create_candidate_symlinks,
 )
@@ -38,6 +40,14 @@ def get_dependent_task_groups(G: nx.DiGraph):
 
 def candidate_subdirs(count: int):
     return tuple(f"batch_{index}" if count > 1 else None for index in range(count))
+
+
+def plan_backward_tasks(G, tasks_rev, index, subdirs, pass_id):
+    task_indices = {task: None if is_batch_fused(task) else index for task in tasks_rev}
+    task_ids = {(task, task_indices[task]): uuid.uuid4() for task in tasks_rev}
+    forward = {task: file_overlays(G, task, task_indices[task], subdirs, pass_id) for task in tasks_rev}
+    gradient = {task: gradient_overlays(G, task, task_indices[task], subdirs, pass_id, task_ids, forward) for task in tasks_rev}
+    return task_indices, task_ids, forward, gradient
 
 
 def num_tasks_for_batch(workflow: Workflow, num_candidates: int) -> int:
@@ -95,6 +105,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
         count = len(candidates)
         task_graph = workflow.task_graph
         subdirs = candidate_subdirs(count)
+        generation = uuid.uuid4().hex
 
         task_groups = list(get_dependent_task_groups(task_graph))
         progress = tqdm(total=num_tasks_for_batch(workflow, count), desc=f"Running workflow [{workflow.graph_context.mode.value}]", unit="tasks")
@@ -115,7 +126,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                     task_kwargs = dict(
                         design=candidates[0 if index is None else index].values,
                         subdir="batch_reduce" if index is None else subdirs[index],
-                        file_overlays=file_overlays(task_graph, task, index, subdirs),
+                        file_overlays=file_overlays(task_graph, task, index, subdirs, generation),
                         is_forward_ad=fw._current_level > -1,
                         is_grad_enabled=torch.is_grad_enabled(),
                         unpack_design=True,
@@ -158,7 +169,7 @@ def run_batch(workflow: Workflow, candidates: Sequence[Candidate], catch: tuple[
                     deps.append(delayed_map[(p, index)])
 
             subdir = "batch_reduce" if index is None else subdirs[index]
-            overlays = file_overlays(task_graph, task, index, subdirs)
+            overlays = file_overlays(task_graph, task, index, subdirs, generation)
 
             with Workdir.create_subdir(subdir) if subdir else nullcontext():
                 task_id, delayed = worker.schedule(
@@ -211,12 +222,11 @@ def run_batch_reverse_autograd(
     catch: tuple[type[Exception], ...] = (),
 ) -> List[torch.Tensor]:
     from dsbo.worker.dask import WorkerContext
-    from dsbo.config import get_active_file_backend
 
     worker = WorkerContext.get_current_worker()
 
     G = workflow.task_graph
-    tasks_rev = list(reversed(list(nx.topological_sort(G))))
+    tasks_rev = [task for task in reversed(list(nx.topological_sort(G))) if not task._no_grad_op]
     progress = tqdm(total=len(candidates) * len(tasks_rev), desc=f"Running workflow (reverse) [{workflow.graph_context.mode.value}]", unit="tasks")
 
     if worker is None:
@@ -225,20 +235,23 @@ def run_batch_reverse_autograd(
         for i, (candidate, candidate_grad_output) in enumerate(zip(candidates, grad_outputs)):
             try:
                 grad_candidate = candidate.detach().requires_grad_()
+                pass_id = uuid.uuid4()
+                task_indices, task_ids, forward_overlays, gradient_overlays = plan_backward_tasks(
+                    G, tasks_rev, i, subdirs, pass_id
+                )
                 with torch.enable_grad():
-                    get_active_file_backend().reset_gradient_state()
-                    for task in tasks_rev:
-                        if task._no_grad_op:
-                            continue
-
+                    for depth, task in enumerate(tasks_rev):
                         design_tensor = grad_candidate.tensor if getattr(task, "requires_design_tensor", False) else None
-                        index = None if is_batch_fused(task) else i
+                        index = task_indices[task]
                         task.run_backward(
                             grad_candidate.values,
                             candidate_grad_output,
                             design_tensor=design_tensor,
                             subdir="batch_reduce" if index is None else subdirs[index],
-                            file_overlays=file_overlays(G, task, index, subdirs),
+                            file_overlays=forward_overlays[task],
+                            gradient_overlays=gradient_overlays[task],
+                            pass_id=pass_id,
+                            gradient_writer_id=task_ids[(task, index)].hex,
                         )
                         progress.update()
                 gradients.append(
@@ -257,10 +270,15 @@ def run_batch_reverse_autograd(
         name_map: dict[str, str] = {}
         exec_ids = []
         batch_path = getattr(get_workdir(), "workdir_root", None)
+        subdirs = candidate_subdirs(len(candidates))
 
         for i, candidate in enumerate(candidates):
             candidate_grad_output = grad_outputs[i]
-            with Workdir.create_subdir(f"batch_{i}") if len(candidates) > 1 else nullcontext():
+            pass_id = uuid.uuid4()
+            backward_plan = plan_backward_tasks(G, tasks_rev, i, subdirs, pass_id)
+            task_indices, task_id_map, file_overlays, gradient_overlays = backward_plan
+            
+            with Workdir.create_subdir(subdirs[i]) if subdirs[i] else nullcontext():
                 delayed_map = {}
                 task_ids = []
                 wdir = getattr(get_workdir(), "workdir_root", None)
@@ -270,15 +288,16 @@ def run_batch_reverse_autograd(
                 exec_ids.append(exec_id)
 
                 for depth, task in enumerate(tasks_rev):
-                    if task._no_grad_op:
-                        continue
-
                     forward_succs = list(G.successors(task))
                     dependencies = [delayed_map[s] for s in forward_succs if s in delayed_map]
-
+                    index = task_indices[task]
                     task_id, delayed_obj = worker.schedule_backward(
                         task, candidate, grad_output=candidate_grad_output,
                         dependencies=dependencies, priority=depth,
+                        file_overlays=file_overlays[task],
+                        gradient_overlays=gradient_overlays[task],
+                        pass_id=pass_id,
+                        task_id=task_id_map[(task, index)],
                     )
                     delayed_map[task] = delayed_obj
                     task_ids.append(task_id)

@@ -133,7 +133,13 @@ class DaskWorkerBase:
 
         return task_id, delayed_obj
 
-    def schedule_backward(self, module: Module, candidate, grad_output=None, dependencies: Iterable = (), priority: int | None = None) -> tuple[uuid.UUID, Delayed]:
+    def schedule_backward(
+        self, module: Module, candidate, grad_output=None,
+        dependencies: Iterable = (), priority: int | None = None,
+        file_overlays=None, gradient_overlays=None, 
+        pass_id: uuid.UUID | None = None,
+        task_id: uuid.UUID | None = None,
+    ) -> tuple[uuid.UUID, Delayed]:
         suffix = get_file_suffix()
         subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
@@ -141,7 +147,8 @@ class DaskWorkerBase:
 
         config_state = dsbo.config.state()
         storage = get_current_storage(create=False)
-        task_id = uuid.uuid4()
+        task_id = task_id or uuid.uuid4()
+        pass_id = pass_id or uuid.uuid4()
 
         def _backward_wrapper(module, candidate, *deps):
             dsbo.config._set(config_state)
@@ -152,8 +159,13 @@ class DaskWorkerBase:
                     grad_candidate.values, grad_output,
                     design_tensor=design_tensor,
                     workdir=workdir, suffix=suffix, subdir=subdir,
+                    file_overlays=file_overlays,
+                    gradient_overlays=gradient_overlays,
+                    pass_id=pass_id,
+                    gradient_writer_id=task_id.hex,
                 )
-            return task_id, grad_candidate.grad.clone() if grad_candidate.grad is not None else None
+            gradient = grad_candidate.grad.clone() if grad_candidate.grad is not None else None
+            return task_id, gradient
 
         with dask.annotate(resources=(resources or {}), priority=priority):
             delayed_obj = delayed(_backward_wrapper, name=f"{module.name}_bwd")(module, candidate, *dependencies)

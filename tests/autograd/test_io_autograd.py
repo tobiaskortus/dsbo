@@ -1,25 +1,21 @@
+import json
 import os
 import h5py
 import numpy as np
 import pytest
 import torch
-import uproot
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import torch.autograd.forward_ad as fw
 
 from dsbo.config import config, get_active_file_backend
-from dsbo.utils.io.storage.autograd import InMemoryFile
+from dsbo.utils.io.gradient import gradient_path
 from dsbo.utils.io.datasets import ModuleSurrogateDataset, WorkflowSurrogateDataset
-from dsbo.utils.io.storage.hdf5 import HDF5File
-from dsbo.utils.io.storage.root import ROOTFile
+from dsbo.utils.io.storage.hdf5 import HDF5File, HDF5Writer
 
 
 @pytest.fixture(
-    params=[
-        pytest.param((HDF5File, ".h5"), id="hdf5"),
-        pytest.param((ROOTFile, ".root"), id="root"),
-    ]
+    params=[pytest.param((HDF5File, ".h5"), id="hdf5")]
 )
 def file_backend(request):
     backend, extension = request.param
@@ -177,7 +173,7 @@ def test_hdf5_file_named_columns_backward_gradient():
             HDF5File.read_backward_gradient(file_path),
             torch.stack((weights[1], torch.zeros(2), weights[0])),
         )
-        with h5py.File(HDF5File._gradient_path(file_path), "r") as file:
+        with h5py.File(gradient_path(file_path), "r") as file:
             assert list(file["gradient"].keys()) == ["third", "first"]
 
 
@@ -284,11 +280,11 @@ def test_hdf5_virtual_dataset_rejects_missing_sources():
         destination = os.path.join(tempdir, "reduced.h5")
         HDF5File.write(source, torch.tensor([[1.0]]))
         HDF5File.reduce([source], destination)
-        assert HDF5File.dependencies(destination) == [source]
+        with h5py.File(destination, "r") as file:
+            manifest = json.loads(file.attrs[HDF5Writer.VDS_SOURCES_ATTRIBUTE])
+        assert manifest == [os.path.relpath(source, os.path.dirname(destination))]
         os.remove(source)
 
-        with pytest.raises(FileNotFoundError, match="missing source"):
-            HDF5File.validate(destination)
         with pytest.raises(FileNotFoundError, match="missing source"):
             HDF5File.open(destination, "cpu")
 
@@ -327,123 +323,6 @@ def test_file_backend_round_trips_shape_and_dtype(file_backend, value):
         assert loaded.numpy().dtype == value.dtype
         np.testing.assert_array_equal(loaded.numpy(), value)
 
-
-def test_root_file_writes_ttree_layout():
-    with TemporaryDirectory() as tempdir, fw.dual_level():
-        file_path = os.path.join(tempdir, "x.root")
-        primal = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
-        tangent = torch.arange(8, 16, dtype=torch.float32).reshape(2, 2, 2)
-        ROOTFile.write(file_path, fw.make_dual(primal, tangent), columns=["first", "second"])
-
-        with uproot.open(file_path) as file:
-            assert file["primal"].classname == "TTree"
-            assert file["primal"].keys() == ["first", "second"]
-            assert file["tangent"].keys() == ["first", "second"]
-            assert file["primal/first"].array(library="np").shape == (2, 2)
-            assert ROOTFile.METADATA_OBJECT in file
-
-
-def test_root_file_reduce_creates_virtual_manifest():
-    with TemporaryDirectory() as tempdir, torch.no_grad():
-        sources = [os.path.join(tempdir, f"source_{index}.root") for index in range(2)]
-        ROOTFile.write(sources[0], torch.tensor([[1.0, 2.0], [4.0, 5.0]]), columns=["first", "second"])
-        ROOTFile.write(sources[1], torch.tensor([[6.0], [3.0]]), columns=["second", "first"])
-        destination = os.path.join(tempdir, "reduced.root")
-
-        ROOTFile.reduce(sources, destination)
-
-        with uproot.open(destination) as file:
-            assert "primal" not in file
-            assert ROOTFile.METADATA_OBJECT in file
-            assert ROOTFile.VDS_SOURCES_OBJECT in file
-        assert ROOTFile.dependencies(destination) == sources
-        with patch("dsbo.utils.io.storage.root.uproot.concatenate", wraps=uproot.concatenate) as concatenate:
-            torch.testing.assert_close(
-                ROOTFile.open(destination, "cpu"),
-                torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-            )
-            concatenate.assert_called_once()
-
-        os.remove(sources[0])
-        with pytest.raises(FileNotFoundError, match="missing source"):
-            ROOTFile.validate(destination)
-        with pytest.raises(FileNotFoundError, match="missing source"):
-            ROOTFile.open(destination, "cpu")
-
-
-def test_root_file_reduce_primal_tangent_and_scalars():
-    with TemporaryDirectory() as tempdir:
-        sources = [os.path.join(tempdir, f"source_{index}.root") for index in range(2)]
-        with fw.dual_level():
-            ROOTFile.write(
-                sources[0],
-                fw.make_dual(torch.tensor([[1.0], [2.0]]), torch.tensor([[0.0], [1.0]])),
-            )
-            ROOTFile.write(
-                sources[1],
-                fw.make_dual(torch.tensor([[3.0]]), torch.tensor([[2.0]])),
-            )
-        destination = os.path.join(tempdir, "reduced.root")
-        ROOTFile.reduce(sources, destination)
-
-        with fw.dual_level():
-            loaded = ROOTFile.open(destination, "cpu")
-            torch.testing.assert_close(loaded, torch.tensor([[1.0], [2.0], [3.0]]))
-            torch.testing.assert_close(
-                fw.unpack_dual(loaded).tangent,
-                torch.tensor([[0.0], [1.0], [2.0]]),
-            )
-
-        scalar_sources = [os.path.join(tempdir, f"scalar_{index}.root") for index in range(2)]
-        with torch.no_grad():
-            ROOTFile.write(scalar_sources[0], torch.tensor(4.0))
-            ROOTFile.write(scalar_sources[1], torch.tensor(5.0))
-            scalar_destination = os.path.join(tempdir, "reduced_scalars.root")
-            ROOTFile.reduce(scalar_sources, scalar_destination)
-            torch.testing.assert_close(ROOTFile.open(scalar_destination, "cpu"), torch.tensor([4.0, 5.0]))
-
-
-def test_root_file_reduce_empty_arrays():
-    with TemporaryDirectory() as tempdir, torch.no_grad():
-        sources = [os.path.join(tempdir, f"empty_{index}.root") for index in range(2)]
-        for source in sources:
-            ROOTFile.write(source, torch.empty((0, 2)))
-        destination = os.path.join(tempdir, "reduced_empty.root")
-        ROOTFile.reduce(sources, destination)
-        assert ROOTFile.open(destination, "cpu").shape == (0, 2)
-
-        named_sources = [os.path.join(tempdir, f"named_empty_{index}.root") for index in range(2)]
-        ROOTFile.write(named_sources[0], torch.empty((2, 3, 0)), columns=["first", "second"])
-        ROOTFile.write(named_sources[1], torch.empty((2, 4, 0)), columns=["second", "first"])
-        named_destination = os.path.join(tempdir, "reduced_named_empty.root")
-        ROOTFile.reduce(named_sources, named_destination)
-        assert ROOTFile.open(named_destination, "cpu").shape == (2, 7, 0)
-
-
-def test_root_file_nested_virtual_reduction():
-    with TemporaryDirectory() as tempdir, torch.no_grad():
-        leaves = [os.path.join(tempdir, f"leaf_{index}.root") for index in range(3)]
-        for source, value in zip(leaves, (1.0, 2.0, 3.0), strict=True):
-            ROOTFile.write(source, torch.tensor(value))
-
-        first_reduction = os.path.join(tempdir, "first.root")
-        ROOTFile.reduce(leaves[:2], first_reduction)
-        nested_reduction = os.path.join(tempdir, "nested.root")
-        ROOTFile.reduce([first_reduction, leaves[2]], nested_reduction)
-        torch.testing.assert_close(ROOTFile.open(nested_reduction, "cpu"), torch.tensor([1.0, 2.0, 3.0]))
-
-        with pytest.raises(ValueError, match="transitive dependency"):
-            ROOTFile.reduce([nested_reduction], leaves[0])
-        with pytest.raises(ValueError, match="transitive dependency"):
-            ROOTFile.reduce([nested_reduction], first_reduction)
-        hard_link = os.path.join(tempdir, "leaf_link.root")
-        os.link(leaves[0], hard_link)
-        with pytest.raises(ValueError, match="transitive dependency"):
-            ROOTFile.reduce([nested_reduction], hard_link)
-
-        os.remove(leaves[1])
-        with pytest.raises(FileNotFoundError, match="missing source"):
-            ROOTFile.reduce([nested_reduction], os.path.join(tempdir, "invalid.root"))
 
 
 def test_file_backend_module_surrogate_dataset(file_backend):
@@ -511,63 +390,11 @@ def test_file_backend_workflow_surrogate_dataset_records(file_backend):
                     torch.testing.assert_close(actual[1], expected[1])
                 return aggregate(dataset)
 
-        if backend is ROOTFile:
-            with patch.object(ROOTFile, "_read_dataset", side_effect=AssertionError("full ROOT read")):
-                x, y = load_dataset()
-        else:
-            x, y = load_dataset()
+        x, y = load_dataset()
 
         assert x.shape == (4, 1)
         assert y.shape == (4, 2)
         torch.testing.assert_close(y.mean(dim=0), torch.zeros(2), atol=1e-6, rtol=0)
-
-
-def test_inmemory_file_primal_only():
-    with torch.no_grad():
-        x = torch.tensor([1.0, 2.0])
-        x = x * 3
-        file_path = "inmem_x"
-
-        InMemoryFile._storage.clear()
-        InMemoryFile.write(file_path, x)
-
-        x_loaded = InMemoryFile.open(file_path, "cpu")
-
-        torch.testing.assert_close(x_loaded, torch.tensor([3.0, 6.0]))
-
-
-def test_inmemory_file_forward_ad_tangent():
-    with fw.dual_level():
-        x = fw.make_dual(torch.tensor([1.0, 2.0]), torch.tensor([1.0, 0.0]))
-        x = x * 3
-        file_path = "inmem_x"
-
-        InMemoryFile._storage.clear()
-        InMemoryFile.write(file_path, x)
-
-        x_loaded = InMemoryFile.open(file_path, "cpu")
-        tangent = fw.unpack_dual(x_loaded).tangent
-        
-        torch.testing.assert_close(x_loaded, torch.tensor([3.0, 6.0]))
-        torch.testing.assert_close(tangent, torch.tensor([3.0, 0.0]))
-
-
-def test_inmemory_file_backward_gradient():
-    file_path = "inmem_x"
-    InMemoryFile._storage.clear()
-    primal = torch.tensor([2.0, 3.0])
-    InMemoryFile.write(file_path, primal)
-
-    with torch.enable_grad():
-        x = InMemoryFile.open(file_path, "cpu")
-        y = (x * x).sum()
-
-        assert file_path in InMemoryFile._storage
-
-        y.backward()
-
-    grad = InMemoryFile.read_backward_gradient(file_path)
-    torch.testing.assert_close(grad, 2.0 * primal)
 
 
 def test_nested_record_vds_merge_roundtrip():
@@ -588,7 +415,8 @@ def test_nested_record_vds_merge_roundtrip():
             assert loss.is_virtual
             np.testing.assert_allclose(energy[:], [0, 0.5, 1, 1.5, 2, 2.5])
             np.testing.assert_allclose(loss[:], [10, 11, 12, 13, 14, 15])
-        assert len(HDF5File.dependencies(merged)) == len(sources)
+        with h5py.File(merged, "r") as file:
+            assert len(json.loads(file.attrs[HDF5Writer.VDS_SOURCES_ATTRIBUTE])) == len(sources)
 
 
 def test_reduce_rejects_incompatible_nested_records():
@@ -621,16 +449,6 @@ def test_file_backend_workflow_surrogate_row_store(file_backend):
                 assert list(file) == [HDF5File.ROW_STORE_DATASET]
                 assert file[HDF5File.ROW_STORE_DATASET].shape == (2, 2)
                 assert file[HDF5File.ROW_STORE_DATASET].compression is None
-        else:
-            metadata, _ = ROOTFile._load_container(sources[0])
-            assert list(metadata["datasets"]) == [ROOTFile.ROW_STORE_DATASET]
-            keyed_metadata = metadata["datasets"][ROOTFile.ROW_STORE_DATASET]
-            assert keyed_metadata["keys"] == ["energy", "loss"]
-            assert keyed_metadata["columns"] is None
-            assert keyed_metadata["branches"] == [ROOTFile.VALUE_BRANCH]
-            with uproot.open(sources[0]) as file:
-                assert file.file.compression is None
-                assert list(file[ROOTFile.ROW_STORE_DATASET].keys()) == keyed_metadata["branches"]
 
         records_path = os.path.join(tempdir, f"records{extension}")
         backend.reduce(sources, records_path)

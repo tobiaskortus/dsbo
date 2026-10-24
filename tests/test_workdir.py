@@ -8,6 +8,8 @@ from unittest import mock
 from unittest.mock import patch
 
 from dsbo.utils.io import AbstractFilePath, AbstractPath, DefaultPaths, PathInfo, Workdir, get_file_suffix, get_subdir, get_workdir, with_remote_workdir
+from dsbo.utils.io.gradient import gradient_path, use_gradient_pass, use_gradient_writer
+from dsbo.utils.io.reduce import GradientAggregationResolver, reduction_sources
 
 
 @patch('os.path.exists', return_value=False)
@@ -337,6 +339,32 @@ def test_file_overlay_is_scoped(mock_makedirs, mock_exists):
         with Workdir.use_file_overlays({file: "/shared/data.txt"}):
             assert file() == "/shared/data.txt"
         assert file() == normal
+
+
+def test_gradient_path_preserves_primal_path_info(tmp_path):
+    import h5py
+    from dsbo.utils.io import Input, Output
+
+    with Workdir.create(str(tmp_path / "execution")):
+        file = Workdir.register_file("simulation", "value.h5")
+        inp, out = Input(file), Output(file)
+        primal = out()
+        with h5py.File(primal, "w") as handle:
+            handle.create_dataset("primal", data=2.0)
+        writer_id = "value-writer"
+        with use_gradient_pass() as contributions:
+            with use_gradient_writer(writer_id):
+                gradient = inp.gradient()
+                assert inp.gradient() == gradient
+                assert inp() == out() == primal
+                assert Workdir.get_path_info(gradient) == Workdir.get_path_info(primal)
+                with h5py.File(gradient, "w") as handle:
+                    handle.create_dataset("gradient", data=3.0)
+                assert inp.gradient() == gradient
+            incoming = out.gradient()
+            assert reduction_sources(contributions[incoming]) == [gradient]
+            assert os.path.samefile(incoming, gradient)
+            assert Workdir.get_path_info(incoming) == Workdir.get_path_info(primal)
 
 
 def test_resolve_file_applies_subdir_and_suffix(tmp_path):

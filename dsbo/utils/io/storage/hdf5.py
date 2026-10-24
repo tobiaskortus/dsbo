@@ -1,9 +1,10 @@
 import json
 import os
+import uuid
+from collections.abc import Iterator
 
 import h5py
 import numpy as np
-import torch
 
 from dsbo.utils.io.storage.autograd import AutogradFileInterface
 from dsbo.utils.io.datasets.views import (
@@ -17,13 +18,65 @@ from dsbo.utils.io.datasets.views import (
 )
 
 
-class HDF5File(AutogradFileInterface):
-    DATASETS = ("primal", "tangent", "gradient")
-    VDS_SOURCES_ATTRIBUTE = "dsbo_vds_sources"
-    PARTITION_SIZES_ATTRIBUTE = "dsbo_partition_sizes"
+class HDF5Statistics:
     STATS_COUNT_ATTRIBUTE = "dsbo_stats_count"
     STATS_MEAN_ATTRIBUTE = "dsbo_stats_mean"
     STATS_SQUARED_DEVIATION_ATTRIBUTE = "dsbo_stats_squared_deviation"
+
+    @classmethod
+    def _statistics(cls, value: np.ndarray) -> tuple[int, np.ndarray, np.ndarray] | None:
+        value = np.asarray(value)
+        if value.ndim not in (1, 2) or value.shape[0] == 0 or value.dtype.kind not in "biuf":
+            return None
+        values = value.astype(np.float64, copy=False)
+        mean = values.mean(axis=0)
+        return value.shape[0], mean, np.square(values - mean).sum(axis=0)
+
+    @classmethod
+    def _write_statistics(cls, dataset: h5py.Dataset, statistics: tuple[int, np.ndarray, np.ndarray]) -> None:
+        count, mean, squared_deviation = statistics
+        dataset.attrs[cls.STATS_COUNT_ATTRIBUTE] = count
+        dataset.attrs[cls.STATS_MEAN_ATTRIBUTE] = mean
+        dataset.attrs[cls.STATS_SQUARED_DEVIATION_ATTRIBUTE] = squared_deviation
+
+    @classmethod
+    def _read_statistics(cls, dataset: h5py.Dataset) -> tuple[int, np.ndarray, np.ndarray] | None:
+        attributes = dataset.attrs
+        if any(
+            name not in attributes
+            for name in (
+                cls.STATS_COUNT_ATTRIBUTE,
+                cls.STATS_MEAN_ATTRIBUTE,
+                cls.STATS_SQUARED_DEVIATION_ATTRIBUTE,
+            )
+        ):
+            return None
+        return (
+            int(attributes[cls.STATS_COUNT_ATTRIBUTE]),
+            np.asarray(attributes[cls.STATS_MEAN_ATTRIBUTE]),
+            np.asarray(attributes[cls.STATS_SQUARED_DEVIATION_ATTRIBUTE]),
+        )
+
+    @staticmethod
+    def _combine_statistics(values: list[tuple[int, np.ndarray, np.ndarray] | None]) -> tuple[int, np.ndarray, np.ndarray] | None:
+        if not values or any(value is None for value in values):
+            return None
+        count, mean, squared_deviation = values[0]
+        for batch_count, batch_mean, batch_squared_deviation in values[1:]:
+            total = count + batch_count
+            delta = batch_mean - mean
+            mean += delta * batch_count / total
+            squared_deviation += (
+                batch_squared_deviation
+                + delta * delta * count * batch_count / total
+            )
+            count = total
+        return count, mean, squared_deviation
+
+
+class HDF5Writer(HDF5Statistics):
+    VDS_SOURCES_ATTRIBUTE = "dsbo_vds_sources"
+    PARTITION_SIZES_ATTRIBUTE = "dsbo_partition_sizes"
     ROW_STORE_DATASET = "__dsbo_row_store__"
     ROW_STORE_KEYS_ATTRIBUTE = "dsbo_keys"
     STORE_ATTRIBUTE = "dsbo_store"
@@ -125,47 +178,156 @@ class HDF5File(AutogradFileInterface):
             return cls._stored_columns(primal) if isinstance(primal, h5py.Group) else []
 
     @classmethod
-    def _load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
+    def gradient_file_contributions(
+        cls, fpath: str, gradient_path: str,
+    ) -> Iterator[tuple[str, str | np.ndarray, list[str] | None]]:
+        """Validate a native adjoint and transpose DSBO concatenations, if any.
+
+        Physical primals retain the native file itself as their contribution;
+        validation reads dataset metadata only and requires no DSBO store tag.
+        """
+        with h5py.File(fpath, "r") as primal_file, h5py.File(gradient_path, "r") as gradient_file:
+            cls._validate_vds_sources(primal_file)
+            primal = primal_file.get("primal")
+            gradient = gradient_file.get("gradient")
+            columns = None
+            if isinstance(primal, h5py.Dataset) and isinstance(gradient, h5py.Dataset):
+                pairs = [(primal, gradient)]
+            elif isinstance(primal, h5py.Group) and isinstance(gradient, h5py.Group):
+                columns = cls._validate_columns(cls._stored_columns(gradient))
+                if not columns or set(columns) != set(gradient.keys()):
+                    raise ValueError("Native HDF5 gradient columns must name every stored gradient column.")
+                unknown = [column for column in columns if column not in cls._stored_columns(primal)]
+                if unknown:
+                    raise ValueError(f"HDF5 primal has no gradient column '{unknown[0]}'.")
+                pairs = [(primal[column], gradient[column]) for column in columns]
+            else:
+                raise ValueError("Native HDF5 '/gradient' layout must match the primal dataset or named-column group.")
+            for primal_dataset, gradient_dataset in pairs:
+                if not isinstance(primal_dataset, h5py.Dataset) or not isinstance(gradient_dataset, h5py.Dataset):
+                    raise ValueError("Native HDF5 gradient columns must be datasets.")
+                if gradient_dataset.shape != primal_dataset.shape:
+                    raise ValueError(
+                        f"Gradient shape {gradient_dataset.shape} does not match HDF5 dataset "
+                        f"'{primal_dataset.name}' shape {primal_dataset.shape}."
+                    )
+                if gradient_dataset.dtype.kind not in "biufc":
+                    raise ValueError("Native HDF5 gradient datasets must have numeric values.")
+            virtual = cls.VDS_SOURCES_ATTRIBUTE in primal_file.attrs
+
+        if not virtual:
+            yield fpath, gradient_path, columns
+            return
+
+        gradient = cls.load_gradient(gradient_path, columns=columns)
+        yield from cls._gradient_contributions(fpath, gradient, columns)
+
+    @classmethod
+    def _partition_offsets(cls, dataset: h5py.Dataset, num_sources: int) -> np.ndarray:
+        sizes = json.loads(dataset.attrs[cls.PARTITION_SIZES_ATTRIBUTE])
+        if len(sizes) != num_sources or sum(sizes) != dataset.shape[0]:
+            raise ValueError(f"Invalid HDF5 concatenation partitions for '{dataset.name}'.")
+        return np.cumsum([0, *sizes])
+
+    @classmethod
+    def _gradient_contributions(
+        cls,
+        fpath: str,
+        gradient: np.ndarray,
+        columns: list[str] | None = None,
+    ) -> Iterator[tuple[str, np.ndarray, list[str] | None]]:
+        """Transpose DSBO virtual concatenation into physical-primal adjoints.
+
+        Named columns occupy tensor axis 0, but each column's physical
+        dataset is concatenated along its own leading (sample) axis.
+        Repeated sources intentionally yield separate additive contributions.
+        """
+        with h5py.File(fpath, "r") as file:
+            sources = cls._vds_sources(file)
+            if not sources:
+                yield fpath, gradient, columns
+                return
+            primal = file["primal"]
+            if isinstance(primal, h5py.Group):
+                columns = columns if columns is not None else cls._stored_columns(primal)
+                cls._validate_columns(columns, gradient)
+                datasets = [primal[column] for column in columns]
+                values = list(gradient)
+            else:
+                if columns is not None:
+                    raise ValueError("HDF5 dataset 'primal' was not written with named columns.")
+                datasets, values = [primal], [gradient]
+
+            partitions = []
+            for dataset, value in zip(datasets, values, strict=True):
+                if value.shape != dataset.shape:
+                    raise ValueError(
+                        f"Gradient shape {value.shape} does not match HDF5 dataset "
+                        f"'{dataset.name}' shape {dataset.shape}."
+                    )
+                partitions.append(cls._partition_offsets(dataset, len(sources)))
+
+            contributions = []
+            for index, source in enumerate(sources):
+                with h5py.File(source, "r") as source_file:
+                    pieces = [
+                        value[offsets[index]:offsets[index + 1]].reshape(source_file[dataset.name].shape)
+                        for dataset, value, offsets in zip(datasets, values, partitions, strict=True)
+                    ]
+                source_gradient = np.stack(pieces, axis=0) if columns is not None else pieces[0]
+                contributions.append((source, source_gradient, columns))
+
+        for source, source_gradient, source_columns in contributions:
+            yield from cls._gradient_contributions(source, source_gradient, source_columns)
+
+    @classmethod
+    def _read_gradient(
+        cls,
+        grad_path: str,
+        columns: list[str] | None = None,
+        *,
+        primal_columns: list[str] | None = None,
+        primal_shapes: dict[str, tuple[int, ...]] | None = None,
+    ) -> np.ndarray:
         with h5py.File(grad_path, "r") as file:
             gradient = file["gradient"]
             if isinstance(gradient, h5py.Dataset):
                 return cls._read_dataset(file, "gradient", columns=columns)
 
-            columns = (
-                cls._validate_columns(columns)
-                if columns is not None else cls._gradient_primal_columns(grad_path)
-            )
-            template = gradient[cls._stored_columns(gradient)[0]]
-            template_value = np.asarray(template[()] if template.shape == () else template[:])
+            if columns is None:
+                columns = primal_columns if primal_columns is not None else cls._gradient_primal_columns(grad_path)
+            if columns is None:
+                columns = cls._stored_columns(gradient)
+            columns = cls._validate_columns(columns)
+            gradient_columns = cls._stored_columns(gradient)
+            dtype = gradient[gradient_columns[0]].dtype
+            template_shape = gradient[gradient_columns[0]].shape
             values = []
             for column in columns:
                 if column in gradient:
                     value = gradient[column]
                     values.append(np.asarray(value[()] if value.shape == () else value[:]))
                 else:
-                    values.append(np.zeros_like(template_value))
+                    shape = primal_shapes[column] if primal_shapes is not None else template_shape
+                    values.append(np.zeros(shape, dtype=dtype))
             return np.stack(values, axis=0)
 
     @classmethod
-    def _save_gradient(cls, grad_path: str, gradient: np.ndarray, columns: list[str] | None = None):
-        if columns is None:
-            columns = cls._gradient_primal_columns(grad_path)
-        if columns is not None and grad_path in cls._gradient_written:
-            selected = cls._validate_columns(columns, gradient)
-            with h5py.File(grad_path, "a", libver="latest") as file:
-                group = file["gradient"]
-                if not isinstance(group, h5py.Group):
-                    raise ValueError("Cannot accumulate named gradients into an unnamed gradient.")
-                stored = cls._stored_columns(group)
-                for column, value in zip(selected, gradient, strict=True):
-                    if column in group:
-                        del group[column]
-                    cls._create_dataset(group, column, value)
-                    if column not in stored:
-                        stored.append(column)
-                group.attrs[cls.COLUMNS_ATTRIBUTE] = json.dumps(stored)
-            return
-        cls._write_datasets(grad_path, columns=columns, gradient=gradient)
+    def load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
+        return cls._read_gradient(grad_path, columns)
+
+    @classmethod
+    def load_backward_gradient(cls, fpath: str, grad_path: str) -> np.ndarray:
+        """Load the resolved backward gradient for a primal, zero-filling
+        named columns that the gradient file does not contain."""
+        with h5py.File(fpath, "r") as primal_file:
+            cls._validate_vds_sources(primal_file)
+            primal = primal_file["primal"]
+            if isinstance(primal, h5py.Dataset):
+                return cls._read_gradient(grad_path)
+            primal_columns = cls._stored_columns(primal)
+            primal_shapes = {column: primal[column].shape for column in primal_columns}
+            return cls._read_gradient(grad_path, primal_columns=primal_columns, primal_shapes=primal_shapes)
 
     @classmethod
     def _gradient_primal_columns(cls, grad_path: str) -> list[str] | None:
@@ -177,31 +339,6 @@ class HDF5File(AutogradFileInterface):
         with h5py.File(primal_path, "r") as file:
             primal = file["primal"]
             return cls._stored_columns(primal) if isinstance(primal, h5py.Group) else None
-
-    @classmethod
-    def read_backward_gradient(cls, fpath: str) -> torch.Tensor:
-        grad_path = cls._gradient_path(fpath)
-        with h5py.File(fpath, "r") as primal_file:
-            cls._validate_vds_sources(primal_file)
-            primal = primal_file["primal"]
-            if isinstance(primal, h5py.Dataset):
-                return torch.from_numpy(cls._load_gradient(grad_path)).float()
-
-            with h5py.File(grad_path, "r") as gradient_file:
-                gradient = gradient_file["gradient"]
-                if isinstance(gradient, h5py.Dataset):
-                    value = np.asarray(gradient[()] if gradient.shape == () else gradient[:])
-                    return torch.from_numpy(value).float()
-                gradient_columns = cls._stored_columns(gradient)
-                dtype = gradient[gradient_columns[0]].dtype
-                values = []
-                for column in cls._stored_columns(primal):
-                    if column in gradient:
-                        value = gradient[column]
-                        values.append(np.asarray(value[()] if value.shape == () else value[:]))
-                    else:
-                        values.append(np.zeros(primal[column].shape, dtype=dtype))
-                return torch.from_numpy(np.stack(values, axis=0)).float()
 
     @classmethod
     def _write_datasets(cls, fpath: str, columns: list[str] | None = None, **datasets: np.ndarray) -> None:
@@ -229,56 +366,6 @@ class HDF5File(AutogradFileInterface):
         statistics = cls._statistics(value)
         if statistics is not None:
             cls._write_statistics(dataset, statistics)
-
-    @classmethod
-    def _statistics(cls, value: np.ndarray) -> tuple[int, np.ndarray, np.ndarray] | None:
-        value = np.asarray(value)
-        if value.ndim not in (1, 2) or value.shape[0] == 0 or value.dtype.kind not in "biuf":
-            return None
-        values = value.astype(np.float64, copy=False)
-        mean = values.mean(axis=0)
-        return value.shape[0], mean, np.square(values - mean).sum(axis=0)
-
-    @classmethod
-    def _write_statistics(cls, dataset: h5py.Dataset, statistics: tuple[int, np.ndarray, np.ndarray]) -> None:
-        count, mean, squared_deviation = statistics
-        dataset.attrs[cls.STATS_COUNT_ATTRIBUTE] = count
-        dataset.attrs[cls.STATS_MEAN_ATTRIBUTE] = mean
-        dataset.attrs[cls.STATS_SQUARED_DEVIATION_ATTRIBUTE] = squared_deviation
-
-    @classmethod
-    def _read_statistics(cls, dataset: h5py.Dataset) -> tuple[int, np.ndarray, np.ndarray] | None:
-        attributes = dataset.attrs
-        if any(
-            name not in attributes
-            for name in (
-                cls.STATS_COUNT_ATTRIBUTE,
-                cls.STATS_MEAN_ATTRIBUTE,
-                cls.STATS_SQUARED_DEVIATION_ATTRIBUTE,
-            )
-        ):
-            return None
-        return (
-            int(attributes[cls.STATS_COUNT_ATTRIBUTE]),
-            np.asarray(attributes[cls.STATS_MEAN_ATTRIBUTE]),
-            np.asarray(attributes[cls.STATS_SQUARED_DEVIATION_ATTRIBUTE]),
-        )
-
-    @staticmethod
-    def _combine_statistics(values: list[tuple[int, np.ndarray, np.ndarray] | None]) -> tuple[int, np.ndarray, np.ndarray] | None:
-        if not values or any(value is None for value in values):
-            return None
-        count, mean, squared_deviation = values[0]
-        for batch_count, batch_mean, batch_squared_deviation in values[1:]:
-            total = count + batch_count
-            delta = batch_mean - mean
-            mean += delta * batch_count / total
-            squared_deviation += (
-                batch_squared_deviation
-                + delta * delta * count * batch_count / total
-            )
-            count = total
-        return count, mean, squared_deviation
 
     @staticmethod
     def _prepare_row_store(datasets: dict[str, np.ndarray]) -> tuple[list[str], np.ndarray]:
@@ -322,37 +409,78 @@ class HDF5File(AutogradFileInterface):
         return json.loads(columns) if columns is not None else list(group.keys())
 
     @classmethod
-    def _validate_vds_sources(cls, file: h5py.File) -> None:
+    def _vds_sources(cls, file: h5py.File) -> list[str]:
         manifest = file.attrs.get(cls.VDS_SOURCES_ATTRIBUTE)
         if manifest is None:
-            return
-        source_paths = json.loads(manifest)
+            return []
         file_dir = os.path.dirname(os.path.abspath(file.filename))
-        missing = [
-            source for source in source_paths
-            if not os.path.isfile(os.path.join(file_dir, source))
+        sources = [
+            os.path.normpath(os.path.join(file_dir, source))
+            for source in json.loads(manifest)
         ]
+        missing = [source for source in sources if not os.path.isfile(source)]
         if missing:
             raise FileNotFoundError(
                 f"HDF5 virtual dataset '{file.filename}' is missing source '{missing[0]}'."
             )
+        return sources
 
     @classmethod
-    def dependencies(cls, fpath: str) -> list[str]:
-        with h5py.File(fpath, "r") as file:
-            manifest = file.attrs.get(cls.VDS_SOURCES_ATTRIBUTE)
-            if manifest is None:
-                return []
-            file_dir = os.path.dirname(os.path.abspath(fpath))
-            return [
-                os.path.normpath(os.path.join(file_dir, source))
-                for source in json.loads(manifest)
-            ]
+    def _validate_vds_sources(cls, file: h5py.File) -> None:
+        cls._vds_sources(file)
 
     @classmethod
-    def validate(cls, fpath: str) -> None:
-        with h5py.File(fpath, "r") as file:
-            cls._validate_vds_sources(file)
+    def aggregate_gradients(cls, sources: list[str], destination: str) -> None:
+        columns = cls._union_gradient_columns(sources)
+        total = None
+        for path in sources:
+            value = cls.load_gradient(path, columns=columns)
+            total = value if total is None else total + value
+        cls.write_gradient(destination, total, columns=columns)
+
+    @classmethod
+    def write_gradient(
+        cls,
+        fpath: str,
+        gradient: np.ndarray,
+        columns: list[str] | None = None,
+        *,
+        merge: bool = False,
+    ) -> None:
+        """Publish a gradient file atomically, or merge named columns in place."""
+        if merge and columns is not None:
+            selected = cls._validate_columns(columns, gradient)
+            with h5py.File(fpath, "a", libver="latest") as file:
+                group = file["gradient"]
+                if not isinstance(group, h5py.Group):
+                    raise ValueError("Cannot accumulate named gradients into an unnamed gradient.")
+                stored = cls._stored_columns(group)
+                for column, value in zip(selected, gradient, strict=True):
+                    if column in group:
+                        del group[column]
+                    cls._create_dataset(group, column, value)
+                    if column not in stored:
+                        stored.append(column)
+                group.attrs[cls.COLUMNS_ATTRIBUTE] = json.dumps(stored)
+            return
+
+        temporary = f"{fpath}.{uuid.uuid4().hex}.partial"
+        try:
+            cls._write_datasets(temporary, columns=columns, gradient=gradient)
+            os.replace(temporary, fpath)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    @classmethod
+    def _union_gradient_columns(cls, sources: list[str]) -> list[str] | None:
+        columns: list[str] = []
+        for path in sources:
+            with h5py.File(path, "r") as file:
+                gradient = file["gradient"]
+                if isinstance(gradient, h5py.Group):
+                    columns.extend(cls._stored_columns(gradient))
+        return list(dict.fromkeys(columns)) or None
 
     @classmethod
     def reduce(cls, sources: list[str], destination: str) -> None:
@@ -401,6 +529,8 @@ class HDF5File(AutogradFileInterface):
     def _collect_metadata(
         cls,
         sources: list[str],
+        *,
+        include_statistics: bool = True,
     ) -> tuple[list[dict[str, tuple[tuple[int, ...], np.dtype, tuple | None, list[str] | None]]], list[str]]:
         metadata = []
         store_types = []
@@ -418,7 +548,7 @@ class HDF5File(AutogradFileInterface):
                     source_metadata = {}
                     file.visititems(
                         lambda name, obj: source_metadata.update(
-                            [(name, (obj.shape, obj.dtype, cls._read_statistics(obj)))]
+                            [(name, (obj.shape, obj.dtype, cls._read_statistics(obj) if include_statistics else None))]
                         )
                         if isinstance(obj, h5py.Dataset) else None
                     )
@@ -500,3 +630,8 @@ class HDF5File(AutogradFileInterface):
             template = primal[columns[0]]
             num_samples = 1 if template.shape == () else template.shape[0]
             return num_samples, len(columns)
+
+
+class HDF5File(AutogradFileInterface, HDF5Writer):
+    """DSBO file channel for HDF5: the autograd layer backed by :class:`HDF5Writer`."""
+    writer = HDF5Writer

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import os
+import uuid
 import warnings
 import networkx as nx
 from contextlib import nullcontext
 
 from dsbo.modules import Module
 from dsbo.utils.io import Workdir
+from dsbo.utils.io.gradient import gradient_path, next_contribution_path
 from dsbo.utils.io.workdir import AbstractFilePath
-from dsbo.utils.io.reduce import LazyReductionResolver
+from dsbo.utils.io.reduce import (
+    FileConcatenationResolver,
+    GradientAggregationResolver,
+    make_reduction_resolver,
+    reduction_sources,
+)
+from typing import Callable, Mapping
 
 
 def inner_module(module: Module) -> Module:
@@ -84,9 +92,9 @@ def _reduced_destination(input_path, producer_indices, subdir, suffix):
         return os.path.join(dir_path, f"{base_name}{label}{suffix_str}{ext}")
 
 
-def file_overlays(graph, task, index: int | None, candidate_subdirs):
+def file_overlays(graph, task, index: int | None, candidate_subdirs, generation: str | uuid.UUID):
     module = inner_module(task)
-    overlays: dict[AbstractFilePath, LazyReductionResolver] = {}
+    overlays: dict[AbstractFilePath, str | FileConcatenationResolver] = {}
 
     for input_path in module.registered_inputs:
         manual_overlay = Workdir.get_file_overlay(input_path)
@@ -105,19 +113,69 @@ def file_overlays(graph, task, index: int | None, candidate_subdirs):
         destination = _reduced_destination(input_path, producer_indices, subdir, module.i)
 
         # Direct overlay: single source points directly to the producer's output
-        if len(sources) == 1:
-            if sources[0] != destination:
-                overlays[input_path] = sources[0]
-            continue
-
-        # Lazy reduction: multiple sources must be reduced before consumption
-        overlays[input_path] = LazyReductionResolver(
+        view = make_reduction_resolver(
             sources,
             destination,
+            FileConcatenationResolver,
             context=f"{module.name} input {input_path.filename}",
+            generation=generation,
         )
+        if view != destination:
+            overlays[input_path] = view
         
     return overlays
+
+
+def _absolute(path: str) -> str:
+    return os.path.normpath(os.path.abspath(path))
+
+
+def _planned_contributions(
+    graph,
+    task,
+    generation: str | uuid.UUID,
+    task_ids,
+    forward_overlays: Mapping[Module, Mapping[AbstractFilePath, str | FileConcatenationResolver]],
+    destinations: set[str],
+) -> dict[str, list[str]]:
+    descendants = nx.descendants(graph, task)
+    contributions: dict[str, list[str]] = {}
+    for (consumer, _), consumer_task_id in task_ids.items():
+        if consumer not in descendants:
+            continue
+        counts: dict[str, int] = {}
+        for input_path in inner_module(consumer).registered_inputs:
+            for target in reduction_sources(forward_overlays.get(consumer, {}).get(input_path)):
+                destination = gradient_path(_absolute(target))
+                if destination not in destinations:
+                    continue
+                contribution = next_contribution_path(destination, generation, consumer_task_id.hex, counts)
+                contributions.setdefault(destination, []).append(contribution)
+    return contributions
+
+
+def gradient_overlays(graph, task, index: int | None, candidate_subdirs, generation: str | uuid.UUID, task_ids, forward_overlays: Mapping[Module, Mapping[AbstractFilePath, str | FileConcatenationResolver]]):
+    """Prepared lazy aggregations for the gradients this task's backward reads."""
+    module = inner_module(task)
+    subdir = "batch_reduce" if index is None else candidate_subdirs[index]
+    destinations = {
+        gradient_path(_absolute(Workdir.resolve_file(path, subdir=subdir, suffix=module.i, use_overlays=False)))
+        for path in module.registered_outputs
+    }
+    if not destinations:
+        return {}
+
+    contributions = _planned_contributions(graph, task, generation, task_ids, forward_overlays, destinations)
+    return {
+        destination: make_reduction_resolver(
+            sources,
+            destination,
+            GradientAggregationResolver,
+            generation=generation,
+            context=f"gradient {os.path.basename(destination)}",
+        )
+        for destination, sources in contributions.items()
+    }
 
 
 def create_candidate_symlinks(module: Module, candidate_subdirs) -> None:
