@@ -67,9 +67,9 @@ def test_resolver_skips_reduce_on_same_object_reuse(tempdir):
     resolver = FileConcatenationResolver(sources, destination)
     resolver.resolve()
 
-    with patch("dsbo.config.get_active_file_backend") as mock_backend:
+    with patch.object(FileConcatenationResolver, "_materialize") as materialize:
         resolver.resolve()
-        mock_backend.return_value.reduce.assert_not_called()
+        materialize.assert_not_called()
 
 
 def test_resolver_called_on_new_run_with_existing_files(tempdir):
