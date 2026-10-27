@@ -257,19 +257,23 @@ class IntermediatesStorage(IntermediatesStorageBase):
         self._engine = engine
         self._readonly = readonly
 
-    def add_scalar(self, tag: str, step: int, value: float) -> None:
+    def add_scalar(self, tag: str, step: int, value: float, run_id: int | None = None) -> None:
         if self._readonly:
             raise RuntimeError("Cannot write to readonly StudyStorage.")
         
         with Session(self._engine) as session:
-            session.add(Intermediate(tag=tag, step=step, value=value, walltime=time.time()))
+            session.add(Intermediate(
+                tag=tag, run_id=run_id, step=step, value=value, walltime=time.time()
+            ))
             session.commit()
 
-    def get_scalars(self, tag: str | None = None) -> list[float] | dict[str, list[float]]:
+    def get_scalars(self, tag: str | None = None, run_id: int | None = None) -> list[float] | dict[str, list[float]]:
         with Session(self._engine) as session:
             query = select(Intermediate).order_by(Intermediate.step)
             if tag is not None:
                 query = query.where(Intermediate.tag == tag)
+            if run_id is not None:
+                query = query.where(Intermediate.run_id == run_id)
             rows = session.exec(query).all()
 
         if tag is not None:
@@ -286,6 +290,19 @@ class IntermediatesStorage(IntermediatesStorageBase):
                 select(Intermediate.tag).distinct().order_by(Intermediate.tag)
             ).all()
         return list(rows)
+
+    def get_run_ids(self, tag: str | None = None) -> list[int]:
+        with Session(self._engine) as session:
+            query = (
+                select(Intermediate.run_id)
+                .where(Intermediate.run_id.is_not(None))
+                .distinct()
+                .order_by(Intermediate.run_id)
+            )
+            if tag is not None:
+                query = query.where(Intermediate.tag == tag)
+            rows = session.exec(query).all()
+        return [int(run_id) for run_id in rows if run_id is not None]
 
 
 class TrialStorage(TrialStorageBase):
@@ -398,16 +415,18 @@ class TrialStorage(TrialStorageBase):
 
 
 class ArtifactStorage(ArtifactStorageBase):
-    def __init__(self, storage_name: str, engine: Engine):
+    def __init__(self, storage_name: str, engine: Engine,
+                 root: Path | str | None = None):
         super().__init__(storage_name)
         self._engine = engine
+        self._root = Path(root).resolve().as_posix() if root is not None else None
 
     def create_artifact(self, name: str, type: str, metadata: dict | None = None) -> Artifact:
         return Artifact(name, type, metadata)
 
     def save_artifact(self, artifact: Artifact, stage: str | None = None,
                       step: int | None = None) -> Artifact:
-        root = Path(Workdir.get_current_dir()).as_posix()
+        root = self._root or Path(Workdir.get_current_dir()).resolve().as_posix()
         artifacts_dir = Path(root) / "artifacts" / artifact.name
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -483,6 +502,8 @@ class ArtifactStorage(ArtifactStorageBase):
                       stage: str | None = None) -> Artifact:
         with Session(self._engine) as session:
             query = select(ArtifactEntry).where(ArtifactEntry.name == name)
+            if self._root is not None:
+                query = query.where(ArtifactEntry.root == self._root)
             if version is not None:
                 query = query.where(ArtifactEntry.version == version)
             if stage is not None:
@@ -515,6 +536,8 @@ class ArtifactStorage(ArtifactStorageBase):
                 query = query.where(ArtifactEntry.stage == stage)
             if subdir is not None:
                 query = query.where(ArtifactEntry.root == subdir)
+            elif self._root is not None:
+                query = query.where(ArtifactEntry.root == self._root)
             query = query.order_by(ArtifactEntry.version.desc())
             latest = session.exec(query).first()
             return latest.version if latest is not None else None
@@ -522,6 +545,8 @@ class ArtifactStorage(ArtifactStorageBase):
     def list_artifacts(self, type: str | None = None) -> list[dict]:
         with Session(self._engine) as session:
             query = select(ArtifactEntry).order_by(ArtifactEntry.name, ArtifactEntry.version)
+            if self._root is not None:
+                query = query.where(ArtifactEntry.root == self._root)
             if type is not None:
                 query = query.where(ArtifactEntry.type == type)
             entries = session.exec(query).all()
@@ -541,11 +566,21 @@ class ArtifactStorage(ArtifactStorageBase):
 
 class StudyStorage(StudyStorageBase):
 
-    def __init__(self, engine: Engine, *, readonly: bool = False, vector_dim: int | None = None):
-        super().__init__(db_path="")
+    def __init__(self, engine: Engine, *, readonly: bool = False,
+                 vector_dim: int | None = None,
+                 db_path: Path | str | None = None,
+                 artifact_root: Path | str | None = None):
+        if artifact_root is None and db_path is not None:
+            db_path = Path(db_path).resolve()
+            artifact_root = db_path.parent / f"{db_path.stem}_artifacts"
+        self._db_path = str(Path(db_path).resolve()) if db_path is not None else ""
+        super().__init__(db_path=self._db_path)
         self._engine = engine
         self._readonly = readonly
         self._vector_dim = vector_dim
+        self._artifact_root = (
+            Path(artifact_root).resolve().as_posix() if artifact_root is not None else None
+        )
         inspector = inspect(engine)
         if not inspector.get_table_names():  # DB is empty
             SQLModel.metadata.create_all(engine)
@@ -553,7 +588,9 @@ class StudyStorage(StudyStorageBase):
         self._trial_storage = TrialStorage(engine, readonly, vector_dim=vector_dim)
         self._workflow_storage = WorkflowStorage(engine, readonly)
         self._intermediates_storage = IntermediatesStorage(engine, readonly)
-        self._artifact_storage = ArtifactStorage("artifacts", engine)
+        self._artifact_storage = ArtifactStorage(
+            "artifacts", engine, root=self._artifact_root,
+        )
 
     @property
     def created_at(self) -> float | None:
@@ -569,6 +606,8 @@ class StudyStorage(StudyStorageBase):
             "url": url,
             "readonly": self._readonly,
             "vector_dim": self._vector_dim,
+            "db_path": self._db_path,
+            "artifact_root": self._artifact_root,
         }
 
     def __setstate__(self, state: dict) -> None:
@@ -582,12 +621,15 @@ class StudyStorage(StudyStorageBase):
             engine,
             readonly=state["readonly"],
             vector_dim=vector_dim,
+            db_path=state.get("db_path"),
+            artifact_root=state.get("artifact_root"),
         )
 
 
     @classmethod
     def create(cls, db_path: Path | str, *, readonly: bool = False,
-               vector_dim: int | None = None) -> "StudyStorage":
+               vector_dim: int | None = None,
+               artifact_root: Path | str | None = None) -> "StudyStorage":
         db_path = Path(db_path).resolve()
         if db_path.exists():
             raise StudyStorageExistsError(
@@ -601,7 +643,10 @@ class StudyStorage(StudyStorageBase):
         )
         if vector_dim is not None:
             _configure_sqlite_vec(engine, vector_dim)
-        storage = cls(engine, readonly=readonly, vector_dim=vector_dim)
+        storage = cls(
+            engine, readonly=readonly, vector_dim=vector_dim,
+            db_path=db_path, artifact_root=artifact_root,
+        )
         StudyMetadata.__table__.create(engine, checkfirst=True)
         with Session(engine) as session:
             session.add(StudyMetadata(created_at=created_at))
@@ -609,7 +654,8 @@ class StudyStorage(StudyStorageBase):
         return storage
 
     @classmethod
-    def open(cls, db_path: Path | str, vector_dim: int | None = None) -> "StudyStorage":
+    def open(cls, db_path: Path | str, vector_dim: int | None = None,
+             artifact_root: Path | str | None = None) -> "StudyStorage":
         db_path = Path(db_path).resolve()
         if not db_path.is_file():
             raise FileNotFoundError(f"Study storage '{db_path}' does not exist.")
@@ -618,7 +664,10 @@ class StudyStorage(StudyStorageBase):
         )
         if vector_dim is not None:
             _configure_sqlite_vec(engine, vector_dim)
-        return cls(engine, readonly=True, vector_dim=vector_dim)
+        return cls(
+            engine, readonly=True, vector_dim=vector_dim,
+            db_path=db_path, artifact_root=artifact_root,
+        )
     
     def close(self):
         self._engine.dispose()

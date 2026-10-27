@@ -137,11 +137,15 @@ class IntermediatesStorageBase(ABC):
         pass
 
     @abstractmethod
-    def add_scalar(self, tag: str, step: int, value: float) -> None:
+    def add_scalar(self, tag: str, step: int, value: float, run_id: int | None = None) -> None:
         pass
 
     @abstractmethod
-    def get_scalars(self, tag: str | None = None) -> list[float] | dict[str, list[float]]:
+    def get_scalars(self, tag: str | None = None, run_id: int | None = None) -> list[float] | dict[str, list[float]]:
+        pass
+
+    @abstractmethod
+    def get_run_ids(self, tag: str | None = None) -> list[int]:
         pass
 
     @abstractmethod

@@ -70,6 +70,7 @@ class JobTrace(SQLModel, table=True):
 class Intermediate(SQLModel, table=True):
     id:       str   = Field(default_factory=_new_id, primary_key=True)
     tag:      str   = Field(index=True)
+    run_id:   int | None = Field(default=None, index=True)
     step:     int
     value:    float
     walltime: float = Field(sa_column=Column(Double))
