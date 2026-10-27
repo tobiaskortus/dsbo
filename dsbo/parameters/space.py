@@ -20,6 +20,14 @@ class ParameterSpace:
         self._key_fn = key_fn
         self._spec = spec
         self._params = _collect(spec, key_fn)
+        self._index: Dict[str, Tuple[int, int]] = {}
+        offset = 0
+        for name, parameter in self._params.items():
+            if isinstance(parameter, Constant):
+                continue
+            width = len(parameter.choices) if isinstance(parameter, Categorical) else 1
+            self._index[name] = (offset, width)
+            offset += width
         self._sampler: Sampler | None = None
 
     @staticmethod
@@ -34,10 +42,9 @@ class ParameterSpace:
             case Encoding.ORDINAL | "ordinal":
                 return sum(0 if isinstance(p, Constant) and not include_constants else 1 for p in self._params.values())
             case Encoding.ONE_HOT | "one_hot":
-                return sum(
-                    0 if isinstance(p, Constant) and not include_constants else
-                    len(p.choices) if isinstance(p, Categorical) else 1
-                    for p in self._params.values()
+                return sum(width for _, width in self._index.values()) + (
+                    sum(isinstance(p, Constant) for p in self._params.values())
+                    if include_constants else 0
                 )
             case _:
                 raise ValueError(f"Unknown encoding {encoding!r}. Use 'ordinal' or 'one_hot'.")
@@ -108,19 +115,15 @@ class Candidate:
     _index: Dict[str, Tuple[int, int]] = field(init=False)
 
     def __post_init__(self):
-        index: Dict[str, Tuple[int, int]] = {}
-        offset = 0
-        for n, p in self.space._params.items():
-            if isinstance(p, Constant):
-                continue
-            w = len(p.choices) if hasattr(p, 'choices') else 1
-            index[n] = (offset, w)
-            offset += w
-        object.__setattr__(self, '_index', index)
+        object.__setattr__(self, '_index', self.space._index)
 
     @classmethod
     def from_values(cls, space: ParameterSpace, values: Dict[str, Any], requires_grad: bool = False) -> Candidate:
         return cls(space, space.encode(values, requires_grad))
+
+    def parameters(self) -> Iterator[Tuple[str, DesignParameter, torch.Tensor]]:
+        for name, (offset, width) in self._index.items():
+            yield name, self.space._params[name], self.tensor[offset:offset + width]
 
     @property
     def values(self) -> Dict[str, Any]:
