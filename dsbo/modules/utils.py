@@ -9,11 +9,12 @@ from dsbo.utils.io.workdir import AbstractFilePath
 
 
 class ResultRecorder(Module):
-    def __init__(self, inner: Module, record_path: AbstractFilePath):
+    def __init__(self, inner: Module, record_path: AbstractFilePath, *, required: bool = False):
         super().__init__()
         self.inner = inner
         self.i = inner.i
         self._record_output = Output(record_path)
+        self._required = required
 
     @property
     def surrogate(self):
@@ -52,15 +53,20 @@ class ResultRecorder(Module):
 
     def __call__(self, design: dict, **kwargs) -> dict:
         result = self.inner(design=design, **kwargs)
-        fpath = self._record_output()
-        get_active_file_backend().write_row_store(
-            fpath,
-            {
-                key: value.detach().cpu().numpy()
-                for key, value in result.items()
-                if isinstance(value, torch.Tensor)
-            },
-        )
+        records = {
+            key: value.detach().cpu().numpy()
+            for key, value in result.items()
+            if isinstance(value, torch.Tensor)
+        }
+        if not records:
+            if self._required:
+                raise RuntimeError(
+                    f"Sink module '{self.inner.name}' returned no tensor results; "
+                    "workflow surrogate training requires every sink to contribute "
+                    "at least one result."
+                )
+            return result
+        get_active_file_backend().write_row_store(self._record_output(), records)
         return result
 
     def set_seed(self, seed: int):

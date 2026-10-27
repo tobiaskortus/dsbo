@@ -164,8 +164,9 @@ def _contract_equivalent_leaves(G: nx.DiGraph, dependency_groups: Iterable) -> n
 
 
 def _wrap_with_recorders(base_graph: nx.DiGraph, record_path) -> tuple[nx.DiGraph, dict[Module, ResultRecorder]]:
+    sinks = {node for node in base_graph.nodes() if base_graph.out_degree(node) == 0}
     node_to_recorder: dict[Module, ResultRecorder] = {
-        node: ResultRecorder(node, record_path)
+        node: ResultRecorder(node, record_path, required=node in sinks)
         for node in base_graph.nodes()
         if not is_batch_fused(node)
     }

@@ -182,6 +182,32 @@ class TestWorkflowSurrogateTrainingPlan:
         sink_edges = [u for u, v in plan.graph.edges() if v is trainer]
         assert len(sink_edges) == 3
         assert all(type(u).__name__ == "ResultRecorder" for u in sink_edges)
+        assert all(
+            node._required
+            for node in plan.graph.nodes()
+            if type(node).__name__ == "ResultRecorder"
+        )
+
+    def test_marks_only_sink_recorders_as_required(self):
+        first, second = SimpleModule(), SimpleModule()
+        wf = Workflow(first >> second)
+        surrogate = _WorkflowSurrogate()
+
+        plan = build_workflow_surrogate_training_plan(
+            wf.task_graph,
+            wf.surrogate_execution.dependency_groups,
+            surrogate,
+            surrogate.train,
+            [_candidate()],
+        )
+
+        recorders = {
+            recorder.inner: recorder
+            for recorder in plan.graph.nodes()
+            if type(recorder).__name__ == "ResultRecorder"
+        }
+        assert recorders[first]._required is False
+        assert recorders[second]._required is True
 
     def test_does_not_wrap_batch_fused_nodes_in_recorder(self):
         fused = batch_fuse(_ModuleSurrogate())
