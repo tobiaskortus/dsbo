@@ -140,16 +140,18 @@ def _module_surrogate_subgraph(
 def _contract_equivalent_leaves(G: nx.DiGraph, dependency_groups: Iterable) -> nx.DiGraph:
     """Only applied when the selected subgraph is a set of independent leaves: collapses
     replicates sharing a template (or type, when no template) into a single representative
-    so one trainer producer remains. Algorithm preserved verbatim."""
+    so one trainer producer remains."""
     if G.nodes() and all(G.out_degree(n) == 0 for n in G.nodes()):
         block_of: dict[tuple[str, int], list[Module]] = defaultdict(list)
+        grouped = set()
 
+        # Inner groups precede outer groups; assign each node only once.
         for g in dependency_groups:
             for n in g.nodes:
-                if n in G.nodes():
+                if n in G.nodes() and n not in grouped:
                     block_of[("template", id(g.template))].append(n)
+                    grouped.add(n)
 
-        grouped = set().union(*block_of.values())
         for n in G.nodes():
             if n not in grouped:
                 block_of[("type", type(n))].append(n)

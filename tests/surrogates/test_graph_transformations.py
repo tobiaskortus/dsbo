@@ -6,10 +6,12 @@ leaf contraction, workflow recorder wrapping, and dependency-group remapping.
 They are intentionally construction-level (no execution), so they stay fast.
 """
 
+import pytest
 import torch
 
 from dsbo.parameters import ParameterSpace, Continuous, Candidate
 from dsbo.modules import dynamic_submodule, batch_fuse
+from dsbo.modules.dsl import dynamic
 from dsbo.workflow import Workflow
 from dsbo.utils.io import Workdir, Input
 from dsbo.utils.io.workdir import DefaultPaths, DefaultFilenames
@@ -18,6 +20,7 @@ from dsbo.surrogates.module_surrogate import ModuleSurrogate
 from dsbo.surrogates.workflow_surrogate import WorkflowSurrogate
 from dsbo.worker.spec import LocalWorkerSpec
 from dsbo.surrogates.graph_transformations import (
+    build_module_surrogate_eval_graph,
     build_module_surrogate_training_plan,
     build_workflow_surrogate_training_plan,
 )
@@ -72,6 +75,35 @@ def _candidate(value=1.0):
 
 
 class TestModuleSurrogateTrainingPlan:
+    @pytest.mark.parametrize("dynamic_outer", [False, True])
+    @pytest.mark.parametrize("with_ancestors", [False, True])
+    def test_nested_replication_uses_copied_nodes(self, dynamic_outer, with_ancestors):
+        target = SimpleModule()
+        surrogate = _ModuleSurrogate()
+        target.surrogate = surrogate
+        inner = (
+            SimpleModule() * 2 >> target * dynamic()
+            if with_ancestors else target * 2
+        )
+        dependencies = (
+            SimpleModule() * 2 >> inner * dynamic()
+            if dynamic_outer else inner * 2
+        )
+        workflow = Workflow(dependencies)
+
+        plan = build_module_surrogate_training_plan(
+            workflow.task_graph,
+            dependencies.groups,
+            surrogate,
+            surrogate.train,
+            [_candidate()],
+        )
+
+        assert plan.trainer is not None
+        producers = list(plan.graph.predecessors(plan.trainer))
+        assert len(producers) == (1 if not dynamic_outer and not with_ancestors else 4)
+        assert all(node in workflow.task_graph for node in producers)
+
     def test_selects_ancestor_subgraph_and_wires_one_trainer(self):
         producer = SimpleModule()
         consumer = SimpleModule()
@@ -135,6 +167,38 @@ class TestModuleSurrogateTrainingPlan:
 
         assert plan.trainer is None
         assert plan.train_submodule is None
+
+
+def test_dynamic_module_replicas_share_one_surrogate():
+    source, target = SimpleModule(), SimpleModule()
+    target.surrogate = _ModuleSurrogate()
+    dependencies = source * 3 >> target * dynamic()
+    workflow = Workflow(dependencies)
+
+    graph = build_module_surrogate_eval_graph(workflow.task_graph, dependencies.groups)
+
+    assert len(graph) == 4
+    assert sum(isinstance(node, _ModuleSurrogate) for node in graph) == 1
+    assert len(graph.edges) == 3
+
+
+@pytest.mark.parametrize("dynamic_outer", [False, True])
+@pytest.mark.parametrize("grouped_inner", [False, True])
+def test_nested_surrogate_eval_preserves_branch_groups(dynamic_outer, grouped_inner):
+    target = SimpleModule()
+    target.surrogate = _ModuleSurrogate()
+    inner = target * 2 if grouped_inner else target | SimpleModule()
+    dependencies = (
+        SimpleModule() * 2 >> inner * dynamic()
+        if dynamic_outer else inner * 2
+    )
+    workflow = Workflow(dependencies)
+
+    graph = build_module_surrogate_eval_graph(workflow.task_graph, dependencies.groups)
+
+    surrogates = [node for node in graph if isinstance(node, _ModuleSurrogate)]
+    assert len(surrogates) == 2
+    assert all(graph.in_degree(node) == (1 if dynamic_outer else 0) for node in surrogates)
 
 
 class TestWorkflowSurrogateTrainingPlan:
