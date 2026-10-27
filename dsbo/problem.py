@@ -9,8 +9,25 @@ from dsbo.modules import Module
 from dsbo.parameters import Candidate, ParameterSpace
 from dsbo.worker.dask import HeterogeneousDaskWorker, WorkerContext
 from dsbo.worker.spec import WorkerSpec
-from dsbo.workflow import Workflow
+from dsbo.workflow import Workflow, implements_backward
 
+
+class ProblemCapabilities:
+    def __init__(self, workflow: Workflow):
+        self.workflow = workflow
+    
+    @cached_property
+    def supports_forward_ad(self):
+        #TODO: How should this be handled?
+        pass
+
+    @cached_property
+    def supports_reverse_ad(self):
+        return all(
+            module._no_grad_op or implements_backward(module)
+            for module in self.workflow.task_graph.nodes
+            if isinstance(module, Module)
+        )
 
 class Problem(ABC):
     def __init__(
@@ -21,6 +38,7 @@ class Problem(ABC):
         self.name = name
         self.workdir = workdir
         self._worker_specs: dict[type[Module], WorkerSpec] = {}
+        self._capabilities = ProblemCapabilities(self.default_workflow)
 
     @cached_property
     def default_workflow(self) -> Workflow:
@@ -37,6 +55,10 @@ class Problem(ABC):
     @property
     def has_worker_specs(self) -> bool:
         return bool(self._worker_specs)
+
+    @property
+    def capabilities(self) -> ProblemCapabilities:
+        return self._capabilities
 
     def to(self, worker_specs: Mapping[type[Module], WorkerSpec]) -> Problem:
         self._worker_specs = dict(worker_specs)
