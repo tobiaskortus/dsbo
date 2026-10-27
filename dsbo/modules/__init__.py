@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import torch
 import inspect
 import weakref
-from abc import ABC
+from enum import Enum
+from pathlib import Path
+from abc import ABC, abstractmethod
 from functools import partial, wraps
-from typing import Optional, Callable, TYPE_CHECKING
+from typing import BinaryIO, Optional, Callable, TYPE_CHECKING
+
 
 from dsbo.autograd import autograd_context
 from dsbo.logger import WorkflowTaskLogger
@@ -22,6 +26,7 @@ from dsbo.utils.io import (
 from dsbo.utils.io.workdir import DefaultPaths
 
 if TYPE_CHECKING:
+    from dsbo.storage.artifact import ArtifactRef
     from dsbo.worker.spec import WorkerSpec
     from dsbo.surrogates.module_surrogate import ModuleSurrogate
     from dsbo.surrogates.module_surrogate import ModuleSurrogateContract
@@ -48,6 +53,7 @@ def auto_wrap(cls, method_name, *decorators):
 
 class Module(ModuleDslMixin, ABC):
     requires_design_tensor = False
+    supports_forward_ad = True
 
     def __init__(self):
         self._registered_files: dict[str, AbstractFilePath] = {}
@@ -301,6 +307,156 @@ def dynamic_submodule(wrapped_fn):
         
 
     return DynamicSubmodule(wrapped_fn)
+
+
+class ModelLifecycleStage(Enum):
+    TRAIN = ("train", "trained")
+    PRETRAIN = ("pretrain", "pretrained")
+    FINETUNE = ("finetune", "finetuned")
+
+    @property
+    def task_name(self) -> str:
+        return self.value[0]
+
+    @property
+    def artifact_stage(self) -> str:
+        return self.value[1]
+
+
+class TrainableModule(Module):
+    def __init__(self, model_dir: str = "models"):
+        super().__init__()
+        self.model_file_path = Output(
+            Workdir.register_file(model_dir, f"{self._artifact_name}.pt")
+        )
+        self._lifecycle_tasks: dict[ModelLifecycleStage, Module] = {}
+        self._task_stages: dict[Module, ModelLifecycleStage] = {}
+
+        for stage in ModelLifecycleStage:
+            if self.implements(stage.task_name):
+                task = getattr(self, stage.task_name)
+                if isinstance(task, Module):
+                    self._lifecycle_tasks[stage] = task
+                    self._task_stages[task] = stage
+
+        if not self.implements_train and not self.implements_pretrain:
+            raise NotImplementedError(
+                f"{type(self).__name__} must implement train or pretrain "
+                "to be trained through the workflow."
+            )
+
+    def implements(self, method_name: str) -> bool:
+        for cls in type(self).__mro__:
+            if method_name in cls.__dict__:
+                return cls is not TrainableModule
+        return False
+
+    @dynamic_submodule
+    def train(self, design, **kwargs):
+        raise NotImplementedError(f"{type(self).__name__} does not implement train.")
+
+    @dynamic_submodule
+    def pretrain(self, design, **kwargs):
+        raise NotImplementedError(f"{type(self).__name__} does not implement pretrain.")
+
+    @dynamic_submodule
+    def finetune(self, design, **kwargs):
+        raise NotImplementedError(f"{type(self).__name__} does not implement finetune.")
+
+    @abstractmethod
+    def state_dict(self) -> dict:
+        ...
+
+    @abstractmethod
+    def from_state_dict(self, state: dict) -> None:
+        ...
+
+    def save_to_file(self, model_file: str | Path) -> None:
+        torch.save(self.state_dict(), model_file)
+
+    def load_from_file(self, model_file: str | Path | BinaryIO) -> None:
+        self.from_state_dict(
+            torch.load(model_file, weights_only=True, map_location="cpu")
+        )
+
+    def publish_trained_model(self, model_file: str, stage: str = "trained") -> ArtifactRef:
+        from dsbo.storage import get_current_storage
+
+        storage = get_current_storage()
+        artifact = storage.artifacts.create_artifact(self._artifact_name, "model")
+        artifact.add_file(model_file, name="model.pt")
+        return storage.artifacts.save_artifact(artifact, stage=stage).ref
+
+    def training_stage(self, task: Module) -> str:
+        stage = self._task_stages.get(task)
+        if stage is None:
+            raise ValueError(f"{task.name} is not a lifecycle task of {type(self).__name__}.")
+        return stage.artifact_stage
+
+    def select_training_task(self) -> Module:
+        return self._lifecycle_tasks[self._get_next_stage()]
+
+    def _resolve_model_ref(self) -> ArtifactRef:
+        from dsbo.storage import get_current_storage
+        from dsbo.storage.artifact import ArtifactRef
+
+        storage = get_current_storage()
+        name = self._artifact_name
+        for stage in (ModelLifecycleStage.FINETUNE, ModelLifecycleStage.PRETRAIN, ModelLifecycleStage.TRAIN):
+            artifact_stage = stage.artifact_stage
+            version = storage.artifacts.latest_version(name, stage=artifact_stage)
+            if version is not None:
+                return ArtifactRef(name, "model", version, artifact_stage)
+        raise RuntimeError(f"No trained model artifact exists for '{name}'.")
+
+    def _get_next_stage(self) -> ModelLifecycleStage:
+        if self.implements_finetune and self.is_pretrained:
+            return ModelLifecycleStage.FINETUNE
+        if self.implements_pretrain:
+            return ModelLifecycleStage.PRETRAIN
+        return ModelLifecycleStage.TRAIN
+
+    def _has_artifact_for(self, *stages: ModelLifecycleStage) -> bool:
+        from dsbo.storage import get_current_storage
+
+        if not (storage := get_current_storage()):
+            return False
+        return any(
+            storage.artifacts.latest_version(self._artifact_name, stage=stage.artifact_stage) is not None
+            for stage in stages
+        )
+
+    @property
+    def implements_train(self) -> bool:
+        return ModelLifecycleStage.TRAIN in self._lifecycle_tasks
+
+    @property
+    def implements_pretrain(self) -> bool:
+        return ModelLifecycleStage.PRETRAIN in self._lifecycle_tasks
+
+    @property
+    def implements_finetune(self) -> bool:
+        return ModelLifecycleStage.FINETUNE in self._lifecycle_tasks
+
+    @property
+    def implements_pretrain_and_finetune(self) -> bool:
+        return self.implements_pretrain and self.implements_finetune
+
+    @property
+    def is_available(self) -> bool:
+        return self.is_pretrained or self.is_finetuned
+
+    @property
+    def is_pretrained(self) -> bool:
+        return self._has_artifact_for(ModelLifecycleStage.PRETRAIN, ModelLifecycleStage.TRAIN)
+
+    @property
+    def is_finetuned(self) -> bool:
+        return self._has_artifact_for(ModelLifecycleStage.FINETUNE)
+
+    @property
+    def _artifact_name(self) -> str:
+        return type(self).__name__.lower()
 
 
 from dsbo.modules.dsl import with_no_grad
