@@ -17,6 +17,7 @@ class HepEmShowSimulation(SimulationBase):
     simulation_file: Output
     energy_file: Output
     labels_file: Output
+    design_file: Output
 
     def __init__(
         self,
@@ -51,6 +52,13 @@ class HepEmShowSimulation(SimulationBase):
             Workdir.register_file(
                 DefaultPaths.SIMULATION,
                 f"{file_prefix}_labels.h5",
+                unique_filename=True,
+            )
+        )
+        self.design_file = Output(
+            Workdir.register_file(
+                DefaultPaths.SIMULATION,
+                f"{file_prefix}_design.h5",
                 unique_filename=True,
             )
         )
@@ -235,6 +243,16 @@ class HepEmShowSimulation(SimulationBase):
         storage.write(self.simulation_file(), edep)
         storage.write(self.energy_file(), energies)
         storage.write(self.labels_file(), self._particle_type_labels())
+        design_vector = torch.cat(
+            [
+                design["absorber"].detach().reshape(-1),
+                design["gap"].detach().reshape(-1),
+            ]
+        )
+        storage.write(
+            self.design_file(),
+            design_vector.unsqueeze(0).expand(edep.shape[0], -1),
+        )
 
     def backward(self, design: dict[str, torch.Tensor], grad_output: torch.Tensor | None = None) -> None:
         storage = get_active_file_backend()

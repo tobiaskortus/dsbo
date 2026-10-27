@@ -70,8 +70,8 @@ def evaluate_set_metrics(model: ParticleEnergyMLP, loader: DataLoader, device: t
     model.eval()
     metrics = RegressionMetrics()
     with torch.no_grad():
-        for inputs, normalized_targets in loader:
-            predictions = model.denormalize(model(shower_features(inputs.to(device))))
+        for designs, inputs, normalized_targets in loader:
+            predictions = model.denormalize(model(designs.to(device), shower_features(inputs.to(device))))
             targets = model.denormalize(normalized_targets.to(device))
             metrics.update(predictions, targets)
     return metrics.compute()
@@ -96,26 +96,30 @@ class ParticleEnergyMLP(nn.Module):
     def __init__(
         self,
         input_dim: int,
+        design_dim: int,
         hidden_dim: int = 128,
         num_hidden_layers: int = 2,
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = []
-        in_features = input_dim
+        width = design_dim + input_dim
         for _ in range(num_hidden_layers):
-            layers.append(nn.Linear(in_features, hidden_dim))
+            layers.append(nn.Linear(width, hidden_dim))
             layers.append(nn.ReLU(inplace=True))
-            in_features = hidden_dim
-        layers.append(nn.Linear(in_features, 1))
+            width = hidden_dim
+        layers.append(nn.Linear(width, 1))
         self.network = nn.Sequential(*layers)
+        self.register_buffer("design_mean", torch.zeros(design_dim))
+        self.register_buffer("design_std", torch.ones(design_dim))
         self.register_buffer("input_mean", torch.zeros(input_dim))
         self.register_buffer("input_std", torch.ones(input_dim))
         self.register_buffer("target_mean", torch.zeros(()))
         self.register_buffer("target_std", torch.ones(()))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, design: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        design = (design - self.design_mean) / self.design_std
         x = (x - self.input_mean) / self.input_std
-        return self.network(x).squeeze(-1)
+        return self.network(torch.cat([design, x], dim=1)).squeeze(-1)
 
     def denormalize(self, normalized: torch.Tensor) -> torch.Tensor:
         return normalized * self.target_std + self.target_mean
@@ -124,6 +128,7 @@ class ParticleEnergyMLP(nn.Module):
 def train_particle_energy_regressor(
     edep_per_cell: torch.Tensor,
     energies: torch.Tensor,
+    designs: torch.Tensor,
     hidden_dim: int = 128,
     num_hidden_layers: int = 2,
     epochs: int = 10,
@@ -150,20 +155,25 @@ def train_particle_energy_regressor(
     flat_edep = shower_features(edep_per_cell)
     input_mean = flat_edep[training_indices].mean(dim=0)
     input_std = flat_edep[training_indices].std(dim=0).clamp_min(1e-6)
+    design_mean = designs[training_indices].mean(dim=0)
+    design_std = designs[training_indices].std(dim=0).clamp_min(1.0)
 
     torch.manual_seed(seed)
     model = ParticleEnergyMLP(
         flat_edep.shape[1],
+        designs.shape[1],
         hidden_dim=hidden_dim,
         num_hidden_layers=num_hidden_layers,
     ).to(device)
     model.input_mean.copy_(input_mean)
     model.input_std.copy_(input_std)
+    model.design_mean.copy_(design_mean)
+    model.design_std.copy_(design_std)
     model.target_mean.copy_(target_mean)
     model.target_std.copy_(target_std)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    dataset = TensorDataset(edep_per_cell, normalized_energies)
+    dataset = TensorDataset(designs, edep_per_cell, normalized_energies)
     training_loader = DataLoader(
         Subset(dataset, training_indices),
         batch_size=batch_size,
@@ -185,12 +195,12 @@ def train_particle_energy_regressor(
     for epoch in range(epochs):
         model.train()
         train_metrics = RegressionMetrics()
-        for inputs, normalized_targets in training_loader:
+        for designs_batch, inputs, normalized_targets in training_loader:
+            designs_batch = designs_batch.to(device)
             inputs = shower_features(inputs.to(device))
             normalized_targets = normalized_targets.to(device)
             optimizer.zero_grad()
-            normalized_predictions = model(inputs)
-            predictions = model.denormalize(normalized_predictions)
+            predictions = model.denormalize(model(designs_batch, inputs))
             targets = model.denormalize(normalized_targets)
             loss = (((predictions - targets) ** 2) / (targets + 1.0)).mean()
             loss.backward()
@@ -246,6 +256,7 @@ class ParticleEnergyRegression(Module):
         super().__init__()
         self.training_edep = Input(training_simulation.simulation_file.path)
         self.training_energy = Input(training_simulation.energy_file.path)
+        self.training_design = Input(training_simulation.design_file.path)
         self.evaluation_edep = Input(evaluation_simulation.simulation_file.path)
         self.evaluation_energy = Input(evaluation_simulation.energy_file.path)
         self.model_file = Output(Workdir.register_file(DefaultPaths.RECONSTRUCTION, "particle_energy_regressor.pt"))
@@ -271,10 +282,12 @@ class ParticleEnergyRegression(Module):
         with torch.no_grad():
             edep = storage.open(self.training_edep(), "cpu").detach()
             energies = storage.open(self.training_energy(), "cpu").reshape(-1).detach()
+            designs = storage.open(self.training_design(), "cpu").detach()
 
         model, metrics = train_particle_energy_regressor(
             edep,
             energies,
+            designs,
             seed=self.seed,
             epochs=self.epochs,
             batch_size=self.batch_size,
@@ -296,17 +309,12 @@ class ParticleEnergyRegression(Module):
 
     @dynamic_submodule
     def eval(self, design, **kwargs) -> dict[str, torch.Tensor]:
-        loss, prediction, target_energy, eval_metrics = self._evaluate()
-        return {
-            "loss": loss,
-            "prediction": prediction,
-            "target_energy": target_energy,
-            **eval_metrics,
-        }
+        loss, _, _, eval_metrics = self._evaluate(design)
+        return {"loss": loss, **eval_metrics}
 
     @eval.backward
     def backward(self, design, grad_output=None) -> None:
-        loss, _, _, _ = self._evaluate()
+        loss, _, _, _ = self._evaluate(design)
         loss.backward(grad_output["loss"])
 
     def _publish_artifact(self, model: ParticleEnergyMLP, metrics: dict) -> int | None:
@@ -355,20 +363,34 @@ class ParticleEnergyRegression(Module):
             metadata.update({f"option_{key}": value for key, value in self.model_options.items()})
             return metadata
     
-    def _evaluate(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    def _evaluate(
+        self,
+        design: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         device = resolve_device()
         storage = get_active_file_backend()
         edep = storage.open(self.evaluation_edep(), "cpu").to(device)
+        design_vector = torch.cat(
+            [
+                design["absorber"].reshape(-1),
+                design["gap"].reshape(-1),
+            ]
+        )
+        design_tensor = design_vector.unsqueeze(0).expand(edep.shape[0], -1)
         with torch.no_grad():
             energies = storage.open(self.evaluation_energy(), "cpu").reshape(-1).to(device)
             state_dict = torch.load(self.trained_model(), map_location=device, weights_only=True)
-            model = ParticleEnergyMLP(edep.shape[1:].numel(), **self.model_options).to(device)
+            model = ParticleEnergyMLP(
+                edep.shape[1:].numel(),
+                design_tensor.shape[1],
+                **self.model_options,
+            ).to(device)
             model.load_state_dict(state_dict)
             model.eval()
             for parameter in model.parameters():
                 parameter.requires_grad_(False)
 
-        predictions = model.denormalize(model(shower_features(edep)))
+        predictions = model.denormalize(model(design_tensor.to(device), shower_features(edep)))
         loss = (((predictions - energies) ** 2)  / (energies + 1.0)).mean()
         with torch.no_grad():
             primal_predictions = fw.unpack_dual(predictions).primal
@@ -386,5 +408,3 @@ class ParticleEnergyRegression(Module):
             energies.cpu(),
             eval_metrics,
         )
-
-   
