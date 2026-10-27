@@ -1,4 +1,6 @@
 import os
+import logging
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -557,6 +559,38 @@ class TestBackendRegistry:
 
 
 class TestContainerWrapperBase:
+    @pytest.mark.parametrize("method", ["run_container", "exec_container"])
+    @pytest.mark.parametrize("logged", [False, True])
+    def test_nonzero_exit_raises_and_preserves_failure_log(self, method, logged):
+        wrapper = ContainerWrapperBase(ImageRef(uri="unused-host-launcher"))
+        runtime = MagicMock()
+        cmd = ["native-backward", "incoming.h5", "outgoing.h5"]
+        runtime.build_run_command.return_value = cmd
+        runtime.build_exec_command.return_value = cmd
+        wrapper._runtime = runtime
+        logger = MagicMock() if logged else None
+
+        with patch("dsbo.container.WorkflowTaskLogger.get_current", return_value=logger), \
+             patch("dsbo.container.subprocess_run", return_value=7) as run:
+            with pytest.raises(subprocess.CalledProcessError) as error:
+                getattr(wrapper, method)(cmd[1:])
+
+        assert error.value.returncode == 7
+        assert error.value.cmd == cmd
+        assert run.call_args.args[0] == cmd
+        if logged:
+            logger.log.assert_any_call(
+                "Container process failed with return code 7", log_type=logging.ERROR,
+            )
+
+    @pytest.mark.parametrize("method", ["run_container", "exec_container"])
+    def test_successful_exit_returns_normally(self, method):
+        wrapper = ContainerWrapperBase(ImageRef(uri="unused-host-launcher"))
+        wrapper._runtime = MagicMock()
+        with patch("dsbo.container.WorkflowTaskLogger.get_current", return_value=None), \
+             patch("dsbo.container.subprocess_run", return_value=0):
+            assert getattr(wrapper, method)(["native-backward"]) is None
+
     @pytest.mark.parametrize(
         ("resources", "expected"),
         [
