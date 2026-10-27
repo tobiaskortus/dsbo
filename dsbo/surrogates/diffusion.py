@@ -118,8 +118,8 @@ class MlpDiffusion1D(ModelMixin, ConfigMixin):
         return_dict: bool = True,
     )  -> MlpDiffusion1DOutput | torch.Tensor:
         
-        #TODO: Is this really necessary to stay compatible with diffusers or is (B, n) also fine?
-        x = x.squeeze(1)
+        if x.dim() == 3:
+            x = x.squeeze(1)
         
         x = self.in_fc(x)
         x = x + self.time_emb(t)

@@ -58,7 +58,7 @@ class WorkflowSurrogate(SurrogateBase):
         self,
         training_data_path: str,
         candidates: CandidateBatch,
-    ) -> tuple[DataLoader, DataLoader]:
+    ) -> tuple[DataLoader, DataLoader | None]:
         from dsbo.utils.io.datasets.datasets import WorkflowSurrogateDataset
 
         dataset = WorkflowSurrogateDataset(
@@ -97,10 +97,13 @@ class WorkflowSurrogate(SurrogateBase):
                 persistent_workers=True,
                 prefetch_factor=getattr(self, "prefetch_factor", 4),
             )
-        return (
-            DataLoader(Subset(dataset, train_indices), shuffle=True, **loader_options),
-            DataLoader(Subset(dataset, val_indices), shuffle=False, **loader_options),
+        train_loader = DataLoader(Subset(dataset, train_indices), shuffle=True, **loader_options)
+        val_loader = (
+            DataLoader(Subset(dataset, val_indices), shuffle=False, **loader_options)
+            if val_indices
+            else None
         )
+        return train_loader, val_loader
 
     @property
     def data_path(self) -> AbstractFilePath:   

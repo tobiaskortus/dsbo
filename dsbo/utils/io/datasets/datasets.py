@@ -261,7 +261,7 @@ class WorkflowSurrogateDataset(SurrogateDataset):
     ):
         super().__init__(backend)
         self._records_path = records_path
-        self._design = torch.as_tensor(design).float()
+        self._design = torch.as_tensor(design).detach().cpu().float()
         self._records: DatasetView | None = None
         self._keys: list[str] = []
         self._n = 0
@@ -371,11 +371,11 @@ def design_split(n_candidates: int, rows_per_design: int, val_split: float, seed
     """Split candidates by *design* into (train, val) row indices."""
     k = rows_per_design
 
+    if val_split <= 0.0 or n_candidates < 2:
+        return list(range(n_candidates * k)), []
+
     def rows_of(designs: list[int]) -> list[int]:
         return [r for c in designs for r in range(c * k, (c + 1) * k)]
-
-    if n_candidates < 2:
-        return list(range(n_candidates * k)), list(range(n_candidates * k))
 
     perm = torch.randperm(n_candidates, generator=torch.Generator().manual_seed(seed)).tolist()
     n_val = min(max(1, int(n_candidates * val_split)), n_candidates - 1)
