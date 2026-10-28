@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import multiprocessing as mp
 from dataclasses import dataclass, replace
 from abc import ABC, abstractmethod
@@ -46,6 +47,11 @@ class WorkerSpec(ABC):
     def spec_key(self) -> str:
         pass
 
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Return whether the job queue backend required by this spec is available."""
+        pass
+
     @property
     def resource_key(self) -> str:
         return self.spec_key
@@ -83,6 +89,9 @@ class LocalWorkerSpec(WorkerSpec):
     min_worker: int | None = None
     max_worker: int | None = None
 
+    def is_available(self) -> bool:
+        return True
+
     @property
     def spec_key(self) -> str:
         return sanitize(f"local_{self.cores}c_{self.processes}p_{self.memory}")
@@ -110,6 +119,10 @@ class SLURMWorkerSpec(WorkerSpec):
 
     min_worker: int | None = None
     max_worker: int | None = None
+
+    def is_available(self) -> bool:
+        commands = (SLURMJob.submit_command, SLURMJob.cancel_command)
+        return all(shutil.which(command) is not None for command in commands)
 
     @property
     def spec_key(self) -> str:

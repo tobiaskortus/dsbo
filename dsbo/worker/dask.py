@@ -3,6 +3,7 @@ from __future__ import annotations
 import dask
 import uuid
 import torch
+import warnings
 import contextvars
 import torch.autograd.forward_ad as fw
 
@@ -41,6 +42,8 @@ def _unpack_tensor(t):
 
 
 class DaskWorkerBase:
+    job_specs: tuple[WorkerSpec, ...] = ()
+
     def __init__(self, cluster):
         self.client = Client(cluster)
 
@@ -172,6 +175,14 @@ class DaskWorkerBase:
 
         return task_id, delayed_obj
 
+
+def check_worker_available(worker: Optional[DaskWorkerBase]) -> bool:
+    """Return whether every job queue backend required by ``worker`` is available."""
+    if worker is None:
+        return True
+    return all(spec.is_available() for spec in worker.job_specs)
+
+
 class WorkerContext:
     _current_worker = contextvars.ContextVar("current_worker", default=None)
 
@@ -179,6 +190,15 @@ class WorkerContext:
     @contextmanager
     def use_worker(cls, worker: Optional[DaskWorkerBase]) -> Generator[None, Any, None]:
         assert worker == None or isinstance(worker, DaskWorkerBase), "Worker must be an instance of DaskWorkerBase"
+        if worker is not None and not check_worker_available(worker):
+            unavailable = [type(spec).__name__ for spec in worker.job_specs if not spec.is_available()]
+            warnings.warn(
+                f"Job queue system required by the worker is not available on this machine "
+                f"({', '.join(unavailable)}). Falling back to local execution.",
+                UserWarning,
+                stacklevel=2,
+            )
+            worker = None
         token = cls._current_worker.set(worker)
         try:
             yield
@@ -193,11 +213,12 @@ class WorkerContext:
 class HeterogeneousDaskWorker(DaskWorkerBase):
     def __init__(self, job_specs: Iterable[WorkerSpec], logdir: str = "logs"):
         self.logdir = logdir
-        cluster_spec = dict(ChainMap(*[s.get_spec_dict() for s in job_specs]))
+        self.job_specs = tuple(job_specs)
+        cluster_spec = dict(ChainMap(*[s.get_spec_dict() for s in self.job_specs]))
 
         adapt_config = dict()
 
-        for spec in job_specs:
+        for spec in self.job_specs:
             assert (spec.min_worker is not None and 
                     spec.max_worker is not None), "Define static or adaptive scaling with .scale() or .adapt()"
 
@@ -205,10 +226,11 @@ class HeterogeneousDaskWorker(DaskWorkerBase):
             adapt_config[spec.spec_key] = (spec.min_worker, spec.max_worker)
 
         self.cluster = HybridCluster(spec=cluster_spec, log_directory=logdir)
-        if all(minimum == maximum for minimum, maximum in adapt_config.values()):
-            self.cluster.scale({key: minimum for key, (minimum, _) in adapt_config.items()})
-        else:
-            self.cluster.adapt(adapt_config)
+        if check_worker_available(self):
+            if all(minimum == maximum for minimum, maximum in adapt_config.values()):
+                self.cluster.scale({key: minimum for key, (minimum, _) in adapt_config.items()})
+            else:
+                self.cluster.adapt(adapt_config)
         super().__init__(self.cluster)
 
     @classmethod
