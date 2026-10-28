@@ -93,9 +93,25 @@ def compute_workflow_hash(workflow: Workflow) -> str:
 
 
 def compute_candidate_hash(candidate: Candidate) -> str:
+    """
+    Hash the evaluation mode, primal input, and forward-AD tangent if present.
+    """
+    # Detaching a dual tensor discards its tangent, so unpack it first.
+    primal, tangent = fw.unpack_dual(candidate.tensor)
+    metadata = {
+        "space": candidate.space._spec,
+        "mode": "forward_ad" if fw._current_level > -1 else "primal",
+        "primal": {"shape": list(primal.shape), "dtype": str(primal.dtype)},
+        "tangent": (
+            {"shape": list(tangent.shape), "dtype": str(tangent.dtype)}
+            if tangent is not None else None
+        ),
+    }
     h = hashlib.sha256()
-    h.update(json.dumps(candidate.space._spec, sort_keys=True, default=vars).encode())
-    h.update(candidate.tensor.detach().cpu().contiguous().numpy().tobytes())
+    h.update(json.dumps(metadata, sort_keys=True, default=vars).encode())
+    h.update(primal.detach().cpu().contiguous().numpy().tobytes())
+    if tangent is not None:
+        h.update(tangent.detach().cpu().contiguous().numpy().tobytes())
     return h.hexdigest()
 
 
@@ -127,6 +143,10 @@ def load_npz(cache_entry_path: str, manifest: dict[str, Any]) -> dict[str, Any] 
 
     data = np.load(rp)
     tangent_set = set(manifest.get("tangent_keys", []))
+    # Reject rather than discard tangents when they cannot be reconstructed.
+    if tangent_set and fw._current_level == -1:
+        return None
+
     results: dict[str, Any] = {}
     for k in manifest["result_keys"]:
         primal = torch.from_numpy(data[f"{k}_primal"])
@@ -240,8 +260,9 @@ class WorkflowExecutionCache:
         indices = []
 
         for i, c in enumerate(candidates):
-            if self.has(c):
-                results[i] =  self.load(c)
+            result = self.load(c)
+            if result is not None:
+                results[i] = result
                 continue
             
             indices.append(i)
