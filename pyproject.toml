@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "pybind11>=3.0,<4"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -19,7 +19,6 @@ dependencies = [
     "filelock",
     "graphviz",
     "grpcio",
-    "h5py",
     "lancedb",
     "lightning",
     "matplotlib",
@@ -43,11 +42,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "build",
     "grpcio-tools",
     "pre-commit",
     "pytest",
+    "h5py>=3.16",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dsbo*"]
+
+[tool.setuptools.package-data]
+"dsbo.utils.io.storage" = ["include/dsbo/*.hpp", "include/dsbo/third_party/*.hpp", "licenses/*.txt", "licenses/*.md"]

@@ -15,6 +15,12 @@
 
 ## Getting started
 
+Building DSBO requires a C++17 compiler and **HDF5 >=2.0 built with thread safety
+enabled**. Install its development headers/libraries first and set `HDF5_ROOT`
+to that installation prefix (or configure `pkg-config`). Python packaging still
+uses setuptools. See [Native C++ HDF5 I/O](docs/guide/native_io.md) for installation,
+SDK export, and Python-free container examples.
+
 <!--
 ```sh
 pip install dsbo        #Full installation

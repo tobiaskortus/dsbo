@@ -1,0 +1,5 @@
+recursive-include dsbo/utils/io/storage/include *.hpp
+recursive-include dsbo/utils/io/storage/licenses *.txt *.md
+recursive-include cpp *.cpp CMakeLists.txt
+recursive-include examples/cpp_container *
+include docs/guide/native_io.md

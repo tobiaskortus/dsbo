@@ -1,5 +1,9 @@
 # I/O and Autograd
 
+The HDF5 backend uses a header-only C++ implementation through pybind11 and
+requires thread-safe HDF5 >=2.0. See [Native C++ HDF5 I/O](native_io.md) for
+installation, SDK export, and Python-free container workflow steps.
+
 Modules in a DSBO workflow exchange data through files. Each module registers the files it reads and writes; the framework resolves these registrations to concrete paths inside the run directory, so one module's output file is the next module's input file.
 
 There is a reason for this design. Modules run as short-lived, stateless tasks — on dask workers, in containers, or locally — so in-memory objects cannot cross task boundaries and the filesystem is the only channel every execution mode shares. Storing gradients in files as well keeps the task graph differentiable even when a backward pass runs on a different worker than the forward pass, and lets containerized modules take part in gradient-based optimization at all.

@@ -19,6 +19,7 @@ nav:
     - Writing Modules: guide/modules.md
     - Building Workflows: guide/workflows.md
     - I/O and Autograd: guide/io.md
+    - Native C++ HDF5 I/O: guide/native_io.md
     - Parallelization with Dask: guide/parallelization.md
     - Using Surrogates: guide/surrogates.md
   - API Reference:
