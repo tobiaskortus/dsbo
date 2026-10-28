@@ -14,17 +14,19 @@ import numpy as np
 import pytest
 import torch
 
+import dsbo.utils.io.storage as storage
 from dsbo.utils.io.gradient import (
     resolve_gradient,
     use_gradient_pass,
     use_gradient_writer,
 )
-from dsbo.utils.io.storage import HDF5Writer as W, export_cpp_sdk, get_cpp_include
+from dsbo.utils.io.storage import HDF5Writer as W
 from dsbo.utils.io.storage import _hdf5
 from dsbo.utils.io.workdir import Input, Output, Workdir
 
 
 DTYPES = ["bool", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float16", "float32", "float64", "complex64", "complex128", ">i4", ">f8", ">c16"]
+STORAGE_DIRECTORY = Path(storage.__file__).resolve().parent
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -309,28 +311,29 @@ def test_environment_and_concurrent_native_calls(tmp_path):
         list(executor.map(work, range(12)))
 
 
-def test_sdk_export_is_complete_source_only_and_non_destructive(tmp_path):
-    assert (get_cpp_include() / "dsbo/hdf5.hpp").is_file()
-    sdk = export_cpp_sdk(tmp_path / "sdk")
+def test_packaged_native_headers_and_notices_can_be_copied(tmp_path):
+    sdk = tmp_path / "sdk"
+    shutil.copytree(STORAGE_DIRECTORY / "include", sdk / "include")
+    shutil.copytree(STORAGE_DIRECTORY / "licenses", sdk / "licenses")
+    assert (sdk / "include/dsbo/hdf5.hpp").is_file()
     assert (sdk / "include/dsbo/third_party/json.hpp").is_file()
     assert (sdk / "licenses/HDF5.txt").is_file()
-    manifest = json.loads((sdk / "sdk.json").read_text())
-    assert manifest["hdf5_threadsafe"]
-    assert manifest["hdf5_minimum"] == "2.0"
+    assert {path.name for path in sdk.iterdir()} == {"include", "licenses"}
     assert not any(path.suffix in {".so", ".dylib", ".dll", ".py", ".pyc"} for path in sdk.rglob("*"))
-    with pytest.raises(FileExistsError):
-        export_cpp_sdk(sdk)
-    with pytest.raises(ValueError, match="outside"):
-        export_cpp_sdk(get_cpp_include() / "invalid-export")
+    for path in sdk.rglob("*"):
+        if path.is_file():
+            assert path.read_bytes() == (STORAGE_DIRECTORY / path.relative_to(sdk)).read_bytes()
 
 
 @pytest.fixture(scope="session")
 def native_executable(tmp_path_factory):
     if os.environ.get("DSBO_TEST_NATIVE") != "1":
-        pytest.skip("Set DSBO_TEST_NATIVE=1 and HDF5_ROOT to build/test the exported C++ SDK")
+        pytest.skip("Set DSBO_TEST_NATIVE=1 and HDF5_ROOT to build/test copied C++ headers")
     root = Path(__file__).resolve().parents[1]
     build = tmp_path_factory.mktemp("native-sdk")
-    sdk = export_cpp_sdk(build / "sdk")
+    sdk = build / "sdk"
+    shutil.copytree(STORAGE_DIRECTORY / "include", sdk / "include")
+    shutil.copytree(STORAGE_DIRECTORY / "licenses", sdk / "licenses")
     subprocess.run([
         "cmake", "-S", str(root / "cpp"), "-B", str(build / "build"),
         f"-DDSBO_SDK_INCLUDE_DIR={sdk / 'include'}", "-DCMAKE_BUILD_TYPE=Debug",
@@ -410,7 +413,7 @@ def test_non_threadsafe_hdf5_is_rejected(tmp_path, check):
     else:
         executable = tmp_path / "unsafe-native-step"
         subprocess.run([
-            "c++", "-std=c++17", "-pthread", f"-I{get_cpp_include()}", f"-I{prefix / 'include'}",
+            "c++", "-std=c++17", "-pthread", f"-I{STORAGE_DIRECTORY / 'include'}", f"-I{prefix / 'include'}",
             str(root / "cpp/examples/workflow_step.cpp"), f"-L{library}", f"-Wl,-rpath,{library}",
             "-lhdf5", "-o", str(executable),
         ], check=True)

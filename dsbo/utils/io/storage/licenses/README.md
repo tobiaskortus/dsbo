@@ -10,5 +10,5 @@
 
 These are third-party notices, not a license grant for DSBO itself. The native
 implementation remains part of DSBO. Obtain maintainer/rightsholder approval
-for the applicable DSBO license before external redistribution. Exporting the
-SDK does not change ownership or licensing of the original implementation.
+for the applicable DSBO license before external redistribution. Copying these
+sources does not change ownership or licensing of the original implementation.

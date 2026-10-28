@@ -83,23 +83,45 @@ wheel repair tools if distributing self-contained binary wheels. Preserve the
 licenses/notices for the actual bundled libraries. No CI setup is required or
 provided for this feature.
 
-## Export the SDK
+## Copy the native headers
 
-```python
-from dsbo.utils.io.storage import export_cpp_sdk, get_cpp_include
+The Python package ships the C++ headers in `dsbo/utils/io/storage/include/`
+and third-party notices in `dsbo/utils/io/storage/licenses/`. Copy both directories
+into your native build context; there is no Python SDK setup or export API.
+This is a **build/setup step**, not something workflow steps do at runtime.
 
-print(get_cpp_include())
-sdk = export_cpp_sdk("build/container-context/dsbo-sdk")
+From the root of a source checkout:
+
+```bash
+DSBO_STORAGE=dsbo/utils/io/storage
+mkdir -p build/container-context
+mkdir build/container-context/dsbo-sdk
+cp -R "$DSBO_STORAGE/include" "$DSBO_STORAGE/licenses" build/container-context/dsbo-sdk/
 ```
 
-The destination must not already exist; existing files are never overwritten.
-The export contains `include/`, `licenses/`, and `sdk.json` with the DSBO version
-and native requirements. It contains no host binaries, host HDF5 paths, or
-Python modules. Compile it against the container's own HDF5 installation.
+To copy from a regular installed package instead, use `python -m pip show -f dsbo`
+to locate its files and set `DSBO_STORAGE` to
+`<Location>/dsbo/utils/io/storage` before running the copy commands. For an
+editable installation, use the source checkout. Use a new destination directory
+when updating the headers so files from different versions are not mixed.
 
-Pin the DSBO package/image versions used to construct a workflow. The exported
-SDK shares DSBO's release version; there is no independently published native
-package or installed `find_package(DSBOIO)` package to manage.
+The resulting build input contains only sources and notices:
+
+```text
+dsbo-sdk/
+├── include/dsbo/hdf5.hpp
+├── include/dsbo/third_party/json.hpp
+└── licenses/
+```
+
+Do not copy host binaries, host HDF5 libraries, or Python modules into the native
+build context. Compile against the target environment's own thread-safe HDF5
+>=2.0 installation. For a local build, you can also use the original `include/`
+directory directly without copying it.
+
+Pin the DSBO source revision/package version and image versions used to construct
+a workflow. The native headers share DSBO's release version; there is no separate
+native package, generated manifest, or installed `find_package(DSBOIO)` package.
 
 ## Use from C++
 
@@ -115,8 +137,8 @@ int main() {
 }
 ```
 
-Supply the exported `include/` directory and link the HDF5 core C library. For
-example on Unix, with the appropriate `PKG_CONFIG_PATH`:
+Supply the original or copied `include/` directory and link the HDF5 core C
+library. For example on Unix, with the appropriate `PKG_CONFIG_PATH`:
 
 ```bash
 c++ -std=c++17 -pthread -I/path/to/dsbo-sdk/include step.cpp \
@@ -150,10 +172,10 @@ and retain the existing compound representation for complex outputs.
 
 ## Python-free container example
 
-Prepare a small Docker build context, from a source checkout and installed DSBO:
+After copying the headers and notices into `build/container-context/dsbo-sdk`
+as above, add the example source and Dockerfile from the checkout:
 
 ```bash
-python -c 'from dsbo.utils.io.storage import export_cpp_sdk; export_cpp_sdk("build/container-context/dsbo-sdk")'
 cp cpp/examples/workflow_step.cpp build/container-context/
 cp examples/cpp_container/Dockerfile build/container-context/
 docker build -t dsbo-native-example:latest build/container-context
@@ -162,7 +184,7 @@ python examples/cpp_container/workflow.py --image dsbo-native-example:latest
 
 The image uses a checksum-verified HDF5 2.0.0 source archive. It builds thread-safe
 HDF5 and the executable in a build stage, then copies only the executable,
-runtime libraries, and notices/version information into the runtime stage.
+runtime libraries, and notices into the runtime stage.
 The runtime stage has no Python. The example doubles values and optional forward
 tangents, and its backward operation doubles incoming adjoints. The Python
 workflow checks `loss=6` and `d(loss)/dx=2` for an input of 3.
@@ -201,9 +223,9 @@ DSBO_TEST_CONTAINER_IMAGE=dsbo-native-example:latest python -m pytest tests/test
 python examples/cpp_container/workflow.py --executable build/native/dsbo_native_step
 ```
 
-The optional native pytest test builds against an **exported SDK**, not the
-checkout's header path. Native tests include multiple translation units,
-concurrent calls, lazy selection, VDS, gradients, and statistics. Python tests
+The optional native pytest test builds against a **manually copied include tree**,
+not the original package header path. Native tests include multiple translation
+units, concurrent calls, lazy selection, VDS, gradients, and statistics. Python tests
 use h5py to inspect the format independently. Container tests verify that Python
 is absent and exchange forward/backward files with the host.
 
@@ -223,7 +245,8 @@ no change to the project's Python build backend is needed.
 
 ## Licensing
 
-Third-party notices accompany the Python package and SDK export. This does not
-choose or change DSBO's license. Maintainer/rightsholder approval is required
+Third-party notices accompany the Python package and must be copied with the
+native headers. This does not choose or change DSBO's license.
+Maintainer/rightsholder approval is required
 before externally redistributing DSBO's native implementation. If redistributing
 HDF5 with additional filters/libraries, include those artifacts' notices too.

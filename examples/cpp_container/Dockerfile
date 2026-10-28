@@ -28,6 +28,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 zlib
 COPY --from=build /opt/hdf5/lib /opt/hdf5/lib
 COPY --from=build /opt/hdf5/share/LICENSE /usr/share/licenses/hdf5/LICENSE
 COPY --from=build /opt/dsbo-sdk/licenses /usr/share/licenses/dsbo-sdk
-COPY --from=build /opt/dsbo-sdk/sdk.json /usr/share/dsbo-sdk/sdk.json
 COPY --from=build /build/dsbo_native_step /usr/local/bin/dsbo_native_step
 ENTRYPOINT ["/usr/local/bin/dsbo_native_step"]
