@@ -1,9 +1,5 @@
 # I/O and Autograd
 
-The HDF5 backend uses a header-only C++ implementation through pybind11 and
-requires thread-safe HDF5 >=2.0. See [Native C++ HDF5 I/O](native_io.md) for
-installation, native builds, and Python-free container workflow steps.
-
 Modules in a DSBO workflow exchange data through files. Each module registers the files it reads and writes; the framework resolves these registrations to concrete paths inside the run directory, so one module's output file is the next module's input file.
 
 There is a reason for this design. Modules run as short-lived, stateless tasks — on dask workers, in containers, or locally — so in-memory objects cannot cross task boundaries and the filesystem is the only channel every execution mode shares. Storing gradients in files as well keeps the task graph differentiable even when a backward pass runs on a different worker than the forward pass, and lets containerized modules take part in gradient-based optimization at all.
@@ -81,26 +77,35 @@ with Workdir.use_file_suffix("2"):
 
 A single **file backend** decides the format — how arrays, gradients, and replica reductions are written to and read from disk — keeping the whole workflow consistent without any module knowing about it.
 
-Two backends are available, all implementing the same interface (`dsbo.utils.io.storage.AutogradFileInterface`):
+The default backend uses the HDF5 format (`HDF5File`), storing arrays as HDF5 datasets.
+The format is widely supported and inspectable with standard tools.
 
-- `HDF5File` — the default. Stores arrays as HDF5 datasets; widely supported and inspectable with standard tools.
-- `ROOTFile` — stores arrays as ROOT TTrees via uproot; use it when results must be readable from ROOT-based analysis pipelines.
+For convenience a header-only C++ implementation is provided for workflow steps using C++ code.
+The same implementation is used in DSBO via pybind11, such that the functionality is always in sync.
+See [Native C++ HDF5 I/O](native_io.md) for installation, native builds, and Python-free container workflow steps.
+
+If other file backends are required, the interface `dsbo.utils.io.storage.AutogradFileInterface` can be implemented and activated as such:
 
 ```python
 import dsbo
-from dsbo.utils.io.storage import ROOTFile
+from myproject.storage import ROOTFile
 
 with dsbo.config.use(file_backend=ROOTFile):
-    ...   # all reads and writes now use ROOT TTrees
+    ...   # all reads and writes now use the ROOTFile backend
 ```
 
-The backend is also applied to *filenames*: registered files whose extension matches a known backend format (`.h5`, `.hdf5`, `.root`) are transparently rewritten to the active backend's default extension. Registering `"results.h5"` under the ROOT backend resolves to `results.root` — so modules stay backend-agnostic while files on disk are always consistent. Unrelated extensions (`.npz`, `.json`, ...) pass through unchanged.
+The backend is also applied to *filenames*: registered files whose extension matches a known backend format (`.h5`, `.hdf5`)
+are transparently rewritten to the active backend's default extension.
+Registering `results.hdf5` under the default `HDF5File` backend resolves to `results.h5`.
+Analogously, if a different file backend is to be used, e.g., your own ROOT implementation, the filename changes automatically to `results.root` —
+provided the file extension is listed in `reducible_extensions()` — so modules stay backend-agnostic while files on disk are always consistent.
+Unrelated extensions (`.npz`, `.json`, ...) pass through unchanged.
 
 ## Combining Replica Outputs
 
 Replicas write to per-replica files (the suffix resolution in [Resolving Paths](#resolving-paths)). Whenever a module's input is written by multiple upstream tasks — a fan-in, for instance — the framework reduces them into one file before the module reads it; the same happens for batch-fused stages. Custom pipelines can call `reduce_registered_file(sources, destination)` from `dsbo.utils.io.reduce` directly.
 
-Reduction is **virtual**: the destination does not copy the source data. For HDF5 it contains virtual datasets (VDS) referencing the sources plus a manifest and per-partition row counts; for ROOT it stores a manifest that is resolved through uproot's multi-file concatenation on read. Reads of the reduced file therefore resolve lazily through the sources, so no data is duplicated on disk.
+Reduction is **virtual**: the destination does not copy the source data. For HDF5 it contains virtual datasets (VDS) referencing the sources plus a manifest and per-partition row counts. Reads of the reduced file therefore resolve lazily through the sources, so no data is duplicated on disk.
 
 ## File-Based Autograd
 
@@ -143,7 +148,7 @@ This is the mechanism behind "gradients flow through files": a differentiable mo
 
     Named columns are an experimental feature; the API may still change.
 
-Arrays can carry named columns: pass `columns=[...]` to `write()` (and to any `open()` to select a subset), or write a `dict[str, np.ndarray]` with `write_named_datasets()`. Columns are stored as an HDF5 group (or ROOT branches) with the column list persisted in metadata, so reads reconstruct the original column order and zero-fill gradients of columns that received no gradient. For tabular results with many rows and named features, `write_row_store(fpath, {"energy": e, "cost": c})` stores an interleaved row store that surrogate training reads efficiently.
+Arrays can carry named columns: pass `columns=[...]` to `write()` (and to any `open()` to select a subset), or write a `dict[str, np.ndarray]` with `write_named_datasets()`. Columns are stored as an HDF5 group with the column list persisted in metadata, so reads reconstruct the original column order and zero-fill gradients of columns that received no gradient. For tabular results with many rows and named features, `write_row_store(fpath, {"energy": e, "cost": c})` stores an interleaved row store that surrogate training reads efficiently.
 
 ## Training Datasets
 

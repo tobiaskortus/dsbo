@@ -1,9 +1,3 @@
-"""Compatibility facade for the header-only native HDF5 implementation.
-
-PyTorch integration deliberately remains in :mod:`.autograd`. All HDF5 access,
-statistics, virtual mappings, and storage-level gradient operations are native.
-"""
-
 import os
 from collections.abc import Iterator
 
