@@ -28,7 +28,7 @@ jobs:
           test -n "$PRIVATE_REPO_TOKEN" || { echo "PRIVATE_REPO_TOKEN is not configured"; exit 1; }
           git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
           pip install torch --index-url https://download.pytorch.org/whl/cpu --no-cache-dir
-          python -m pip install --no-cache-dir ".[dev]"
+          python -m pip install --no-cache-dir -e ".[dev]"
           git config --global --unset-all url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf
 
       - name: Run unit tests
