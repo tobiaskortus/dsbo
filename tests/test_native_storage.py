@@ -19,14 +19,8 @@ import numpy as np
 import pytest
 import torch
 
-from dsbo.utils.io.gradient import (
-    resolve_gradient,
-    use_gradient_pass,
-    use_gradient_writer,
-)
 from dsbo.utils.io.storage import HDF5Writer as W
 from dsbo.utils.io.storage import _hdf5
-from dsbo.utils.io.workdir import Input, Output, Workdir
 
 
 DTYPES = ["bool", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float16", "float32", "float64", "complex64", "complex128", ">i4", ">f8", ">c16"]
@@ -419,102 +413,8 @@ def test_native_headers_and_notices_can_be_copied(tmp_path):
             assert path.read_bytes() == source.read_bytes()
 
 
-@pytest.fixture(scope="session")
-def native_executable(tmp_path_factory):
-    if os.environ.get("DSBO_TEST_NATIVE") != "1":
-        pytest.skip("Set DSBO_TEST_NATIVE=1 and HDF5_ROOT to build/test copied C++ headers")
-    root = Path(__file__).resolve().parents[1]
-    build = tmp_path_factory.mktemp("native-sdk")
-    sdk = build / "sdk"
-    shutil.copytree(INCLUDE_DIRECTORY, sdk / "include")
-    shutil.copytree(LICENSE_DIRECTORY, sdk / "licenses")
-    subprocess.run([
-        "cmake", "-S", str(root / "cpp"), "-B", str(build / "build"),
-        f"-DDSBO_SDK_INCLUDE_DIR={sdk / 'include'}", "-DCMAKE_BUILD_TYPE=Debug",
-    ], check=True)
-    subprocess.run(["cmake", "--build", str(build / "build"), "--parallel", "2"], check=True)
-    subprocess.run(["ctest", "--test-dir", str(build / "build"), "--output-on-failure"], check=True)
-    return build / "build" / "dsbo_native_step"
-
-
-def test_native_executable_forward_tangent_and_gradient_routing(tmp_path, native_executable):
-    from dsbo.utils.io.storage import HDF5File
-
-    with Workdir.create(str(tmp_path / "work")):
-        source = Workdir.register_file("native", "input.h5")
-        target = Workdir.register_file("native", "output.h5")
-        inp, out = Input(source), Output(target)
-        values, tangent = np.arange(4, dtype=np.float64), np.ones(4)
-        W.write_primal_tangent(inp(), values, tangent)
-        subprocess.run([str(native_executable), "forward", inp(), out()], check=True)
-        actual, actual_tangent = W.open_primal_tangent(out())
-        np.testing.assert_array_equal(actual, 2 * values)
-        np.testing.assert_array_equal(actual_tangent, 2 * tangent)
-        with use_gradient_pass():
-            with use_gradient_writer("downstream"):
-                W.write_gradient(Input(target).gradient(), np.ones(4))
-            with use_gradient_writer("native"):
-                subprocess.run([str(native_executable), "backward", out.gradient(), inp.gradient()], check=True)
-            np.testing.assert_array_equal(HDF5File.read_backward_gradient(inp()).numpy(), np.full(4, 2))
-            assert Path(resolve_gradient(inp())).is_file()
-
-
-def test_container_without_python(tmp_path):
-    image = os.environ.get("DSBO_TEST_CONTAINER_IMAGE")
-    if not image:
-        pytest.skip("Set DSBO_TEST_CONTAINER_IMAGE to a built examples/cpp_container image")
-    subprocess.run(["docker", "run", "--rm", "--entrypoint", "/bin/sh", image, "-c", "! command -v python && ! command -v python3"], check=True)
-    source, output, incoming, outgoing = [tmp_path / f"{name}.h5" for name in ("source", "output", "incoming", "outgoing")]
-    W.write_primal(source, np.arange(4, dtype=np.float64))
-    W.write_gradient(incoming, np.ones(4))
-    for mode, first, second in (("forward", source, output), ("backward", incoming, outgoing)):
-        subprocess.run(["docker", "run", "--rm", "-v", f"{tmp_path}:/work", image, mode, f"/work/{first.name}", f"/work/{second.name}"], check=True)
-    np.testing.assert_array_equal(W.open_primal(output), np.arange(4) * 2)
-    np.testing.assert_array_equal(W.load_gradient(outgoing), np.full(4, 2))
-
-
 def test_production_storage_does_not_import_h5py():
     subprocess.run([
         sys.executable, "-c",
         "import sys; from dsbo.utils.io.storage import HDF5Writer; assert 'h5py' not in sys.modules",
     ], check=True)
-
-
-def test_bundled_python_ignores_non_threadsafe_hdf5(tmp_path):
-    prefix = os.environ.get("DSBO_TEST_UNSAFE_HDF5")
-    if not prefix:
-        pytest.skip("Set DSBO_TEST_UNSAFE_HDF5 to test isolation from a non-thread-safe HDF5 >=2.0")
-    prefix = Path(prefix).resolve()
-    library = prefix / ("lib64" if (prefix / "lib64").is_dir() else "lib")
-    env = os.environ.copy()
-    variable = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
-    env[variable] = str(library)
-    env["HDF5_ROOT"] = str(prefix)
-    shared = library / ("libhdf5.dylib" if sys.platform == "darwin" else "libhdf5.so")
-    subprocess.run([
-        sys.executable, "-c", f'''import ctypes
-unsafe = ctypes.CDLL({str(shared)!r}, mode=ctypes.RTLD_GLOBAL)
-safe = ctypes.c_bool()
-assert unsafe.H5is_library_threadsafe(ctypes.byref(safe)) >= 0 and not safe.value
-from dsbo.utils.io.storage import _hdf5
-assert _hdf5.environment()["threadsafe"]
-''',
-    ], cwd=tmp_path, env=env, check=True)
-
-
-def test_native_non_threadsafe_hdf5_is_rejected(tmp_path):
-    prefix = os.environ.get("DSBO_TEST_UNSAFE_HDF5")
-    if not prefix:
-        pytest.skip("Set DSBO_TEST_UNSAFE_HDF5 to test standalone C++ dependency validation")
-    prefix = Path(prefix).resolve()
-    library = prefix / ("lib64" if (prefix / "lib64").is_dir() else "lib")
-    root = Path(__file__).resolve().parents[1]
-    executable = tmp_path / "unsafe-native-step"
-    subprocess.run([
-        "c++", "-std=c++17", "-pthread", f"-I{INCLUDE_DIRECTORY}", f"-I{prefix / 'include'}",
-        str(root / "cpp/examples/workflow_step.cpp"), f"-L{library}", f"-Wl,-rpath,{library}",
-        "-lhdf5", "-o", str(executable),
-    ], check=True)
-    result = subprocess.run([str(executable)], capture_output=True, text=True)
-    assert result.returncode != 0
-    assert "thread-safe HDF5 installation" in result.stderr

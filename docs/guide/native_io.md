@@ -235,23 +235,24 @@ python -m pytest tests
 cmake -S cpp -B build/native -DHDF5_ROOT="$HDF5_ROOT"
 cmake --build build/native --parallel
 ctest --test-dir build/native --output-on-failure
-DSBO_TEST_NATIVE=1 python -m pytest tests/test_native_storage.py
-DSBO_TEST_CONTAINER_IMAGE=dsbo-native-example:latest python -m pytest tests/test_native_storage.py -k container
 python examples/cpp_container/workflow.py --executable build/native/dsbo_native_step
 ```
 
-The optional native pytest test builds against a **manually copied include tree**,
-not the original `cpp/include/` path. Native tests include multiple translation
-units, concurrent calls, lazy selection, VDS, gradients, and statistics. Python tests
-use h5py to inspect the format independently. Container tests verify that Python
-is absent and exchange forward/backward files with the host.
+Native compilation and execution tests run through CMake/CTest, not pytest.
+They cover multiple translation units, concurrent calls, lazy selection, VDS,
+gradients, and statistics. To test a manually copied include tree, pass
+`-DDSBO_SDK_INCLUDE_DIR=/path/to/dsbo-sdk/include` when configuring CMake.
 
-Python tests also verify hidden dependency symbols, gzip/shuffle interoperability,
-both h5py/DSBO import orders, and operation without external HDF5 configuration.
-If a separate non-thread-safe HDF5 >=2.0 build is available, set
-`DSBO_TEST_UNSAFE_HDF5=/path/to/that/prefix` to verify that the Python extension
-remains isolated even when that library is loaded globally, while standalone
-native callers still reject it.
+CTest also checks the runtime environment guard with controlled HDF5 query
+results: supported libraries are accepted, while old versions, non-thread-safe
+libraries, and failed version/thread-safety queries are rejected. These tests
+use the normal supported HDF5 SDK; no separate non-thread-safe build is needed.
+
+Python tests use h5py to inspect the format independently and verify hidden
+dependency symbols, gzip/shuffle interoperability, both h5py/DSBO import orders,
+and operation without external HDF5 configuration. Running pytest does not
+require Docker or an external HDF5 SDK, and does not compile standalone C++
+executables. The container workflow above remains a manually runnable example.
 
 For packaging validation:
 
