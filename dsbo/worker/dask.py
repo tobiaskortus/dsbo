@@ -15,7 +15,7 @@ import dsbo
 from contextlib import contextmanager
 from dsbo.storage import get_current_storage, use_storage
 from dsbo.autograd import _pack, _unpack
-from dask_heterogeneous.hybrid import HybridCluster
+from dsbo_heterogeneous.hybrid import HybridCluster
 from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 
