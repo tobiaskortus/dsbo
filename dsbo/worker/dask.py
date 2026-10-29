@@ -61,6 +61,15 @@ class DaskWorkerBase:
     def compute(self, objs, **kwargs):
         return self.client.compute(objs, **kwargs)
 
+    def _task_resources(self, module: Module) -> dict[str, int]:
+        spec = module.resources
+        if spec is None:
+            raise ValueError(
+                f"Module '{module.name}' has no worker spec; assign one with "
+                f"module.to(spec) or problem.to({{type(module): spec}})."
+            )
+        return spec.resources
+
     def gather(self, futures: Iterable[Future], catch: tuple = ()) -> list:
         """Should be okay since client.gather implements
 
@@ -94,10 +103,10 @@ class DaskWorkerBase:
         priority: int | None = None,
         file_overlays=None,
     ) -> tuple[uuid.UUID, Delayed]:
+        resources = self._task_resources(module)
         suffix = get_file_suffix()
         subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
-        resources = getattr(module.resources, "resources", None)
         packed_design = _pack(design)
         packed_design_tensor = _pack_tensor(design_tensor)
 
@@ -143,10 +152,11 @@ class DaskWorkerBase:
         pass_id: uuid.UUID | None = None,
         task_id: uuid.UUID | None = None,
     ) -> tuple[uuid.UUID, Delayed]:
+        resources = self._task_resources(module)
+
         suffix = get_file_suffix()
         subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
-        resources = getattr(module.resources, "resources", None)
 
         config_state = dsbo.config.state()
         storage = get_current_storage(create=False)

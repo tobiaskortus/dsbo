@@ -1,7 +1,34 @@
+import os
 import shutil
 import subprocess
 from threading import Thread
 from typing import Callable, List, Optional
+
+
+def available_cores() -> int:
+    """Return the number of CPUs available to the current process.
+
+    SLURM exposes the per-task CPU allocation through ``SLURM_CPUS_PER_TASK``;
+    otherwise fall back to the process CPU affinity and finally to the total
+    number of CPUs on the machine.
+    """
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus:
+        try:
+            return max(1, int(slurm_cpus))
+        except ValueError:
+            pass
+
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    if process_cpu_count is not None:
+        count = process_cpu_count()
+        if count:
+            return count
+
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
 
 
 def which_python():

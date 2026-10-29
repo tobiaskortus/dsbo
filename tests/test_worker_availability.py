@@ -1,5 +1,6 @@
 import pytest
 
+from dsbo.modules import Module
 from dsbo.worker.dask import DaskWorkerBase, WorkerContext, check_worker_available
 from dsbo.worker.spec import LocalWorkerSpec, SLURMWorkerSpec
 
@@ -45,3 +46,19 @@ class TestWorkerContextAvailability:
 
         with WorkerContext.use_worker(worker):
             assert WorkerContext.get_current_worker() is worker
+
+
+class TestScheduleRequiresWorkerSpec:
+    def test_schedule_without_spec_raises_rror(self):
+        worker = object.__new__(DaskWorkerBase)
+        module = Module()
+
+        with pytest.raises(ValueError, match="has no worker spec"):
+            worker.schedule(module, design={})
+
+    def test_schedule_backward_without_spec_raises_error(self):
+        worker = object.__new__(DaskWorkerBase)
+        module = Module()
+
+        with pytest.raises(ValueError, match="has no worker spec"):
+            worker.schedule_backward(module, candidate=None)
