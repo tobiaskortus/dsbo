@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
+from importlib.metadata import distribution
 from pathlib import Path
 
 import h5py
@@ -31,6 +32,7 @@ from dsbo.utils.io.workdir import Input, Output, Workdir
 
 DTYPES = ["bool", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float16", "float32", "float64", "complex64", "complex128", ">i4", ">f8", ">c16"]
 STORAGE_DIRECTORY = Path(storage.__file__).resolve().parent
+LICENSE_DIRECTORY = Path(__file__).resolve().parents[1] / "LICENSES"
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -368,13 +370,26 @@ def test_bundled_source_archives_and_notices():
             member = next(member for member in source if member.name.removeprefix("./") == name.removesuffix(".tar.gz") + "/LICENSE")
             upstream_license = source.extractfile(member).read()
         notice = "HDF5.txt" if name.startswith("hdf5-") else "zlib.txt"
-        assert (STORAGE_DIRECTORY / "licenses" / notice).read_bytes().strip() == upstream_license.strip()
+        assert (LICENSE_DIRECTORY / notice).read_bytes().strip() == upstream_license.strip()
+
+
+def test_third_party_notices_are_distribution_metadata():
+    package = distribution("dsbo")
+    expected = {f"LICENSES/{path.name}" for path in LICENSE_DIRECTORY.iterdir() if path.is_file()}
+    assert set(package.metadata.get_all("License-File", [])) == expected
+    # Editable installs may expose source-tree egg-info instead of wheel
+    # dist-info. Both must list the same notices and locate their actual bytes.
+    files = package.files or []
+    for name in expected:
+        recorded = [path for path in files if path.as_posix() == name or path.as_posix().endswith("/licenses/" + name)]
+        assert len(recorded) == 1, name
+        assert Path(package.locate_file(recorded[0])).read_bytes() == (LICENSE_DIRECTORY / Path(name).name).read_bytes()
 
 
 def test_packaged_native_headers_and_notices_can_be_copied(tmp_path):
     sdk = tmp_path / "sdk"
     shutil.copytree(STORAGE_DIRECTORY / "include", sdk / "include")
-    shutil.copytree(STORAGE_DIRECTORY / "licenses", sdk / "licenses")
+    shutil.copytree(LICENSE_DIRECTORY, sdk / "licenses")
     assert (sdk / "include/dsbo/hdf5.hpp").is_file()
     assert (sdk / "include/dsbo/third_party/json.hpp").is_file()
     assert (sdk / "licenses/HDF5.txt").is_file()
@@ -382,7 +397,8 @@ def test_packaged_native_headers_and_notices_can_be_copied(tmp_path):
     assert not any(path.suffix in {".so", ".dylib", ".dll", ".py", ".pyc"} for path in sdk.rglob("*"))
     for path in sdk.rglob("*"):
         if path.is_file():
-            assert path.read_bytes() == (STORAGE_DIRECTORY / path.relative_to(sdk)).read_bytes()
+            source = LICENSE_DIRECTORY / path.name if path.parent.name == "licenses" else STORAGE_DIRECTORY / path.relative_to(sdk)
+            assert path.read_bytes() == source.read_bytes()
 
 
 @pytest.fixture(scope="session")
@@ -393,7 +409,7 @@ def native_executable(tmp_path_factory):
     build = tmp_path_factory.mktemp("native-sdk")
     sdk = build / "sdk"
     shutil.copytree(STORAGE_DIRECTORY / "include", sdk / "include")
-    shutil.copytree(STORAGE_DIRECTORY / "licenses", sdk / "licenses")
+    shutil.copytree(LICENSE_DIRECTORY, sdk / "licenses")
     subprocess.run([
         "cmake", "-S", str(root / "cpp"), "-B", str(build / "build"),
         f"-DDSBO_SDK_INCLUDE_DIR={sdk / 'include'}", "-DCMAKE_BUILD_TYPE=Debug",

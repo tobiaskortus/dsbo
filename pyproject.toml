@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "pybind11>=3.0,<4", "cmake>=3.26", "ninja>=1.11"]
+requires = ["setuptools>=77.0.3", "pybind11>=3.0,<4", "cmake>=3.26", "ninja>=1.11"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,7 @@ name = "dsbo"
 version = "0.1.0"
 description = "Detector Surrogate-Based Optimization"
 requires-python = ">=3.10"
+license-files = ["LICENSES/*"]
 
 dependencies = [
     "attrs",
@@ -54,4 +55,4 @@ where = ["."]
 include = ["dsbo*"]
 
 [tool.setuptools.package-data]
-"dsbo.utils.io.storage" = ["include/dsbo/*.hpp", "include/dsbo/third_party/*.hpp", "licenses/*.txt", "licenses/*.md"]
+"dsbo.utils.io.storage" = ["include/dsbo/*.hpp", "include/dsbo/third_party/*.hpp"]

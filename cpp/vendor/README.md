@@ -12,6 +12,6 @@ system-wide. Standalone builds in `cpp/CMakeLists.txt` use their own HDF5.
 
 CMake validates these hashes before extraction and never downloads dependencies.
 When updating, replace the archives and hashes together, preserve the upstream
-licenses in `dsbo/utils/io/storage/licenses/`, and rerun the isolation, compression,
+licenses in `LICENSES/`, and rerun the isolation, compression,
 native interoperability, and source-distribution-to-wheel checks documented in
 `docs/guide/native_io.md`. The archives themselves are not included in wheels.

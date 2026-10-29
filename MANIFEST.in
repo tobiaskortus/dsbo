@@ -1,5 +1,4 @@
 recursive-include dsbo/utils/io/storage/include *.hpp
-recursive-include dsbo/utils/io/storage/licenses *.txt *.md
 recursive-include cpp *.cpp CMakeLists.txt
 recursive-include cpp/python *.map
 recursive-include cpp/vendor *.tar.gz *.md

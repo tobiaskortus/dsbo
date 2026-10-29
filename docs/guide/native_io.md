@@ -92,25 +92,31 @@ dependencies must be installed/configured separately when needed.
 
 ## Copy the native headers
 
-The Python package ships the C++ headers in `dsbo/utils/io/storage/include/`
-and third-party notices in `dsbo/utils/io/storage/licenses/`. Copy both directories
-into your native build context; there is no Python SDK setup or export API.
+The Python package ships the C++ headers in `dsbo/utils/io/storage/include/`.
+Third-party notices live in the repository's `LICENSES/` directory and are
+packaged as distribution metadata, not inside the Python package. Copy the
+headers and notices into your native build context; there is no Python SDK
+setup or export API.
 This is a **build/setup step**, not something workflow steps do at runtime.
 
 From the root of a source checkout:
 
 ```bash
 DSBO_STORAGE=dsbo/utils/io/storage
+DSBO_LICENSES=LICENSES
 mkdir -p build/container-context
 mkdir build/container-context/dsbo-sdk
-cp -R "$DSBO_STORAGE/include" "$DSBO_STORAGE/licenses" build/container-context/dsbo-sdk/
+cp -R "$DSBO_STORAGE/include" build/container-context/dsbo-sdk/
+cp -R "$DSBO_LICENSES" build/container-context/dsbo-sdk/licenses
 ```
 
 To copy from a regular installed package instead, use `python -m pip show -f dsbo`
-to locate its files and set `DSBO_STORAGE` to
-`<Location>/dsbo/utils/io/storage` before running the copy commands. For an
-editable installation, use the source checkout. Use a new destination directory
-when updating the headers so files from different versions are not mixed.
+to locate its files. Set `DSBO_STORAGE` to `<Location>/dsbo/utils/io/storage` and
+`DSBO_LICENSES` to the reported
+`<Location>/dsbo-<version>.dist-info/licenses/LICENSES` directory before running
+the copy commands. For an editable installation, use the source checkout. Use
+a new destination directory when updating so files from different versions
+are not mixed.
 
 The resulting build input contains only sources and notices:
 
@@ -250,8 +256,9 @@ python -m build
 ```
 
 The default build command builds a wheel from the resulting source archive.
-Inspect the sdist for both pinned dependency archives and the wheel for SDK
-headers/notices (the source archives must not be in the wheel). Install the wheel
+Inspect the sdist for both pinned dependency archives and `LICENSES/`, and the
+wheel for SDK headers and notices under `.dist-info/licenses/LICENSES/` (the
+source archives must not be in the wheel). Install the wheel
 in a clean environment without HDF5 to check relocation and runtime independence.
 `otool -L` on macOS or `readelf -d` on Linux should show no HDF5/zlib dependency
 or build-directory RPATH; only `PyInit__hdf5` should be exported from the extension.

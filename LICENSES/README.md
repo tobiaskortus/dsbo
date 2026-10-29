@@ -1,6 +1,6 @@
-# Native storage SDK notices
+# Third-party notices for bundled code
 
-- `include/dsbo/third_party/json.hpp` is nlohmann/json **3.12.0**, imported
+- The vendored `dsbo/third_party/json.hpp` header is nlohmann/json **3.12.0**, imported
   unmodified from its `single_include/nlohmann/json.hpp`. Its MIT license is in
   `nlohmann-json.txt`.
 - Python bindings use pybind11 (BSD-3-Clause); its license is in `pybind11.txt`.
@@ -10,6 +10,11 @@
   `zlib.txt` preserves zlib's license. Standalone C++ applications supply their
   own HDF5. Preserve notices for the actual artifacts and optional libraries you
   redistribute if these differ from the bundled Python dependencies.
+
+These files are included in source distributions under `LICENSES/` and in
+installed wheels under `<distribution>.dist-info/licenses/LICENSES/`. They are
+distribution metadata, not Python package data. Copy the relevant notices with
+the headers when preparing standalone native/container distributions.
 
 These are third-party notices, not a license grant for DSBO itself. The native
 implementation remains part of DSBO. Obtain maintainer/rightsholder approval
