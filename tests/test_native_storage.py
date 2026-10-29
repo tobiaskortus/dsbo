@@ -1,11 +1,15 @@
 """Format compatibility is checked independently with h5py, never a fallback."""
 
 import gc
+import ctypes
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tarfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -311,6 +315,62 @@ def test_environment_and_concurrent_native_calls(tmp_path):
         list(executor.map(work, range(12)))
 
 
+def test_python_extension_keeps_dependency_symbols_private():
+    extension = ctypes.CDLL(_hdf5.__file__)
+    for symbol in ("H5open", "H5get_libversion", "zlibVersion", "inflate", "deflate"):
+        with pytest.raises(AttributeError):
+            getattr(extension, symbol)
+
+
+@pytest.mark.parametrize("first", ["h5py", "dsbo"])
+def test_bundled_hdf5_coexists_with_h5py(tmp_path, first):
+    subprocess.run([
+        sys.executable, "-c", f"import {first}\n" + '''
+import h5py
+import numpy as np
+from dsbo.utils.io.storage import HDF5Writer as W, _hdf5
+assert _hdf5.environment()["threadsafe"]
+values = np.arange(24., dtype=np.float64).reshape(6, 4)
+with h5py.File("compressed.h5", "w") as file:
+    file.create_dataset("primal", data=values, compression="gzip", shuffle=True)
+np.testing.assert_array_equal(W.open_primal("compressed.h5"), values)
+W.write_primal("native.h5", values)
+with h5py.File("native.h5") as file:
+    np.testing.assert_array_equal(file["primal"][:], values)
+''',
+    ], cwd=tmp_path, check=True)
+
+
+def test_python_does_not_require_external_hdf5(tmp_path):
+    env = os.environ.copy()
+    for variable in ("HDF5_ROOT", "HDF5_INCLUDE_DIR", "HDF5_LIBRARY_DIR", "PKG_CONFIG", "PKG_CONFIG_PATH"):
+        env[variable] = str(tmp_path / "missing-sdk")
+    subprocess.run([
+        sys.executable, "-c", '''
+import numpy as np
+from dsbo.utils.io.storage import HDF5Writer as W, _hdf5
+assert _hdf5.environment()["threadsafe"]
+W.write_primal("test.h5", np.arange(3.))
+np.testing.assert_array_equal(W.open_primal("test.h5"), np.arange(3.))
+''',
+    ], cwd=tmp_path, env=env, check=True)
+
+
+def test_bundled_source_archives_and_notices():
+    root = Path(__file__).resolve().parents[1]
+    configuration = (root / "cpp/python/CMakeLists.txt").read_text()
+    archives = re.findall(r'URL "[^"\n]*/vendor/([^"\n]+)"\s+URL_HASH SHA256=([0-9a-f]{64})', configuration)
+    assert len(archives) == 2
+    for name, checksum in archives:
+        archive = root / "cpp/vendor" / name
+        assert hashlib.sha256(archive.read_bytes()).hexdigest() == checksum
+        with tarfile.open(archive) as source:
+            member = next(member for member in source if member.name.removeprefix("./") == name.removesuffix(".tar.gz") + "/LICENSE")
+            upstream_license = source.extractfile(member).read()
+        notice = "HDF5.txt" if name.startswith("hdf5-") else "zlib.txt"
+        assert (STORAGE_DIRECTORY / "licenses" / notice).read_bytes().strip() == upstream_license.strip()
+
+
 def test_packaged_native_headers_and_notices_can_be_copied(tmp_path):
     sdk = tmp_path / "sdk"
     shutil.copytree(STORAGE_DIRECTORY / "include", sdk / "include")
@@ -386,37 +446,41 @@ def test_production_storage_does_not_import_h5py():
     ], check=True)
 
 
-@pytest.mark.parametrize("check", ["build", "python-runtime", "native-runtime"])
-def test_non_threadsafe_hdf5_is_rejected(tmp_path, check):
+def test_bundled_python_ignores_non_threadsafe_hdf5(tmp_path):
     prefix = os.environ.get("DSBO_TEST_UNSAFE_HDF5")
     if not prefix:
-        pytest.skip("Set DSBO_TEST_UNSAFE_HDF5 to a non-thread-safe HDF5 >=2.0 prefix for rejection tests")
+        pytest.skip("Set DSBO_TEST_UNSAFE_HDF5 to test isolation from a non-thread-safe HDF5 >=2.0")
+    prefix = Path(prefix).resolve()
+    library = prefix / ("lib64" if (prefix / "lib64").is_dir() else "lib")
+    env = os.environ.copy()
+    variable = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+    env[variable] = str(library)
+    env["HDF5_ROOT"] = str(prefix)
+    shared = library / ("libhdf5.dylib" if sys.platform == "darwin" else "libhdf5.so")
+    subprocess.run([
+        sys.executable, "-c", f'''import ctypes
+unsafe = ctypes.CDLL({str(shared)!r}, mode=ctypes.RTLD_GLOBAL)
+safe = ctypes.c_bool()
+assert unsafe.H5is_library_threadsafe(ctypes.byref(safe)) >= 0 and not safe.value
+from dsbo.utils.io.storage import _hdf5
+assert _hdf5.environment()["threadsafe"]
+''',
+    ], cwd=tmp_path, env=env, check=True)
+
+
+def test_native_non_threadsafe_hdf5_is_rejected(tmp_path):
+    prefix = os.environ.get("DSBO_TEST_UNSAFE_HDF5")
+    if not prefix:
+        pytest.skip("Set DSBO_TEST_UNSAFE_HDF5 to test standalone C++ dependency validation")
     prefix = Path(prefix).resolve()
     library = prefix / ("lib64" if (prefix / "lib64").is_dir() else "lib")
     root = Path(__file__).resolve().parents[1]
-    env = os.environ.copy()
-    if check == "build":
-        env["HDF5_ROOT"] = str(prefix)
-        env.pop("HDF5_INCLUDE_DIR", None)
-        env.pop("HDF5_LIBRARY_DIR", None)
-        result = subprocess.run([
-            sys.executable, str(root / "setup.py"), "build_ext", "--build-temp", str(tmp_path / "build"),
-        ], cwd=root, env=env, capture_output=True, text=True)
-        assert result.returncode != 0
-        assert "HDF5_ENABLE_THREADSAFE=ON" in result.stdout + result.stderr
-    elif check == "python-runtime":
-        variable = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
-        env[variable] = str(library)
-        result = subprocess.run([sys.executable, "-c", "import dsbo"], cwd=root, env=env, capture_output=True, text=True)
-        assert result.returncode != 0
-        assert "thread-safe HDF5 installation" in result.stderr
-    else:
-        executable = tmp_path / "unsafe-native-step"
-        subprocess.run([
-            "c++", "-std=c++17", "-pthread", f"-I{STORAGE_DIRECTORY / 'include'}", f"-I{prefix / 'include'}",
-            str(root / "cpp/examples/workflow_step.cpp"), f"-L{library}", f"-Wl,-rpath,{library}",
-            "-lhdf5", "-o", str(executable),
-        ], check=True)
-        result = subprocess.run([str(executable)], capture_output=True, text=True)
-        assert result.returncode != 0
-        assert "thread-safe HDF5 installation" in result.stderr
+    executable = tmp_path / "unsafe-native-step"
+    subprocess.run([
+        "c++", "-std=c++17", "-pthread", f"-I{STORAGE_DIRECTORY / 'include'}", f"-I{prefix / 'include'}",
+        str(root / "cpp/examples/workflow_step.cpp"), f"-L{library}", f"-Wl,-rpath,{library}",
+        "-lhdf5", "-o", str(executable),
+    ], check=True)
+    result = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "thread-safe HDF5 installation" in result.stderr

@@ -8,17 +8,53 @@ and gradient contribution bookkeeping remain in Python.
 Native steps can run as standalone executables, including inside containers
 without Python, PyTorch, pybind11, or an installed DSBO package.
 
-## Requirements
+## Python installation
 
-- C++17 compiler and HDF5 development headers/libraries for compilation.
+**Python users do not need an HDF5 installation.** The Python extension contains
+private, statically linked copies of thread-safe **HDF5 2.0.0** and **zlib 1.3.2**,
+including DEFLATE/gzip support. Their symbols are hidden so DSBO can coexist with
+packages such as h5py that load different HDF5/zlib libraries.
+
+- When a compatible prebuilt wheel is available, pip installs it without needing
+  a compiler, CMake, or HDF5 on the user's machine.
+- Source and editable installs require C and C++17 compilers. Pip supplies the
+  declared CMake/Ninja/pybind11 build dependencies in an isolated environment;
+  setuptools remains the Python build backend.
+
+From a checkout:
+
+```bash
+python -m pip install -e '.[dev]'
+```
+
+The build extracts checksum-verified source archives shipped in `cpp/vendor/`
+and source distributions. It does not download native sources, discover a system
+HDF5, or install anything system-wide. There is no HDF5 runtime dependency on a
+build directory. Python builds ignore `HDF5_ROOT`, `HDF5_INCLUDE_DIR`,
+`HDF5_LIBRARY_DIR`, and pkg-config settings; these are not needed for Python use.
+Pip may still need network access to install Python/build dependencies. Once
+those are available, the native build itself works offline.
+
+After editing a header or binding source, rebuild with the same install command.
+Editable installation does not mean C++ edits are compiled on import. Set
+`CMAKE_BUILD_PARALLEL_LEVEL` to limit build concurrency. Advanced cross builds
+can pass `DSBO_CMAKE_TOOLCHAIN_FILE`; `DSBO_CROSS_COMPILE=1` skips executing the
+target-library validation probe on the build host. Compile-time validation and
+the extension's mandatory runtime HDF5 check still apply.
+
+## Standalone C++ requirements
+
+These requirements apply when compiling your own executable using `hdf5.hpp`,
+not when using DSBO's Python functionality:
+
+- C++17 compiler and your own HDF5 development headers/libraries.
 - **HDF5 >=2.0 built with `HDF5_ENABLE_THREADSAFE=ON`.** The actual loaded library
-  is checked, as well as the headers used during the build.
-- `pkg-config`, or explicit HDF5 installation paths, for the Python build.
-- CMake for the standalone examples/tests, not ordinary Python package builds.
+  is checked, not just the build headers.
+- CMake for the provided standalone examples/tests, or an equivalent build setup.
 
-Installing `h5py` does not provide a supported native development SDK. Do not
-link against its private bundled libraries. DSBO itself no longer uses h5py;
-it is used by tests as an independent format reader/writer.
+DSBO's Python extension is not an HDF5 development SDK for native applications.
+Do not link against it or h5py's private libraries. DSBO itself does not import
+h5py; tests use it as an independent format reader/writer.
 
 Thread-safe HDF5 protects library internals; it does not make multi-call file
 updates transactional or allow unrelated processes to write the same file.
@@ -28,7 +64,7 @@ serialize access and closing on each reader instance. Do not transfer live
 readers across process/fork boundaries. Different readers may be used from
 different threads. Coordinate writes to the same destination externally.
 
-## Install HDF5
+## Install HDF5 for standalone C++
 
 Use a suitable prebuilt thread-safe variant, or build the core C library from
 an official HDF5 source release. For example, after extracting HDF5 2.0.0:
@@ -53,35 +89,6 @@ Disabling `HDF5_BUILD_CPP_LIB` disables HDF5's own C++ wrapper, **not** DSBO's C
 implementation, which uses the C API. HDF5 source builds require a sufficiently
 new CMake (2.0.0 requires CMake 3.26 or newer). Optional compression/filter
 dependencies must be installed/configured separately when needed.
-
-## Build the Python package
-
-The build backend remains setuptools. From a checkout:
-
-```bash
-export HDF5_ROOT="$HOME/.local/hdf5-threadsafe"
-python -m pip install -e '.[dev]'
-```
-
-Alternatively configure `PKG_CONFIG_PATH` to find the desired `hdf5.pc`.
-`HDF5_PKGCONFIG_NAME` selects a different pkg-config package name. Explicit
-`HDF5_INCLUDE_DIR` and `HDF5_LIBRARY_DIR` override paths; `HDF5_LIBRARIES` is an
-optional space-separated list of link libraries (default `hdf5`). No HDF5
-installation is downloaded automatically by the Python build.
-
-After editing a header or binding source, rebuild using the same install
-command. Header dependencies are declared explicitly. Editable installation
-does not mean C++ edits are compiled when Python imports a module.
-
-For cross-compilation, `DSBO_CROSS_COMPILE=1` skips execution of the build probe;
-compile-time header validation and runtime SDK/extension validation still apply.
-
-The extension needs the selected HDF5 shared library at runtime. Local builds
-record its library search directory. A wheel produced this way is not necessarily
-portable to another machine: use platform-appropriate dependency bundling and
-wheel repair tools if distributing self-contained binary wheels. Preserve the
-licenses/notices for the actual bundled libraries. No CI setup is required or
-provided for this feature.
 
 ## Copy the native headers
 
@@ -229,9 +236,12 @@ units, concurrent calls, lazy selection, VDS, gradients, and statistics. Python 
 use h5py to inspect the format independently. Container tests verify that Python
 is absent and exchange forward/backward files with the host.
 
+Python tests also verify hidden dependency symbols, gzip/shuffle interoperability,
+both h5py/DSBO import orders, and operation without external HDF5 configuration.
 If a separate non-thread-safe HDF5 >=2.0 build is available, set
-`DSBO_TEST_UNSAFE_HDF5=/path/to/that/prefix` to run rejection tests for the Python
-build, the actual loaded Python runtime library, and a standalone native caller.
+`DSBO_TEST_UNSAFE_HDF5=/path/to/that/prefix` to verify that the Python extension
+remains isolated even when that library is loaded globally, while standalone
+native callers still reject it.
 
 For packaging validation:
 
@@ -239,9 +249,19 @@ For packaging validation:
 python -m build
 ```
 
-Build a wheel from the resulting source archive as well, and inspect both
-archives for SDK headers and notices. Package-building commands use setuptools;
-no change to the project's Python build backend is needed.
+The default build command builds a wheel from the resulting source archive.
+Inspect the sdist for both pinned dependency archives and the wheel for SDK
+headers/notices (the source archives must not be in the wheel). Install the wheel
+in a clean environment without HDF5 to check relocation and runtime independence.
+`otool -L` on macOS or `readelf -d` on Linux should show no HDF5/zlib dependency
+or build-directory RPATH; only `PyInit__hdf5` should be exported from the extension.
+
+Build wheels for each supported Python/platform/architecture combination. Static
+HDF5/zlib linking does not remove the platform C/C++ runtime or Python ABI
+requirements: use an appropriate deployment target/build image, and inspect or
+repair release wheels with tools such as auditwheel (Linux), delocate (macOS),
+or delvewheel (Windows). A wheel built on a recent Linux distribution is not
+automatically a manylinux wheel. No CI configuration is added by this feature.
 
 ## Licensing
 

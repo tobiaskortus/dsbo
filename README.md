@@ -15,11 +15,13 @@
 
 ## Getting started
 
-Building DSBO requires a C++17 compiler and **HDF5 >=2.0 built with thread safety
-enabled**. Install its development headers/libraries first and set `HDF5_ROOT`
-to that installation prefix (or configure `pkg-config`). Python packaging still
-uses setuptools. See [Native C++ HDF5 I/O](docs/guide/native_io.md) for installation,
-copying native headers, and Python-free container examples.
+DSBO's Python package includes its own thread-safe HDF5 implementation; no HDF5
+installation is required. A compatible prebuilt wheel needs no compiler either.
+Source and editable installations require C/C++17 compilers and automatically
+build the bundled dependencies using pip-provided CMake/Ninja. Python packaging
+still uses setuptools. Only standalone C++ users need their own thread-safe
+HDF5 >=2.0 installation. See [Native C++ HDF5 I/O](docs/guide/native_io.md) for
+details, copying native headers, and Python-free container examples.
 
 <!--
 ```sh
