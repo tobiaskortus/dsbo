@@ -1,7 +1,7 @@
 # Native C++ HDF5 I/O
 
 DSBO's HDF5 storage implementation is header-only C++17, in
-`dsbo/utils/io/storage/include/dsbo/hdf5.hpp`. Python uses the same implementation
+`cpp/include/dsbo/hdf5.hpp`. Python uses the same implementation
 through pybind11. PyTorch autograd, workflow setup, path resolution, scheduling,
 and gradient contribution bookkeeping remain in Python.
 
@@ -92,7 +92,10 @@ dependencies must be installed/configured separately when needed.
 
 ## Copy the native headers
 
-The Python package ships the C++ headers in `dsbo/utils/io/storage/include/`.
+The canonical C++ headers live in `cpp/include/`. Python wheel builds copy them
+into `dsbo/utils/io/storage/include/` in the installed package. In source
+checkouts, including editable installations, use `cpp/include/` directly; builds
+do not create a duplicate header tree inside the Python sources.
 Third-party notices live in the repository's `LICENSES/` directory and are
 packaged as distribution metadata, not inside the Python package. Copy the
 headers and notices into your native build context; there is no Python SDK
@@ -102,16 +105,17 @@ This is a **build/setup step**, not something workflow steps do at runtime.
 From the root of a source checkout:
 
 ```bash
-DSBO_STORAGE=dsbo/utils/io/storage
+DSBO_INCLUDE=cpp/include
 DSBO_LICENSES=LICENSES
 mkdir -p build/container-context
 mkdir build/container-context/dsbo-sdk
-cp -R "$DSBO_STORAGE/include" build/container-context/dsbo-sdk/
+cp -R "$DSBO_INCLUDE" build/container-context/dsbo-sdk/include
 cp -R "$DSBO_LICENSES" build/container-context/dsbo-sdk/licenses
 ```
 
 To copy from a regular installed package instead, use `python -m pip show -f dsbo`
-to locate its files. Set `DSBO_STORAGE` to `<Location>/dsbo/utils/io/storage` and
+to locate its files. Set `DSBO_INCLUDE` to
+`<Location>/dsbo/utils/io/storage/include` and
 `DSBO_LICENSES` to the reported
 `<Location>/dsbo-<version>.dist-info/licenses/LICENSES` directory before running
 the copy commands. For an editable installation, use the source checkout. Use
@@ -129,7 +133,7 @@ dsbo-sdk/
 
 Do not copy host binaries, host HDF5 libraries, or Python modules into the native
 build context. Compile against the target environment's own thread-safe HDF5
->=2.0 installation. For a local build, you can also use the original `include/`
+>=2.0 installation. For a local build, you can also use the original `cpp/include/`
 directory directly without copying it.
 
 Pin the DSBO source revision/package version and image versions used to construct
@@ -237,7 +241,7 @@ python examples/cpp_container/workflow.py --executable build/native/dsbo_native_
 ```
 
 The optional native pytest test builds against a **manually copied include tree**,
-not the original package header path. Native tests include multiple translation
+not the original `cpp/include/` path. Native tests include multiple translation
 units, concurrent calls, lazy selection, VDS, gradients, and statistics. Python tests
 use h5py to inspect the format independently. Container tests verify that Python
 is absent and exchange forward/backward files with the host.
@@ -256,10 +260,11 @@ python -m build
 ```
 
 The default build command builds a wheel from the resulting source archive.
-Inspect the sdist for both pinned dependency archives and `LICENSES/`, and the
-wheel for SDK headers and notices under `.dist-info/licenses/LICENSES/` (the
-source archives must not be in the wheel). Install the wheel
-in a clean environment without HDF5 to check relocation and runtime independence.
+Inspect the sdist for `cpp/include/`, both pinned dependency archives, and
+`LICENSES/`, and the wheel for SDK headers under `dsbo/utils/io/storage/include/`
+and notices under `.dist-info/licenses/LICENSES/` (the source archives must not
+be in the wheel). Install the wheel in a clean environment without HDF5 to check
+relocation and runtime independence.
 `otool -L` on macOS or `readelf -d` on Linux should show no HDF5/zlib dependency
 or build-directory RPATH; only `PyInit__hdf5` should be exported from the extension.
 

@@ -19,7 +19,6 @@ import numpy as np
 import pytest
 import torch
 
-import dsbo.utils.io.storage as storage
 from dsbo.utils.io.gradient import (
     resolve_gradient,
     use_gradient_pass,
@@ -31,7 +30,7 @@ from dsbo.utils.io.workdir import Input, Output, Workdir
 
 
 DTYPES = ["bool", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float16", "float32", "float64", "complex64", "complex128", ">i4", ">f8", ">c16"]
-STORAGE_DIRECTORY = Path(storage.__file__).resolve().parent
+INCLUDE_DIRECTORY = Path(__file__).resolve().parents[1] / "cpp/include"
 LICENSE_DIRECTORY = Path(__file__).resolve().parents[1] / "LICENSES"
 
 
@@ -386,9 +385,28 @@ def test_third_party_notices_are_distribution_metadata():
         assert Path(package.locate_file(recorded[0])).read_bytes() == (LICENSE_DIRECTORY / Path(name).name).read_bytes()
 
 
-def test_packaged_native_headers_and_notices_can_be_copied(tmp_path):
+def test_native_headers_are_distribution_data():
+    root = Path(__file__).resolve().parents[1]
+    assert not (root / "dsbo/utils/io/storage/include").exists()
+    headers = sorted(INCLUDE_DIRECTORY.rglob("*.hpp"))
+    assert {path.relative_to(INCLUDE_DIRECTORY).as_posix() for path in headers} == {
+        "dsbo/hdf5.hpp", "dsbo/third_party/json.hpp",
+    }
+    package = distribution("dsbo")
+    files = package.files or []
+    for header in headers:
+        relative = header.relative_to(INCLUDE_DIRECTORY)
+        # Source-tree metadata lists the canonical inputs; wheel metadata lists
+        # the installed copies. Neither requires a second source header tree.
+        names = {header.relative_to(root).as_posix(), "dsbo/utils/io/storage/include/" + relative.as_posix()}
+        recorded = [path for path in files if path.as_posix() in names]
+        assert len(recorded) == 1, relative
+        assert Path(package.locate_file(recorded[0])).read_bytes() == header.read_bytes()
+
+
+def test_native_headers_and_notices_can_be_copied(tmp_path):
     sdk = tmp_path / "sdk"
-    shutil.copytree(STORAGE_DIRECTORY / "include", sdk / "include")
+    shutil.copytree(INCLUDE_DIRECTORY, sdk / "include")
     shutil.copytree(LICENSE_DIRECTORY, sdk / "licenses")
     assert (sdk / "include/dsbo/hdf5.hpp").is_file()
     assert (sdk / "include/dsbo/third_party/json.hpp").is_file()
@@ -397,7 +415,7 @@ def test_packaged_native_headers_and_notices_can_be_copied(tmp_path):
     assert not any(path.suffix in {".so", ".dylib", ".dll", ".py", ".pyc"} for path in sdk.rglob("*"))
     for path in sdk.rglob("*"):
         if path.is_file():
-            source = LICENSE_DIRECTORY / path.name if path.parent.name == "licenses" else STORAGE_DIRECTORY / path.relative_to(sdk)
+            source = LICENSE_DIRECTORY / path.name if path.parent.name == "licenses" else INCLUDE_DIRECTORY / path.relative_to(sdk / "include")
             assert path.read_bytes() == source.read_bytes()
 
 
@@ -408,7 +426,7 @@ def native_executable(tmp_path_factory):
     root = Path(__file__).resolve().parents[1]
     build = tmp_path_factory.mktemp("native-sdk")
     sdk = build / "sdk"
-    shutil.copytree(STORAGE_DIRECTORY / "include", sdk / "include")
+    shutil.copytree(INCLUDE_DIRECTORY, sdk / "include")
     shutil.copytree(LICENSE_DIRECTORY, sdk / "licenses")
     subprocess.run([
         "cmake", "-S", str(root / "cpp"), "-B", str(build / "build"),
@@ -493,7 +511,7 @@ def test_native_non_threadsafe_hdf5_is_rejected(tmp_path):
     root = Path(__file__).resolve().parents[1]
     executable = tmp_path / "unsafe-native-step"
     subprocess.run([
-        "c++", "-std=c++17", "-pthread", f"-I{STORAGE_DIRECTORY / 'include'}", f"-I{prefix / 'include'}",
+        "c++", "-std=c++17", "-pthread", f"-I{INCLUDE_DIRECTORY}", f"-I{prefix / 'include'}",
         str(root / "cpp/examples/workflow_step.cpp"), f"-L{library}", f"-Wl,-rpath,{library}",
         "-lhdf5", "-o", str(executable),
     ], check=True)

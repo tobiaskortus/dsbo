@@ -61,7 +61,7 @@ find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 3.0 CONFIG REQUIRED)
 pybind11_add_module(_hdf5 MODULE NO_EXTRAS ../bindings/hdf5.cpp)
 target_compile_features(_hdf5 PRIVATE cxx_std_17)
-target_include_directories(_hdf5 PRIVATE ../../dsbo/utils/io/storage/include)
+target_include_directories(_hdf5 PRIVATE ../include)
 target_link_libraries(_hdf5 PRIVATE hdf5-static)
 set_target_properties(_hdf5 PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${DSBO_EXTENSION_DIRECTORY}"

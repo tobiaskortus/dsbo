@@ -53,6 +53,3 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dsbo*"]
-
-[tool.setuptools.package-data]
-"dsbo.utils.io.storage" = ["include/dsbo/*.hpp", "include/dsbo/third_party/*.hpp"]

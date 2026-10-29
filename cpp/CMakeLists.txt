@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(dsbo_native LANGUAGES C CXX)
 
 # This build is deliberately independent of Python and its packaging backend.
-set(DSBO_SDK_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../dsbo/utils/io/storage/include"
+set(DSBO_SDK_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include"
     CACHE PATH "Native header include directory (may point to a copied include tree)")
 find_package(HDF5 2.0 REQUIRED COMPONENTS C)
 find_package(Threads REQUIRED)

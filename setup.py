@@ -15,11 +15,39 @@ from pathlib import Path
 import pybind11
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 from setuptools.errors import CompileError
 
 
 ROOT = Path(__file__).resolve().parent
-INCLUDE = Path("dsbo/utils/io/storage/include")
+INCLUDE = Path("cpp/include")
+
+
+class NativeHeadersBuildPy(build_py):
+    """Package the canonical C++ headers without copying them into the checkout."""
+
+    def _header_mapping(self):
+        destination = Path(self.build_lib) / "dsbo/utils/io/storage/include"
+        return {
+            str(destination / path.relative_to(INCLUDE)): str(path)
+            for path in sorted(INCLUDE.rglob("*.hpp"))
+        }
+
+    def run(self):
+        super().run()
+        if not self.editable_mode:
+            for destination, source in self._header_mapping().items():
+                self.mkpath(str(Path(destination).parent))
+                self.copy_file(source, destination)
+
+    def get_source_files(self):
+        return [*super().get_source_files(), *self._header_mapping().values()]
+
+    def get_outputs(self, include_bytecode=True):
+        return list(dict.fromkeys([*super().get_outputs(include_bytecode), *self._header_mapping()]))
+
+    def get_output_mapping(self):
+        return {**super().get_output_mapping(), **self._header_mapping()}
 
 
 class BundledBuildExt(build_ext):
@@ -76,4 +104,4 @@ extension = Extension(
         *[str(path) for path in sorted(Path("cpp/vendor").glob("*.tar.gz"))],
     ],
 )
-setup(ext_modules=[extension], cmdclass={"build_ext": BundledBuildExt})
+setup(ext_modules=[extension], cmdclass={"build_ext": BundledBuildExt, "build_py": NativeHeadersBuildPy})
