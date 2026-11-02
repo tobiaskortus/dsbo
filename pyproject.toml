@@ -17,6 +17,7 @@ dependencies = [
     "filelock",
     "graphviz",
     "grpcio",
+    "ipython",
     "lancedb",
     "lightning",
     "matplotlib",
