@@ -195,6 +195,98 @@ def test_named_dataset_append_and_nested_unicode(tmp_path):
         assert list(file["nested"]) == ["β"]
 
 
+@pytest.mark.parametrize("links", ["hard-cycles", "hard-aliases", "soft-links", "external-links"])
+def test_dataset_discovery_matches_object_visitation(tmp_path, links):
+    path = tmp_path / "links.h5"
+    external = tmp_path / "external.h5"
+    if links == "external-links":
+        with h5py.File(external, "w") as file:
+            file.create_dataset("remote/values", data=np.arange(4.) + 20)
+
+    with h5py.File(path, "w", track_order=True) as file:
+        file.attrs[W.STORE_ATTRIBUTE] = "flat"
+        nested = file.create_group("nested", track_order=True)
+        nested.create_dataset("β", data=np.arange(4.) + 10)
+        file.create_dataset("primal", data=np.arange(4.))
+        file.create_group("empty")
+        file["named_type"] = np.dtype("i4")
+        if links == "hard-cycles":
+            file["cycle"] = file["/"]
+            nested["self"] = nested
+            nested.create_group("child")["parent"] = nested
+        elif links == "hard-aliases":
+            file["a_group"] = nested
+            file["z_group"] = nested
+            file["a_primal"] = file["primal"]
+            file["z_primal"] = file["primal"]
+            nested["a_values"] = nested["β"]
+        elif links == "soft-links":
+            file["a_soft_dataset"] = h5py.SoftLink("/primal")
+            file["a_soft_group"] = h5py.SoftLink("/nested")
+            file["dangling"] = h5py.SoftLink("/missing")
+            file["soft_cycle"] = h5py.SoftLink("/soft_cycle")
+            nested["dangling"] = h5py.SoftLink("/missing")
+        else:
+            file["a_external_dataset"] = h5py.ExternalLink(external.name, "/remote/values")
+            file["a_external_group"] = h5py.ExternalLink(external.name, "/remote")
+            file["dangling_file"] = h5py.ExternalLink("missing.h5", "/remote")
+            file["dangling_object"] = h5py.ExternalLink(external.name, "/missing")
+            nested["dangling"] = h5py.ExternalLink("missing.h5", "/remote")
+
+        expected = {}
+        for root in ("", "nested", "/nested", "empty"):
+            datasets = {}
+            prefix = root + "/" if root else ""
+            parent = file[root] if root else file
+            parent.visititems(
+                lambda name, value: datasets.update({prefix + name: value[()].tolist()})
+                if isinstance(value, h5py.Dataset) else None
+            )
+            expected[root] = datasets
+        assert len(expected[""]) == 2
+
+    # Keep a traversal regression from hanging or exhausting the pytest process.
+    result = subprocess.run([
+        sys.executable, "-c", '''
+import json
+import sys
+import numpy as np
+from dsbo.utils.io.storage import HDF5Writer as W, _hdf5
+
+path, expected = sys.argv[1], json.loads(sys.argv[2])
+reader = _hdf5.Reader(path)
+try:
+    for root, datasets in expected.items():
+        assert reader.keys(root) == sorted(datasets), (root, reader.keys(root), datasets)
+        for name, values in datasets.items():
+            np.testing.assert_array_equal(reader.read(name), values)
+finally:
+    reader.close()
+with W.open_dataset(path) as view:
+    assert view.keys == tuple(sorted(expected[""])), view.keys
+    for name, values in expected[""].items():
+        np.testing.assert_array_equal(view.read(name, slice(None)), values)
+''', str(path), json.dumps(expected),
+    ], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"Child exited with {result.returncode}:\n{result.stdout}\n{result.stderr}"
+
+
+def test_dataset_discovery_root_validation_and_closed_reader(tmp_path):
+    path = tmp_path / "discovery.h5"
+    W.write_primal(path, np.arange(3.))
+    reader = _hdf5.Reader(str(path))
+    try:
+        assert reader.keys() == ["primal"]
+        with pytest.raises(KeyError, match="does not exist"):
+            reader.keys("missing")
+        with pytest.raises(ValueError, match="not a group"):
+            reader.keys("primal")
+    finally:
+        reader.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        reader.keys()
+
+
 @pytest.mark.parametrize("left,right", [(a, b) for a in DTYPES[:14] for b in DTYPES[:14]])
 def test_gradient_numeric_promotion(tmp_path, left, right):
     a = np.array([1, 0], dtype=left)

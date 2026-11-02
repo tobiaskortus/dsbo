@@ -10,6 +10,43 @@ static void expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+static void test_dataset_discovery(const std::string& path) {
+    const auto values = io::Array::from<double>({1, 2, 3}, {3});
+    const auto external_path = fs::absolute(path + ".external.h5").string();
+    {
+        auto external = io::detail::open_file(external_path, true);
+        io::detail::create_dataset(external, "remote/values", values.view());
+    }
+    {
+        auto file = io::detail::open_file(path, true);
+        io::detail::create_dataset(file, "primal", values.view());
+        io::detail::create_dataset(file, "nested/values", values.view());
+        io::detail::require_group(file, "empty");
+        io::detail::Handle type(H5Tcopy(H5T_NATIVE_INT), H5Tclose);
+        io::detail::check(H5Tcommit2(file, "named_type", type, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), "Cannot create test named datatype");
+        io::detail::check(H5Lcreate_hard(file, "/", file, "cycle", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test root cycle");
+        io::detail::check(H5Lcreate_hard(file, "nested", file, "nested/self", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test group cycle");
+        io::detail::check(H5Lcreate_hard(file, "nested", file, "a_group", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test group alias");
+        io::detail::check(H5Lcreate_hard(file, "primal", file, "a_primal", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test dataset alias");
+        io::detail::check(H5Lcreate_hard(file, "nested/values", file, "nested/a_values", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test nested alias");
+        io::detail::check(H5Lcreate_soft("/primal", file, "soft_dataset", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test soft dataset link");
+        io::detail::check(H5Lcreate_soft("/nested", file, "soft_group", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test soft group link");
+        io::detail::check(H5Lcreate_soft("/missing", file, "dangling", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test dangling link");
+        io::detail::check(H5Lcreate_soft("/soft_cycle", file, "soft_cycle", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test soft cycle");
+        io::detail::check(H5Lcreate_external(external_path.c_str(), "/remote/values", file, "external_dataset", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test external dataset link");
+        io::detail::check(H5Lcreate_external(external_path.c_str(), "/remote", file, "external_group", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test external group link");
+        io::detail::check(H5Lcreate_external((path + ".missing.h5").c_str(), "/", file, "dangling_external", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test dangling external link");
+    }
+    io::Reader reader(path);
+    expect(reader.keys() == std::vector<std::string>({"a_group/a_values", "a_primal"}), "Discovery visits hard-linked objects once and skips symbolic links");
+    expect(reader.keys("nested") == std::vector<std::string>({"nested/a_values"}), "Discovery preserves the requested root prefix");
+    expect(reader.keys("/nested") == std::vector<std::string>({"/nested/a_values"}), "Discovery preserves absolute root prefixes");
+    expect(reader.keys("empty").empty(), "Empty groups contain no datasets");
+    expect(reader.read("a_group/a_values").storage == values.storage, "Discovered hard-link paths remain readable");
+    expect(reader.read("soft_dataset").storage == values.storage, "Named reads still resolve soft links");
+    expect(reader.read("external_dataset").storage == values.storage, "Named reads still resolve external links");
+}
+
 static void test_string_attributes(const std::string& path) {
     auto file = io::detail::open_file(path, true);
     expect(!io::detail::string_attribute(file, io::store_attribute), "Missing string attributes remain optional");
@@ -69,6 +106,7 @@ int main(int argc, char** argv) {
         fs::create_directories(root);
         const auto path = [&](const std::string& name) { return (root / name).string(); };
         test_string_attributes(path("string-attributes.h5"));
+        test_dataset_discovery(path("discovery.h5"));
         const auto extended = io::Array::from<long double>({1.25L, -2.5L}, {2});
         auto swapped_type = extended.type;
         swapped_type.little_endian = !swapped_type.little_endian;

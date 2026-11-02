@@ -23,6 +23,7 @@ if(BUILD_TESTING)
   add_executable(dsbo_native_tests tests/hdf5.cpp tests/second_translation_unit.cpp)
   target_link_libraries(dsbo_native_tests PRIVATE dsbo::io)
   add_test(NAME native_hdf5 COMMAND dsbo_native_tests "${CMAKE_CURRENT_BINARY_DIR}/test-files")
+  set_tests_properties(native_hdf5 PROPERTIES TIMEOUT 60)
 
   add_executable(dsbo_environment_tests tests/environment.cpp)
   target_link_libraries(dsbo_environment_tests PRIVATE dsbo::io)

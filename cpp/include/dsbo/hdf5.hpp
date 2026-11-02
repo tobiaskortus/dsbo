@@ -859,16 +859,22 @@ public:
     }
     std::vector<std::string> keys(const std::string& root = "") const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
+        auto parent = detail::group(file_, root.empty() ? "/" : root);
         std::vector<std::string> result;
-        const auto visit = [&](const auto& self, const std::string& prefix) -> void {
-            auto parent = prefix.empty() ? detail::group(file_, "/") : detail::group(file_, prefix);
-            for (const auto& name : detail::children(parent)) {
-                const auto path = prefix.empty() ? name : prefix + "/" + name;
-                if (detail::object_type(file_, path) == H5O_TYPE_DATASET) result.push_back(path);
-                else if (detail::object_type(file_, path) == H5O_TYPE_GROUP) self(self, path);
-            }
+        struct State { const std::string& prefix; std::vector<std::string>& names; std::exception_ptr error; } state{root, result, {}};
+        const auto callback = [](hid_t, const char* name, const H5O_info2_t* info, void* pointer) -> herr_t {
+            auto& state = *static_cast<State*>(pointer);
+            try {
+                if (info->type == H5O_TYPE_DATASET)
+                    state.names.push_back(state.prefix.empty() ? name : state.prefix + "/" + name);
+                return 0;
+            } catch (...) { state.error = std::current_exception(); return -1; }
         };
-        visit(visit, root);
+        // Match h5py's object visitation: visit each hard-linked object once,
+        // including in cyclic graphs, and do not follow soft or external links.
+        const auto status = H5Ovisit3(parent, H5_INDEX_NAME, H5_ITER_INC, callback, &state, H5O_INFO_BASIC);
+        if (state.error) std::rethrow_exception(state.error);
+        detail::check(status, "Cannot enumerate HDF5 datasets.");
         std::sort(result.begin(), result.end());
         return result;
     }
