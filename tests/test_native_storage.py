@@ -66,6 +66,49 @@ def test_h5py_legacy_files_read_by_native_backend(tmp_path, dtype):
         W.open_dataset(path)
 
 
+@pytest.mark.parametrize("dtype", [h5py.string_dtype("utf-8"), np.dtype("S16")], ids=["variable", "fixed"])
+@pytest.mark.parametrize("shape", [None, (0,), (2,), (100,), (2, 2)], ids=["null", "empty", "two", "hundred", "matrix"])
+@pytest.mark.parametrize("attribute", [W.STORE_ATTRIBUTE, W.VDS_SOURCES_ATTRIBUTE])
+def test_string_metadata_rejects_non_singleton_attributes(tmp_path, dtype, shape, attribute):
+    path = tmp_path / "malformed-metadata.h5"
+    value = "flat" if attribute == W.STORE_ATTRIBUTE else "[]"
+    with h5py.File(path, "w") as file:
+        file.create_dataset("primal", data=np.arange(3.))
+        if attribute != W.STORE_ATTRIBUTE:
+            file.attrs[W.STORE_ATTRIBUTE] = "flat"
+        data = h5py.Empty(dtype) if shape is None else np.full(shape, value, dtype=dtype)
+        file.attrs.create(attribute, data=data, dtype=dtype)
+
+    # A regression can corrupt native memory, so isolate every malformed read.
+    result = subprocess.run([
+        sys.executable, "-c", '''
+import sys
+from dsbo.utils.io.storage import HDF5Writer as W
+try:
+    W.open_dataset(sys.argv[1])
+except ValueError as error:
+    assert sys.argv[2] in str(error), str(error)
+    assert "exactly one element" in str(error), str(error)
+else:
+    raise AssertionError("Non-singleton string metadata was accepted")
+''', str(path), attribute,
+    ], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"Child exited with {result.returncode}:\n{result.stdout}\n{result.stderr}"
+
+
+@pytest.mark.parametrize("dtype", [h5py.string_dtype("utf-8"), np.dtype("S16")], ids=["variable", "fixed"])
+@pytest.mark.parametrize("shape", [(), (1,), (1, 1)])
+def test_string_metadata_accepts_scalar_and_singleton_attributes(tmp_path, dtype, shape):
+    path = tmp_path / "singleton-metadata.h5"
+    values = np.arange(3.)
+    with h5py.File(path, "w") as file:
+        file.create_dataset("primal", data=values)
+        file.attrs.create(W.STORE_ATTRIBUTE, data=np.full(shape, "flat", dtype=dtype), dtype=dtype)
+        file.attrs.create(W.VDS_SOURCES_ATTRIBUTE, data=np.full(shape, "[]", dtype=dtype), dtype=dtype)
+    with W.open_dataset(path) as view:
+        np.testing.assert_array_equal(view.read("primal", slice(None)), values)
+
+
 def test_noncontiguous_inputs_scalar_rank_and_owned_output(tmp_path):
     for i, values in enumerate((np.array(3.5), np.arange(24).reshape(4, 6).T, np.arange(10)[::-2])):
         path = tmp_path / f"{i}.h5"

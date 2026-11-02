@@ -353,6 +353,11 @@ inline std::optional<std::string> string_attribute(hid_t parent, const char* nam
     Handle attribute(H5Aopen(parent, name, H5P_DEFAULT), H5Aclose);
     Handle type(H5Aget_type(attribute), H5Tclose);
     if (H5Tget_class(type) != H5T_STRING) throw std::invalid_argument(std::string("Invalid HDF5 string attribute: ") + name);
+    Handle space(H5Aget_space(attribute), H5Sclose);
+    const auto count = H5Sget_simple_extent_npoints(space);
+    if (count < 0) throw IOError(std::string("Cannot inspect HDF5 string attribute: ") + name);
+    // H5Aread reads the entire attribute into storage for a single string.
+    if (count != 1) throw std::invalid_argument(std::string("Invalid HDF5 string attribute '") + name + "': expected exactly one element.");
     if (H5Tis_variable_str(type) > 0) {
         char* value = nullptr;
         check(H5Aread(attribute, type, &value), "Cannot read HDF5 string attribute.");

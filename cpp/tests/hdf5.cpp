@@ -10,6 +10,49 @@ static void expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+static void test_string_attributes(const std::string& path) {
+    auto file = io::detail::open_file(path, true);
+    expect(!io::detail::string_attribute(file, io::store_attribute), "Missing string attributes remain optional");
+    const std::vector<std::optional<io::Shape>> shapes = {
+        io::Shape{}, io::Shape{1}, io::Shape{1, 1}, io::Shape{0},
+        io::Shape{2}, io::Shape{100}, io::Shape{2, 2}, std::nullopt,
+    };
+    for (bool variable : {false, true}) {
+        io::detail::Handle type(H5Tcopy(H5T_C_S1), H5Tclose);
+        constexpr std::size_t width = 8;
+        io::detail::check(H5Tset_size(type, variable ? H5T_VARIABLE : width), "Cannot set test string size");
+        for (const auto& shape : shapes) {
+            auto space = shape ? io::detail::dataspace(*shape) : io::detail::Handle(H5Screate(H5S_NULL), H5Sclose);
+            const auto count = shape ? io::elements(*shape) : 0;
+            if (H5Aexists(file, io::store_attribute) > 0)
+                io::detail::check(H5Adelete(file, io::store_attribute), "Cannot replace test string attribute");
+            io::detail::Handle attribute(H5Acreate2(file, io::store_attribute, type, space, H5P_DEFAULT, H5P_DEFAULT), H5Aclose);
+            if (count) {
+                if (variable) {
+                    const std::vector<const char*> values(count, "flat");
+                    io::detail::check(H5Awrite(attribute, type, values.data()), "Cannot write variable-length test strings");
+                } else {
+                    std::vector<char> values(count * width, '\0');
+                    for (std::size_t i = 0; i < count; ++i) std::memcpy(values.data() + i * width, "flat", 4);
+                    io::detail::check(H5Awrite(attribute, type, values.data()), "Cannot write fixed-length test strings");
+                }
+            }
+            if (count == 1) {
+                expect(io::detail::string_attribute(file, io::store_attribute).value() == "flat", "Scalar and singleton string attributes are readable");
+            } else {
+                try {
+                    io::detail::string_attribute(file, io::store_attribute);
+                    throw std::logic_error("Non-singleton string attribute was accepted");
+                } catch (const std::invalid_argument& error) {
+                    const std::string message = error.what();
+                    expect(message.find(io::store_attribute) != std::string::npos &&
+                           message.find("exactly one element") != std::string::npos, "String validation names the attribute and element-count requirement");
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         io::check_environment();
@@ -25,6 +68,7 @@ int main(int argc, char** argv) {
         const fs::path root = argv[1];
         fs::create_directories(root);
         const auto path = [&](const std::string& name) { return (root / name).string(); };
+        test_string_attributes(path("string-attributes.h5"));
         const auto extended = io::Array::from<long double>({1.25L, -2.5L}, {2});
         auto swapped_type = extended.type;
         swapped_type.little_endian = !swapped_type.little_endian;
