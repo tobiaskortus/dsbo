@@ -253,6 +253,12 @@ inline void finish_file(Handle& file) {
 }
 
 inline Shape shape(hid_t space) {
+    switch (H5Sget_simple_extent_type(space)) {
+        case H5S_SCALAR: return {};
+        case H5S_SIMPLE: break;
+        case H5S_NULL: throw std::invalid_argument("HDF5 NULL dataspaces (H5S_NULL) are not supported.");
+        default: throw IOError("Cannot inspect HDF5 dataspace class.");
+    }
     const int rank = H5Sget_simple_extent_ndims(space);
     if (rank < 0) throw IOError("Cannot inspect HDF5 shape.");
     Shape result(static_cast<std::size_t>(rank));
@@ -1165,7 +1171,11 @@ public:
     static Array load_backward_gradient(const std::string& primal_path, const std::string& gradient_path) {
         auto file = detail::open_file(primal_path);
         detail::sources(file, primal_path);
-        if (detail::object_type(file, "primal") == H5O_TYPE_DATASET) return read_gradient(gradient_path, std::nullopt);
+        if (detail::object_type(file, "primal") == H5O_TYPE_DATASET) {
+            auto primal = detail::dataset(file, "primal");
+            detail::dataset_shape(primal);
+            return read_gradient(gradient_path, std::nullopt);
+        }
         auto parent = detail::group(file, "primal");
         const auto columns = detail::stored_columns(parent);
         std::map<std::string, Shape> dimensions;

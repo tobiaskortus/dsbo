@@ -66,6 +66,60 @@ def test_h5py_legacy_files_read_by_native_backend(tmp_path, dtype):
         W.open_dataset(path)
 
 
+@pytest.mark.parametrize("named", [False, True], ids=["flat", "column"])
+@pytest.mark.parametrize("operation", ["shape", "read", "integer", "slice", "empty_slice", "indices", "empty_indices", "open_primal", "open_primal_tangent", "shape_from_path"])
+def test_null_dataset_reads_and_shapes_rejected(tmp_path, named, operation):
+    path = tmp_path / "null.h5"
+    name = "primal/value" if named else "primal"
+    with h5py.File(path, "w") as file:
+        file.create_dataset(name, data=h5py.Empty("f8"))
+        assert file[name].shape is None
+
+    reader = _hdf5.Reader(str(path))
+    try:
+        operations = {
+            "shape": lambda: reader.shape(name),
+            "read": lambda: reader.read(name),
+            "integer": lambda: reader.read(name, 0),
+            "slice": lambda: reader.read(name, slice(None)),
+            "empty_slice": lambda: reader.read(name, slice(0, 0)),
+            "indices": lambda: reader.read_indices(name, [0]),
+            "empty_indices": lambda: reader.read_indices(name, []),
+            "open_primal": lambda: W.open_primal(path),
+            "open_primal_tangent": lambda: W.open_primal_tangent(path),
+            "shape_from_path": lambda: W.shape_from_path(path),
+        }
+        with pytest.raises(ValueError, match="H5S_NULL"):
+            operations[operation]()
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["flat", "column"])
+def test_null_tangent_rejected(tmp_path, named):
+    path = tmp_path / "null-tangent.h5"
+    with h5py.File(path, "w") as file:
+        file.create_dataset("primal/value" if named else "primal", data=3.5)
+        file.create_dataset("tangent/value" if named else "tangent", data=h5py.Empty("f8"))
+    with pytest.raises(ValueError, match="H5S_NULL"):
+        W.open_primal_tangent(path)
+
+
+@pytest.mark.parametrize("attribute", [W.STATS_COUNT_ATTRIBUTE, W.STATS_MEAN_ATTRIBUTE, W.STATS_SQUARED_DEVIATION_ATTRIBUTE])
+def test_null_numeric_metadata_rejected(tmp_path, attribute):
+    path = tmp_path / "null-statistics.h5"
+    W.write_primal(path, np.arange(3.))
+    with h5py.File(path, "r+") as file:
+        del file["primal"].attrs[attribute]
+        file["primal"].attrs.create(attribute, data=h5py.Empty("u8" if attribute == W.STATS_COUNT_ATTRIBUTE else "f8"))
+    reader = _hdf5.Reader(str(path))
+    try:
+        with pytest.raises(ValueError, match="H5S_NULL"):
+            reader.statistics("primal")
+    finally:
+        reader.close()
+
+
 @pytest.mark.parametrize("dtype", [h5py.string_dtype("utf-8"), np.dtype("S16")], ids=["variable", "fixed"])
 @pytest.mark.parametrize("shape", [None, (0,), (2,), (100,), (2, 2)], ids=["null", "empty", "two", "hundred", "matrix"])
 @pytest.mark.parametrize("attribute", [W.STORE_ATTRIBUTE, W.VDS_SOURCES_ATTRIBUTE])
@@ -311,6 +365,74 @@ def test_sparse_gradient_aggregation_and_merge(tmp_path):
     W.write_gradient(total, np.array([[9., 10.]]), ["c"], merge=True)
     np.testing.assert_array_equal(W.load_backward_gradient(primal, total), [[9, 10], [3, 4], [6, 8]])
     assert not list(tmp_path.glob("*.partial"))
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["flat", "column"])
+@pytest.mark.parametrize("null_target", ["gradient", "primal", "both"])
+def test_null_gradients_rejected_before_shape_validation(tmp_path, named, null_target):
+    primal, gradient = tmp_path / "primal.h5", tmp_path / "gradient.h5"
+    values = np.array([3.5]) if named else np.array(3.5)
+    columns = ["value"] if named else None
+    W.write_primal(primal, values, columns)
+    W.write_gradient(gradient, values, columns)
+    for path, root in ((primal, "primal"), (gradient, "gradient")):
+        if null_target not in (root, "both"):
+            continue
+        name = f"{root}/value" if named else root
+        with h5py.File(path, "r+") as file:
+            del file[name]
+            file.create_dataset(name, data=h5py.Empty("f8"))
+
+    with pytest.raises(ValueError, match="H5S_NULL"):
+        list(W.gradient_file_contributions(primal, gradient))
+    with pytest.raises(ValueError, match="H5S_NULL"):
+        W.load_backward_gradient(primal, gradient)
+    if null_target in ("gradient", "both"):
+        with pytest.raises(ValueError, match="H5S_NULL"):
+            W.load_gradient(gradient)
+
+
+def test_sparse_scalar_gradients_do_not_treat_null_columns_as_missing(tmp_path):
+    primal, gradient = tmp_path / "primal.h5", tmp_path / "gradient.h5"
+    W.write_primal(primal, np.array([1., 2., 3.]), ["missing", "valid", "null"])
+    W.write_gradient(gradient, np.array([4., 5.]), ["valid", "null"])
+    np.testing.assert_array_equal(W.load_backward_gradient(primal, gradient), [0., 4., 5.])
+    with h5py.File(gradient, "r+") as file:
+        del file["gradient/null"]
+        file.create_dataset("gradient/null", data=h5py.Empty("f8"))
+    with pytest.raises(ValueError, match="H5S_NULL"):
+        W.load_backward_gradient(primal, gradient)
+    with pytest.raises(ValueError, match="H5S_NULL"):
+        list(W.gradient_file_contributions(primal, gradient))
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["flat", "column"])
+@pytest.mark.parametrize("shape", [(), (0,), (0, 2), (2, 0)])
+def test_scalar_and_empty_gradients_remain_supported(tmp_path, named, shape):
+    primal, gradient = tmp_path / "primal.h5", tmp_path / "gradient.h5"
+    values = np.full(shape, 3.5)
+    if named:
+        values = np.expand_dims(values, 0)
+    columns = ["value"] if named else None
+    W.write_primal(primal, values, columns)
+    W.write_gradient(gradient, values, columns)
+    assert list(W.gradient_file_contributions(primal, gradient)) == [(str(primal), str(gradient), columns)]
+    loaded = W.load_backward_gradient(primal, gradient)
+    assert loaded.shape == values.shape
+    np.testing.assert_array_equal(loaded, values)
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["flat", "column"])
+def test_null_dataset_reduction_preserves_destination(tmp_path, named):
+    source, destination = tmp_path / "null.h5", tmp_path / "destination.h5"
+    with h5py.File(source, "w") as file:
+        file.attrs[W.STORE_ATTRIBUTE] = "column" if named else "flat"
+        file.create_dataset("primal/value" if named else "primal", data=h5py.Empty("f8"))
+    W.write_primal(destination, np.array(3.5))
+    before = destination.read_bytes()
+    with pytest.raises(ValueError, match="H5S_NULL"):
+        W.reduce([source], destination)
+    assert destination.read_bytes() == before
 
 
 @pytest.mark.parametrize("left,right", [((), (3,)), ((2, 1), (1, 3)), ((1, 2), (0, 2))])

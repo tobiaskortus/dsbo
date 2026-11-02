@@ -10,6 +10,72 @@ static void expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+template<class Function> static void expect_null_rejected(Function&& function) {
+    try { function(); }
+    catch (const std::invalid_argument& error) {
+        expect(std::string(error.what()).find("H5S_NULL") != std::string::npos, "NULL dataspace errors identify H5S_NULL");
+        return;
+    }
+    throw std::logic_error("NULL dataspace was accepted");
+}
+
+static void create_null_dataset(hid_t parent, const std::string& name) {
+    io::detail::Handle space(H5Screate(H5S_NULL), H5Sclose);
+    io::detail::Handle value(H5Dcreate2(parent, name.c_str(), H5T_NATIVE_DOUBLE, space,
+                                      H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), H5Dclose);
+}
+
+static void test_dataspace_classes(const std::string& path) {
+    const auto scalar = io::Array::from<double>({3.5}, {});
+    const io::Array empty(io::dtype<double>(), {0, 2});
+    {
+        auto file = io::detail::open_file(path, true);
+        io::detail::create_dataset(file, "scalar", scalar.view());
+        io::detail::create_dataset(file, "empty", empty.view());
+        create_null_dataset(file, "null");
+        io::detail::Handle space(H5Screate(H5S_NULL), H5Sclose);
+        io::detail::Handle attribute(H5Acreate2(file, "null_attribute", H5T_NATIVE_DOUBLE, space,
+                                             H5P_DEFAULT, H5P_DEFAULT), H5Aclose);
+    }
+    io::Reader reader(path);
+    expect(reader.shape("scalar").empty(), "Scalar dataspaces retain rank zero");
+    expect(reader.read("scalar").values<double>() == scalar.values<double>(), "Scalar values are preserved");
+    expect(reader.read("scalar", {0, 1, 1, true}).values<double>() == scalar.values<double>(), "Scalar selections preserve values");
+    expect(reader.read_indices("scalar", {0}).values<double>() == scalar.values<double>(), "Scalar indexed reads preserve values");
+    expect(reader.shape("empty") == empty.shape && reader.read("empty").storage.empty(), "Zero-length simple dataspaces remain supported");
+    expect_null_rejected([&] { reader.shape("null"); });
+    expect_null_rejected([&] { reader.read("null"); });
+    expect_null_rejected([&] { reader.read("null", {0, 1, 1, true}); });
+    expect_null_rejected([&] { reader.read("null", {0, 1, 1, false}); });
+    expect_null_rejected([&] { reader.read("null", {0, 1, 0, false}); });
+    expect_null_rejected([&] { reader.read_indices("null", {0}); });
+    expect_null_rejected([&] { reader.read_indices("null", {}); });
+    auto file = io::detail::open_file(path);
+    expect_null_rejected([&] { io::detail::read_array_attribute(file, "null_attribute", io::dtype<double>()); });
+}
+
+static void test_null_gradients(const std::string& primal_path, const std::string& gradient_path) {
+    const auto scalar = io::Array::from<double>({3.5}, {});
+    for (bool null_primal : {false, true}) for (bool null_gradient : {false, true}) {
+        if (!null_primal && !null_gradient) continue;
+        io::HDF5Writer::write_primal(primal_path, scalar.view());
+        io::HDF5Writer::write_gradient(gradient_path, scalar.view());
+        if (null_primal) {
+            auto file = io::detail::open_file(primal_path, true, true);
+            io::detail::check(H5Ldelete(file, "primal", H5P_DEFAULT), "Cannot replace test primal");
+            create_null_dataset(file, "primal");
+        }
+        if (null_gradient) {
+            auto file = io::detail::open_file(gradient_path, true, true);
+            io::detail::check(H5Ldelete(file, "gradient", H5P_DEFAULT), "Cannot replace test gradient");
+            create_null_dataset(file, "gradient");
+            expect_null_rejected([&] { io::HDF5Writer::load_gradient(gradient_path); });
+        }
+        expect_null_rejected([&] { io::HDF5Writer::gradient_file_contributions(primal_path, gradient_path); });
+        expect_null_rejected([&] { io::HDF5Writer::load_backward_gradient(primal_path, gradient_path); });
+    }
+}
+
 static void test_dataset_discovery(const std::string& path) {
     const auto values = io::Array::from<double>({1, 2, 3}, {3});
     const auto external_path = fs::absolute(path + ".external.h5").string();
@@ -107,6 +173,8 @@ int main(int argc, char** argv) {
         const auto path = [&](const std::string& name) { return (root / name).string(); };
         test_string_attributes(path("string-attributes.h5"));
         test_dataset_discovery(path("discovery.h5"));
+        test_dataspace_classes(path("dataspace-classes.h5"));
+        test_null_gradients(path("null-primal.h5"), path("null-gradient.h5"));
         const auto extended = io::Array::from<long double>({1.25L, -2.5L}, {2});
         auto swapped_type = extended.type;
         swapped_type.little_endian = !swapped_type.little_endian;
