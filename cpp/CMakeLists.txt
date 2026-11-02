@@ -30,9 +30,21 @@ if(BUILD_TESTING)
     add_test(NAME native_environment_${scenario} COMMAND dsbo_environment_tests "${scenario}")
   endforeach()
 
+  add_executable(dsbo_workflow_step_tests tests/workflow_step.cpp)
+  target_link_libraries(dsbo_workflow_step_tests PRIVATE dsbo::io)
+  foreach(scenario IN ITEMS reordered partial matching unnamed)
+    add_test(NAME native_workflow_backward_${scenario}
+      COMMAND "${CMAKE_COMMAND}"
+        "-DTEST_HELPER=$<TARGET_FILE:dsbo_workflow_step_tests>"
+        "-DNATIVE_STEP=$<TARGET_FILE:dsbo_native_step>"
+        "-DSCENARIO=${scenario}"
+        "-DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/workflow-step/${scenario}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/workflow_step.cmake")
+  endforeach()
+
   add_custom_target(check
     COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure -C "$<CONFIG>"
-    DEPENDS dsbo_native_tests dsbo_environment_tests dsbo_native_step
+    DEPENDS dsbo_native_tests dsbo_environment_tests dsbo_workflow_step_tests dsbo_native_step
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     USES_TERMINAL
     VERBATIM)
