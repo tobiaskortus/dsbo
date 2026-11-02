@@ -15,6 +15,9 @@ class LocalDaskWorker(DaskWorkerBase):
         self.cluster.scale(2)
         super().__init__(self.cluster)
 
+    def _task_resources(self, module):
+        return {}
+
 
 @pytest.fixture(scope="session", autouse=True)
 def workflow():

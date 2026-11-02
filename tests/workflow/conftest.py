@@ -91,6 +91,9 @@ class LocalDaskWorker(DaskWorkerBase):
         self.cluster.scale(2)
         super().__init__(self.cluster)
 
+    def _task_resources(self, module):
+        return {}
+
 class SimpleModule(Module):
     def __init__(self):
         super().__init__()

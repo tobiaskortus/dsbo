@@ -1,5 +1,3 @@
-"""Run the AIDO-style surrogate optimization on the HepEmShow example."""
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -7,15 +5,20 @@ from datetime import datetime
 import torch
 
 from dsbo.config import config
-from dsbo.storage.sqlmodel import StudyStorage
-from dsbo.surrogates.workflow_surrogate import DefaultWorkflowSurrogate
 from dsbo.utils.io import Workdir
+from dsbo.storage.sqlmodel import StudyStorage
+from dsbo.worker.spec import SLURMWorkerSpec
+from dsbo.worker.dask import HeterogeneousDaskWorker, WorkerContext
+from dsbo.surrogates.workflow_surrogate import DefaultWorkflowSurrogate
+
 from examples.hepemshow.aido.strategy import CovarianceStrategy
+from examples.hepemshow.modules.reconstruction import ParticleEnergyRegression
+from examples.hepemshow.modules.simulation import HepEmShowSimulation
 from examples.hepemshow.problem import HepEmShowCalorimeterProblem
 
 
 def evaluate_candidate(evaluation_workflow, candidate):
-    with torch.no_grad(), config.use(cache_config=None):
+    with Workdir.create_subdir("evaluation"), torch.no_grad(), config.use(cache_config=None):
         return evaluation_workflow.run(candidate.detach(), use_surrogates=False)
 
 
@@ -30,7 +33,10 @@ def trial_objectives(evaluation, surrogate_loss, constraint):
     }
 
 
+spec = SLURMWorkerSpec(10, 1, "16GB", "1:00:00", partition="epyc-256").adapt(0, 5)
+
 problem = HepEmShowCalorimeterProblem("aido_hepemshow", None)
+problem.to({HepEmShowSimulation: spec, ParticleEnergyRegression: spec})
 
 workflow = problem.batch_reduced_workflow
 evaluation_workflow = problem.default_workflow
@@ -51,6 +57,7 @@ surrogate = DefaultWorkflowSurrogate(
     sample_count=512,
     num_workers=0,
 )
+surrogate.to(spec)
 workflow.patch(surrogate)
 
 
@@ -62,28 +69,29 @@ optimizer = torch.optim.Adam([candidate.tensor], lr=0.2)
 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 study_path = f"example_hepemshow_aido_{timestamp}.db"
 
-with  StudyStorage.create(study_path) as study:
-    for step in range(8000):
-        with Workdir.create(f"files/example_hepemshow_aido/step={step}", error_if_exists=False):
-            optimizer.zero_grad()
-            result = workflow.run(candidate)
+with StudyStorage.create(study_path) as study, HeterogeneousDaskWorker.from_workflow(workflow) as worker:
+    with WorkerContext.use_worker(worker):
+        for step in range(8000):
+            with Workdir.create(f"files/example_hepemshow_aido/step={step}", error_if_exists=False):
+                optimizer.zero_grad()
+                result = workflow.run(candidate)
 
-            constraint = 0.1 * torch.clamp(candidate.tensor.sum() - 150.0, min=0.0)
-            surrogate_loss = result["loss"].mean()
-            loss = surrogate_loss + constraint
+                constraint = 0.1 * torch.clamp(candidate.tensor.sum() - 150.0, min=0.0)
+                surrogate_loss = result["loss"].mean()
+                loss = surrogate_loss + constraint
 
-            if step % 10 == 0:
-                evaluation = evaluate_candidate(evaluation_workflow, candidate)
-                objectives = trial_objectives(evaluation, surrogate_loss, constraint)
+                if step % 10 == 0:
+                    evaluation = evaluate_candidate(evaluation_workflow, candidate)
+                    objectives = trial_objectives(evaluation, surrogate_loss, constraint)
 
-                study.trials.add_trial(
-                    step,
-                    candidate.detach().tensor,
-                    objectives,
-                    constraints={"total_thickness": constraint.detach()},
-                )
+                    study.trials.add_trial(
+                        step,
+                        candidate.detach().tensor,
+                        objectives,
+                        constraints={"total_thickness": constraint.detach()},
+                    )
 
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                candidate.tensor.clamp_(min=problem.LOWER_BOUND, max=problem.UPPER_BOUND)
+                loss.backward()
+                optimizer.step()
+                with torch.no_grad():
+                    candidate.tensor.clamp_(min=problem.LOWER_BOUND, max=problem.UPPER_BOUND)

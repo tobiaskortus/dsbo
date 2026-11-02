@@ -10,13 +10,10 @@ requires-python = ">=3.10"
 license-files = ["LICENSES/*"]
 
 dependencies = [
-    "attrs",
     "dask[distributed]",
     "dask-jobqueue",
-    "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main",
+    "dsbo_heterogeneous @ git+https://github.com/tobiaskortus/dsbo_heterogeneous.git@main",
     "diffusers",
-    "duckdb",
-    "duckdb-engine",
     "filelock",
     "graphviz",
     "grpcio",
@@ -25,20 +22,13 @@ dependencies = [
     "matplotlib",
     "networkx",
     "numpy",
-    "optuna",
-    "optuna-integration[botorch]",
-    "pandas",
     "psutil",
-    "pyarrow",
     "pytorch-lightning",
     "sqlalchemy",
     "sqlmodel",
     "sqlite-vec",
-    "ipython",
-    "diffusers",
     "torch",
     "tqdm",
-    "uproot>=5,<6",
 ]
 
 [project.optional-dependencies]
@@ -49,6 +39,9 @@ dev = [
     "pytest",
     "h5py>=3.16",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -26,6 +26,10 @@ class StudyStorageExistsError(FileExistsError):
     pass
 
 
+class ExecutionConflictError(ValueError):
+    """A workflow execution ID is already registered in the study."""
+
+
 def _configure_sqlite_vec(engine: Engine, vector_dim: int) -> None:
     import sqlite_vec
 
@@ -175,7 +179,19 @@ class WorkflowStorage(WorkflowStorageBase):
                 session.add(Execution(workflow_id=wf.id, batch_id=batch.id if batch is not None else None, 
                                       exec_id=exec_id, num_jobs=wf.num_tasks))
             
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as error:
+                session.rollback()
+                if "UNIQUE constraint failed: execution.exec_id" not in str(error.orig):
+                    raise
+                raise ExecutionConflictError(
+                    f"Cannot register workflow execution in '{batch_id}': an execution ID "
+                    "is already registered in this study. Execution IDs are derived from "
+                    "the working directory; use a separate Workdir or "
+                    "Workdir.create_subdir('evaluation') for each workflow run. "
+                    "Existing execution records have not been changed."
+                ) from None
             if batch is not None:
                 session.refresh(batch)
         return batch

@@ -11,6 +11,7 @@ import torch.autograd.forward_ad as fw
 from dsbo.config import get_active_file_backend
 from dsbo.modules.simulation import SimulationBase
 from dsbo.utils.io import DefaultPaths, Output, Workdir
+from dsbo.utils.process import available_cores
 
 
 class HepEmShowSimulation(SimulationBase):
@@ -137,11 +138,16 @@ class HepEmShowSimulation(SimulationBase):
 
         return result
 
-    def _parallel_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if self.num_workers is None or self.num_workers <= len(tasks):
+    def _resolve_num_workers(self) -> int:
+        if self.num_workers is not None:
+            return max(1, self.num_workers)
+        return available_cores(self.resources)
+
+    def _parallel_tasks(self, tasks: list[dict[str, Any]], num_workers: int) -> list[dict[str, Any]]:
+        if num_workers <= len(tasks):
             return tasks
 
-        remaining_workers = self.num_workers
+        remaining_workers = num_workers
         parallel_tasks = []
         for index, task in enumerate(tasks):
             remaining_tasks = len(tasks) - index
@@ -158,8 +164,9 @@ class HepEmShowSimulation(SimulationBase):
                 task["bar_edep"] = np.asarray(task["bar_edep"]).reshape(-1).tolist()
             return module.run_simulation(**task)
 
-        tasks = self._parallel_tasks(tasks)
-        num_workers = min(self.num_workers or len(tasks), len(tasks))
+        num_workers = self._resolve_num_workers()
+        tasks = self._parallel_tasks(tasks, num_workers)
+        num_workers = min(num_workers, len(tasks))
         if num_workers == 1:
             return [run(task) for task in tasks]
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
