@@ -101,6 +101,7 @@ extension = Extension(
     depends=[
         *[str(path) for path in sorted(INCLUDE.rglob("*.hpp"))],
         *[str(path) for path in sorted(Path("cpp/python").glob("*"))],
+        *[str(path) for path in sorted(Path("cpp/cmake").glob("*.cmake"))],
         *[str(path) for path in sorted(Path("cpp/vendor").glob("*.tar.gz"))],
     ],
 )

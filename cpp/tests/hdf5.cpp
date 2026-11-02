@@ -13,6 +13,11 @@ static void expect(bool condition, const char* message) {
 int main(int argc, char** argv) {
     try {
         io::check_environment();
+        unsigned filter_info = 0;
+        expect(H5Zfilter_avail(H5Z_FILTER_DEFLATE) > 0 &&
+               H5Zget_filter_info(H5Z_FILTER_DEFLATE, &filter_info) >= 0 &&
+               (filter_info & H5Z_FILTER_CONFIG_ENCODE_ENABLED) &&
+               (filter_info & H5Z_FILTER_CONFIG_DECODE_ENABLED), "Bundled zlib must provide gzip encoding/decoding");
         expect(second_translation_unit() == io::dtype<double>(), "Header must work across translation units");
         const auto truth = io::Array::from<std::int64_t>({-1, 0, 256}, {3});
         expect(io::convert(truth.view(), io::dtype<bool>()).values<bool>() == std::vector<bool>({true, false, true}), "Boolean conversion uses truth values");

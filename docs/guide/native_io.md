@@ -44,13 +44,14 @@ the extension's mandatory runtime HDF5 check still apply.
 
 ## Standalone C++ requirements
 
-These requirements apply when compiling your own executable using `hdf5.hpp`,
-not when using DSBO's Python functionality:
+These requirements apply when integrating `hdf5.hpp` into your own application,
+not when using DSBO's Python functionality or running the repository's
+self-contained native tests:
 
 - C++17 compiler and your own HDF5 development headers/libraries.
 - **HDF5 >=2.0 built with `HDF5_ENABLE_THREADSAFE=ON`.** The actual loaded library
   is checked, not just the build headers.
-- CMake for the provided standalone examples/tests, or an equivalent build setup.
+- Your preferred build system. Adopters do not need DSBO's repository CMake files.
 
 DSBO's Python extension is not an HDF5 development SDK for native applications.
 Do not link against it or h5py's private libraries. DSBO itself does not import
@@ -66,29 +67,75 @@ different threads. Coordinate writes to the same destination externally.
 
 ## Install HDF5 for standalone C++
 
-Use a suitable prebuilt thread-safe variant, or build the core C library from
-an official HDF5 source release. For example, after extracting HDF5 2.0.0:
+Use a suitable prebuilt thread-safe variant, or install a standalone SDK from
+the bundled source archives as below. This is **optional for adopters**: Python
+installation and the repository's native `check` target do not require it.
+
+### Install the bundled HDF5 and zlib sources
+
+The checkout and source distribution contain HDF5 **2.0.0** and zlib **1.3.2**
+under `cpp/vendor/`. The following Unix/macOS commands install both into a
+user-selected prefix, with no dependency-source downloads or `sudo`. They
+require CMake >=3.26, C/C++ compilers, and a build tool such as Make or Ninja.
+Compare the archive hashes with `cpp/vendor/README.md` before extracting:
 
 ```bash
-cmake -S hdf5-2.0.0 -B hdf5-build \
-  -DCMAKE_INSTALL_PREFIX="$HOME/.local/hdf5-threadsafe" \
+cmake -E sha256sum cpp/vendor/hdf5-2.0.0.tar.gz cpp/vendor/zlib-1.3.2.tar.gz
+```
+
+From the repository root, first build and install static, position-independent
+zlib so that it can be linked into the shared HDF5 library:
+
+```bash
+HDF5_PREFIX="$HOME/.local/dsbo-hdf5"
+mkdir -p build/hdf5-sdk-src
+tar -xzf cpp/vendor/zlib-1.3.2.tar.gz -C build/hdf5-sdk-src
+tar -xzf cpp/vendor/hdf5-2.0.0.tar.gz -C build/hdf5-sdk-src
+
+cmake --fresh -S build/hdf5-sdk-src/zlib-1.3.2 -B build/hdf5-sdk-zlib \
+  -DCMAKE_INSTALL_PREFIX="$HDF5_PREFIX" \
+  -DCMAKE_INSTALL_LIBDIR=lib \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+  -DZLIB_BUILD_SHARED=OFF -DZLIB_BUILD_STATIC=ON \
+  -DZLIB_BUILD_TESTING=OFF -DZLIB_INSTALL=ON
+cmake --build build/hdf5-sdk-zlib --parallel 4
+cmake --install build/hdf5-sdk-zlib
+```
+
+Then build the thread-safe HDF5 core C library with DEFLATE/gzip support,
+using the zlib installation above instead of a system zlib:
+
+```bash
+cmake --fresh -S build/hdf5-sdk-src/hdf5-2.0.0 -B build/hdf5-sdk-hdf5 \
+  -DCMAKE_INSTALL_PREFIX="$HDF5_PREFIX" \
+  -DHDF5_INSTALL_LIB_DIR=lib \
+  -DCMAKE_PREFIX_PATH="$HDF5_PREFIX" -DZLIB_ROOT="$HDF5_PREFIX" \
+  -DZLIB_USE_STATIC_LIBS=ON -DHDF5_USE_ZLIB_STATIC=ON \
   -DCMAKE_BUILD_TYPE=Release \
   -DHDF5_ENABLE_THREADSAFE=ON \
-  -DHDF5_BUILD_CPP_LIB=OFF \
-  -DHDF5_BUILD_FORTRAN=OFF \
-  -DHDF5_BUILD_HL_LIB=OFF \
   -DHDF5_ENABLE_PARALLEL=OFF \
+  -DHDF5_BUILD_CPP_LIB=OFF -DHDF5_BUILD_FORTRAN=OFF \
+  -DHDF5_BUILD_HL_LIB=OFF -DHDF5_BUILD_JAVA=OFF \
+  -DHDF5_ENABLE_ZLIB_SUPPORT=ON -DHDF5_ENABLE_SZIP_SUPPORT=OFF \
+  -DHDF5_ALLOW_EXTERNAL_SUPPORT=NO \
   -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF \
-  -DBUILD_TESTING=OFF -DHDF5_BUILD_EXAMPLES=OFF
-cmake --build hdf5-build --parallel
-cmake --install hdf5-build
+  -DBUILD_TESTING=OFF -DHDF5_BUILD_EXAMPLES=OFF -DHDF5_BUILD_TOOLS=OFF
+cmake --build build/hdf5-sdk-hdf5 --parallel 4
+cmake --install build/hdf5-sdk-hdf5
 ```
 
 These flags avoid combinations HDF5 2.0 marks unsupported with thread safety.
 Disabling `HDF5_BUILD_CPP_LIB` disables HDF5's own C++ wrapper, **not** DSBO's C++
-implementation, which uses the C API. HDF5 source builds require a sufficiently
-new CMake (2.0.0 requires CMake 3.26 or newer). Optional compression/filter
-dependencies must be installed/configured separately when needed.
+implementation, which uses the C API. Other optional filters require their own
+dependencies and redistribution notices.
+
+The installation prefix contains `include/`, `lib/`, and HDF5's CMake package
+files. For an external CMake project using `find_package(HDF5 ...)`, pass
+`-DHDF5_ROOT="$HDF5_PREFIX" -DCMAKE_PREFIX_PATH="$HDF5_PREFIX"`. For pkg-config,
+add `$HDF5_PREFIX/lib/pkgconfig` to `PKG_CONFIG_PATH`. This SDK is independent of
+DSBO's Python extension and remains installed if you delete the checkout's
+`build/` directory. Use a fresh prefix when upgrading to avoid mixing versions.
 
 ## Copy the native headers
 
@@ -228,15 +275,31 @@ require corresponding mounts too. Writers close their files before successful
 task completion; downstream readers run afterwards. No SWMR, MPI, or RPC layer
 is introduced by this integration.
 
-## Local validation
+## Run the repository tests
+
+The native test/example project builds its own thread-safe HDF5 and zlib from
+the checksum-verified archives in `cpp/vendor/`, using the same dependency
+configuration as the Python extension. It needs CMake >=3.26, C/C++17 compilers,
+and Make or Ninja, but **no Python, external HDF5/zlib SDK, network access, or
+installation step**. All dependency sources, headers, and libraries stay under
+the selected build directory.
 
 ```bash
-python -m pytest tests
-cmake -S cpp -B build/native -DHDF5_ROOT="$HDF5_ROOT"
-cmake --build build/native --parallel
-ctest --test-dir build/native --output-on-failure
-python examples/cpp_container/workflow.py --executable build/native/dsbo_native_step
+cmake -S cpp -B build/native
+cmake --build build/native --target check --parallel 4
 ```
+
+The `check` target builds the native test executables and example before running
+CTest with failure output. It runs on every invocation; dependencies are only
+rebuilt when needed. After a build, you can rerun just the tests with
+`ctest --test-dir build/native --output-on-failure`. For a multi-configuration
+generator, pass `--config Release` to the build command (and `-C Release` when
+calling CTest directly).
+
+If reusing a build directory from the old external-SDK setup, configure once with
+`cmake --fresh -S cpp -B build/native` to discard its cached paths. To clean all
+native build artifacts, delete `build/native/`; no separately installed SDK is
+affected.
 
 Native compilation and execution tests run through CMake/CTest, not pytest.
 They cover multiple translation units, concurrent calls, lazy selection, VDS,
@@ -246,13 +309,18 @@ gradients, and statistics. To test a manually copied include tree, pass
 CTest also checks the runtime environment guard with controlled HDF5 query
 results: supported libraries are accepted, while old versions, non-thread-safe
 libraries, and failed version/thread-safety queries are rejected. These tests
-use the normal supported HDF5 SDK; no separate non-thread-safe build is needed.
+use the bundled dependency build; no separate non-thread-safe SDK is needed.
 
 Python tests use h5py to inspect the format independently and verify hidden
 dependency symbols, gzip/shuffle interoperability, both h5py/DSBO import orders,
 and operation without external HDF5 configuration. Running pytest does not
 require Docker or an external HDF5 SDK, and does not compile standalone C++
 executables. The container workflow above remains a manually runnable example.
+
+After installing DSBO's Python package, run its separate Python test suite with
+`python -m pytest tests`. To manually exercise the Python workflow around the
+native example, run
+`python examples/cpp_container/workflow.py --executable build/native/dsbo_native_step`.
 
 For packaging validation:
 
@@ -261,7 +329,7 @@ python -m build
 ```
 
 The default build command builds a wheel from the resulting source archive.
-Inspect the sdist for `cpp/include/`, both pinned dependency archives, and
+Inspect the sdist for `cpp/include/`, `cpp/cmake/`, both pinned dependency archives, and
 `LICENSES/`, and the wheel for SDK headers under `dsbo/utils/io/storage/include/`
 and notices under `.dist-info/licenses/LICENSES/` (the source archives must not
 be in the wheel). Install the wheel in a clean environment without HDF5 to check

@@ -353,7 +353,7 @@ np.testing.assert_array_equal(W.open_primal("test.h5"), np.arange(3.))
 
 def test_bundled_source_archives_and_notices():
     root = Path(__file__).resolve().parents[1]
-    configuration = (root / "cpp/python/CMakeLists.txt").read_text()
+    configuration = (root / "cpp/cmake/BundledHDF5.cmake").read_text()
     archives = re.findall(r'URL "[^"\n]*/vendor/([^"\n]+)"\s+URL_HASH SHA256=([0-9a-f]{64})', configuration)
     assert len(archives) == 2
     for name, checksum in archives:

@@ -1,9 +1,11 @@
-# Bundled Python-extension dependencies
+# Bundled native dependencies
 
 These are unmodified upstream source archives, not host binaries. They are
-included in source distributions and used only by `cpp/python/CMakeLists.txt`.
-Both libraries are built statically with hidden symbols; nothing is installed
-system-wide. Standalone builds in `cpp/CMakeLists.txt` use their own HDF5.
+included in source distributions. `cpp/cmake/BundledHDF5.cmake` builds them for
+both the Python extension and the Python-free C++ test/example project.
+Both libraries are built statically with hidden symbols inside the respective
+build directory; nothing is installed system-wide. Adopters can also install a
+standalone SDK from these archives as documented in `docs/guide/native_io.md`.
 
 | Archive | Upstream URL | SHA-256 |
 |---|---|---|
