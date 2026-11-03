@@ -320,7 +320,9 @@ affected.
 
 Native compilation and execution tests run through CMake/CTest, not pytest.
 They cover multiple translation units, concurrent calls, lazy selection, VDS,
-gradients, and statistics. To test a manually copied include tree, pass
+gradients, and detailed validation and numerical-statistics cases. Python tests
+cover the bindings and file-format interoperability. CI runs both suites.
+To test a manually copied include tree, pass
 `-DDSBO_SDK_INCLUDE_DIR=/path/to/dsbo-sdk/include` when configuring CMake.
 
 CTest also checks the runtime environment guard with controlled HDF5 query
@@ -359,7 +361,8 @@ HDF5/zlib linking does not remove the platform C/C++ runtime or Python ABI
 requirements: use an appropriate deployment target/build image, and inspect or
 repair release wheels with tools such as auditwheel (Linux), delocate (macOS),
 or delvewheel (Windows). A wheel built on a recent Linux distribution is not
-automatically a manylinux wheel. No CI configuration is added by this feature.
+automatically a manylinux wheel. Repository CI runs tests; release-wheel building
+and validation remain separate.
 
 ## Licensing
 

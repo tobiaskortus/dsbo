@@ -33,3 +33,15 @@ jobs:
 
       - name: Run unit tests
         run: python -m pytest tests
+
+  test-native:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build and run native tests
+        run: |
+          cmake -S cpp -B build/native -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          cmake --build build/native --target check --parallel 2

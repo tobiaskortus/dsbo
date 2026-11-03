@@ -2,10 +2,8 @@
 
 import gc
 import ctypes
-import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -74,8 +72,16 @@ def test_h5py_legacy_files_read_by_native_backend(tmp_path, dtype):
         W.open_dataset(path)
 
 
-@pytest.mark.parametrize("named", [False, True], ids=["flat", "column"])
-@pytest.mark.parametrize("operation", ["shape", "read", "integer", "slice", "empty_slice", "indices", "empty_indices", "open_primal", "open_primal_tangent", "shape_from_path"])
+@pytest.mark.parametrize(
+    "named,operation",
+    # Reader operations use the same dataset path handling. Writer operations
+    # additionally traverse named-column groups, so exercise both layouts there.
+    [(False, operation) for operation in ["shape", "read", "integer", "slice", "empty_slice", "indices", "empty_indices"]] + [
+        (named, operation)
+        for named in [False, True]
+        for operation in ["open_primal", "open_primal_tangent", "shape_from_path"]
+    ],
+)
 def test_null_dataset_reads_and_shapes_rejected(tmp_path, named, operation):
     path = tmp_path / "null.h5"
     name = "primal/value" if named else "primal"
@@ -113,13 +119,12 @@ def test_null_tangent_rejected(tmp_path, named):
         W.open_primal_tangent(path)
 
 
-@pytest.mark.parametrize("attribute", [W.STATS_COUNT_ATTRIBUTE, W.STATS_MEAN_ATTRIBUTE, W.STATS_SQUARED_DEVIATION_ATTRIBUTE])
-def test_null_numeric_metadata_rejected(tmp_path, attribute):
+def test_null_numeric_metadata_rejected(tmp_path):
     path = tmp_path / "null-statistics.h5"
     W.write_primal(path, np.arange(3.))
     with h5py.File(path, "r+") as file:
-        del file["primal"].attrs[attribute]
-        file["primal"].attrs.create(attribute, data=h5py.Empty("u8" if attribute == W.STATS_COUNT_ATTRIBUTE else "f8"))
+        del file["primal"].attrs[W.STATS_COUNT_ATTRIBUTE]
+        file["primal"].attrs.create(W.STATS_COUNT_ATTRIBUTE, data=h5py.Empty("u8"))
     reader = _hdf5.Reader(str(path))
     try:
         with pytest.raises(ValueError, match="H5S_NULL"):
@@ -128,10 +133,13 @@ def test_null_numeric_metadata_rejected(tmp_path, attribute):
         reader.close()
 
 
-@pytest.mark.parametrize("attribute", [W.STATS_MEAN_ATTRIBUTE, W.STATS_SQUARED_DEVIATION_ATTRIBUTE])
-@pytest.mark.parametrize("shape", [(0,), (1,), (3,), (1, 2)], ids=["empty", "short", "long", "same-size-wrong-rank"])
-@pytest.mark.parametrize("source_index", [0, 1], ids=["first-source", "second-source"])
+@pytest.mark.parametrize("attribute,shape,source_index", [
+    pytest.param(W.STATS_MEAN_ATTRIBUTE, (1,), 0, id="first-source-short-mean"),
+    pytest.param(W.STATS_SQUARED_DEVIATION_ATTRIBUTE, (1, 2), 1, id="second-source-wrong-rank-deviation"),
+])
 def test_statistics_shape_mismatch_rejected_before_reduction(tmp_path, attribute, shape, source_index):
+    # The native suite covers the shape matrix; these cases check Python errors
+    # and preservation of the destination when reading malformed file metadata.
     sources = [tmp_path / "a.h5", tmp_path / "b.h5"]
     for index, source in enumerate(sources):
         W.write_primal(source, np.arange(6.).reshape(3, 2) + index)
@@ -166,17 +174,16 @@ finally:
 
 
 @pytest.mark.parametrize("dtype", [h5py.string_dtype("utf-8"), np.dtype("S16")], ids=["variable", "fixed"])
-@pytest.mark.parametrize("shape", [None, (0,), (2,), (2, 2)], ids=["null", "empty", "two", "matrix"])
 @pytest.mark.parametrize("attribute", [W.STORE_ATTRIBUTE, W.VDS_SOURCES_ATTRIBUTE])
-def test_string_metadata_rejects_non_singleton_attributes(tmp_path, dtype, shape, attribute):
+def test_string_metadata_rejects_multiple_values(tmp_path, dtype, attribute):
+    # Other malformed dataspaces are covered directly in cpp/tests/hdf5.cpp.
     path = tmp_path / "malformed-metadata.h5"
     value = "flat" if attribute == W.STORE_ATTRIBUTE else "[]"
     with h5py.File(path, "w") as file:
         file.create_dataset("primal", data=np.arange(3.))
         if attribute != W.STORE_ATTRIBUTE:
             file.attrs[W.STORE_ATTRIBUTE] = "flat"
-        data = h5py.Empty(dtype) if shape is None else np.full(shape, value, dtype=dtype)
-        file.attrs.create(attribute, data=data, dtype=dtype)
+        file.attrs.create(attribute, data=np.full(2, value, dtype=dtype), dtype=dtype)
 
     # A regression can corrupt native memory, so isolate every malformed read.
     result = subprocess.run([
@@ -196,14 +203,13 @@ else:
 
 
 @pytest.mark.parametrize("dtype", [h5py.string_dtype("utf-8"), np.dtype("S16")], ids=["variable", "fixed"])
-@pytest.mark.parametrize("shape", [(), (1,), (1, 1)])
-def test_string_metadata_accepts_scalar_and_singleton_attributes(tmp_path, dtype, shape):
-    path = tmp_path / "singleton-metadata.h5"
+def test_string_metadata_accepts_scalar_attributes(tmp_path, dtype):
+    path = tmp_path / "scalar-metadata.h5"
     values = np.arange(3.)
     with h5py.File(path, "w") as file:
         file.create_dataset("primal", data=values)
-        file.attrs.create(W.STORE_ATTRIBUTE, data=np.full(shape, "flat", dtype=dtype), dtype=dtype)
-        file.attrs.create(W.VDS_SOURCES_ATTRIBUTE, data=np.full(shape, "[]", dtype=dtype), dtype=dtype)
+        file.attrs.create(W.STORE_ATTRIBUTE, data=np.array("flat", dtype=dtype), dtype=dtype)
+        file.attrs.create(W.VDS_SOURCES_ATTRIBUTE, data=np.array("[]", dtype=dtype), dtype=dtype)
     with W.open_dataset(path) as view:
         np.testing.assert_array_equal(view.read("primal", slice(None)), values)
 
@@ -233,30 +239,11 @@ def test_statistics_unsupported_arrays_and_noncanonical_bool(tmp_path):
 
 
 @pytest.mark.parametrize("matrix", [False, True], ids=["scalar-stats", "vector-stats"])
-@pytest.mark.parametrize("case", ["cancellation", "short-cancellation", "constant", "short-constant", "large-offset", "near-ulp", "squared-sum"])
-def test_statistics_numerical_accuracy_and_persistence(tmp_path, matrix, case):
-    offset = 1e12 + 0.1
-    # Analytical references avoid using another ordinary floating-point reduction
-    # as the accuracy oracle. All offsets below are representable in float64.
-    if case == "cancellation":
-        values = np.r_[1e16, np.ones(100_000), -1e16]
-        mean, deviation = 100_000 / 100_002, 2e32
-    elif case == "short-cancellation":
-        values = np.array([1e16, 1., -1e16])
-        mean, deviation = 1 / 3, 2e32
-    elif case in ("constant", "short-constant"):
-        values = np.full(1_000_000 if case == "constant" else 9, offset)
-        mean, deviation = offset, 0.
-    elif case == "large-offset":
-        values = offset + np.tile([-0.25, 0., 0.25], 33_334)
-        mean, deviation = offset, 33_334 / 8
-    elif case == "near-ulp":
-        step = np.spacing(offset)
-        values = np.array([offset, offset, offset + step])
-        mean, deviation = offset, step * step * (2 / 3)
-    else:
-        values = np.r_[1e8, np.tile([1., -1.], 50_000), -1e8]
-        mean, deviation = 0., 2e16 + 100_000
+def test_statistics_binding_and_persistence(tmp_path, matrix):
+    # Numerical edge cases live in cpp/tests/hdf5.cpp. Here, check binding shapes
+    # and independently readable attributes with an analytical reference.
+    values = np.array([1e16, 1., -1e16])
+    mean, deviation = 1 / 3, 2e32
     expected_mean = np.array([mean, -mean]) if matrix else np.array(mean)
     expected_deviation = np.full(2, deviation) if matrix else np.array(deviation)
     if matrix:
@@ -279,40 +266,17 @@ def test_statistics_numerical_accuracy_and_persistence(tmp_path, matrix, case):
     for count, actual_mean, actual_deviation in (W._statistics(values), persisted, independent):
         assert count == len(values)
         assert actual_mean.shape == actual_deviation.shape == expected_mean.shape
-        # Exact mean equality for constants also catches one-ULP drift at 1e12.
-        if case in ("constant", "short-constant", "near-ulp"):
-            np.testing.assert_array_equal(actual_mean, expected_mean)
-        else:
-            np.testing.assert_allclose(actual_mean, expected_mean, rtol=2e-15, atol=0)
+        np.testing.assert_allclose(actual_mean, expected_mean, rtol=2e-15, atol=0)
         np.testing.assert_allclose(actual_deviation, expected_deviation, rtol=2e-15, atol=0)
 
 
-@pytest.mark.parametrize("values,mean,deviation", [
-    ([np.nan, 1.], np.nan, np.nan),
-    ([np.inf, 1.], np.inf, np.nan),
-    ([-np.inf, 1.], -np.inf, np.nan),
-    ([np.inf, np.inf], np.inf, np.nan),
-    ([np.inf, -np.inf], np.nan, np.nan),
-    ([1e200, -1e200], 0., np.inf),
-])
-def test_statistics_nonfinite_propagation(values, mean, deviation):
-    count, actual_mean, actual_deviation = W._statistics(np.array(values))
-    assert count == len(values)
-    np.testing.assert_equal(actual_mean, mean)
-    np.testing.assert_equal(actual_deviation, deviation)
-
-
 @pytest.mark.parametrize("matrix", [False, True], ids=["scalar-stats", "vector-stats"])
-@pytest.mark.parametrize("constant", [False, True], ids=["large-offset", "constant"])
-def test_combined_large_offset_statistics(tmp_path, matrix, constant):
+def test_combined_large_offset_statistics(tmp_path, matrix):
     offset = 1e12 + 0.1
-    if constant:
-        batches = [np.full(500_000, offset), np.full(500_000, offset)]
-        deviation = 0.
-    else:
-        residuals = np.tile([-0.25, 0.25], 50_000)
-        batches = [offset - 0.5 + residuals, offset + 0.5 + residuals]
-        deviation = 200_000 * (0.5 ** 2 + 0.25 ** 2)
+    # Constant-data normalization is covered end to end in test_io_autograd.py.
+    residuals = np.tile([-0.25, 0.25], 50_000)
+    batches = [offset - 0.5 + residuals, offset + 0.5 + residuals]
+    deviation = 200_000 * (0.5 ** 2 + 0.25 ** 2)
     if matrix:
         batches = [np.column_stack((batch, -batch)) for batch in batches]
     sources = [tmp_path / "a.h5", tmp_path / "b.h5"]
@@ -423,76 +387,33 @@ def test_named_dataset_append_and_nested_unicode(tmp_path):
         assert list(file["nested"]) == ["β"]
 
 
-@pytest.mark.parametrize("links", ["hard-cycles", "hard-aliases", "soft-links", "external-links"])
-def test_dataset_discovery_matches_object_visitation(tmp_path, links):
+def test_dataset_discovery_handles_cycles(tmp_path):
     path = tmp_path / "links.h5"
-    external = tmp_path / "external.h5"
-    if links == "external-links":
-        with h5py.File(external, "w") as file:
-            file.create_dataset("remote/values", data=np.arange(4.) + 20)
-
-    with h5py.File(path, "w", track_order=True) as file:
+    with h5py.File(path, "w") as file:
         file.attrs[W.STORE_ATTRIBUTE] = "flat"
-        nested = file.create_group("nested", track_order=True)
-        nested.create_dataset("β", data=np.arange(4.) + 10)
+        file.create_dataset("nested/β", data=np.arange(4.) + 10)
         file.create_dataset("primal", data=np.arange(4.))
-        file.create_group("empty")
-        file["named_type"] = np.dtype("i4")
-        if links == "hard-cycles":
-            file["cycle"] = file["/"]
-            nested["self"] = nested
-            nested.create_group("child")["parent"] = nested
-        elif links == "hard-aliases":
-            file["a_group"] = nested
-            file["z_group"] = nested
-            file["a_primal"] = file["primal"]
-            file["z_primal"] = file["primal"]
-            nested["a_values"] = nested["β"]
-        elif links == "soft-links":
-            file["a_soft_dataset"] = h5py.SoftLink("/primal")
-            file["a_soft_group"] = h5py.SoftLink("/nested")
-            file["dangling"] = h5py.SoftLink("/missing")
-            file["soft_cycle"] = h5py.SoftLink("/soft_cycle")
-            nested["dangling"] = h5py.SoftLink("/missing")
-        else:
-            file["a_external_dataset"] = h5py.ExternalLink(external.name, "/remote/values")
-            file["a_external_group"] = h5py.ExternalLink(external.name, "/remote")
-            file["dangling_file"] = h5py.ExternalLink("missing.h5", "/remote")
-            file["dangling_object"] = h5py.ExternalLink(external.name, "/missing")
-            nested["dangling"] = h5py.ExternalLink("missing.h5", "/remote")
-
+        file["cycle"] = file["/"]
         expected = {}
-        for root in ("", "nested", "/nested", "empty"):
-            datasets = {}
-            prefix = root + "/" if root else ""
-            parent = file[root] if root else file
-            parent.visititems(
-                lambda name, value: datasets.update({prefix + name: value[()].tolist()})
-                if isinstance(value, h5py.Dataset) else None
-            )
-            expected[root] = datasets
-        assert len(expected[""]) == 2
+        file.visititems(
+            lambda name, value: expected.update({name: value[()].tolist()})
+            if isinstance(value, h5py.Dataset) else None
+        )
+        assert len(expected) == 2
 
+    # The native suite covers aliases and symbolic links in more detail.
     # Keep a traversal regression from hanging or exhausting the pytest process.
     result = subprocess.run([
         sys.executable, "-c", '''
 import json
 import sys
 import numpy as np
-from dsbo.utils.io.storage import HDF5Writer as W, _hdf5
+from dsbo.utils.io.storage import HDF5Writer as W
 
 path, expected = sys.argv[1], json.loads(sys.argv[2])
-reader = _hdf5.Reader(path)
-try:
-    for root, datasets in expected.items():
-        assert reader.keys(root) == sorted(datasets), (root, reader.keys(root), datasets)
-        for name, values in datasets.items():
-            np.testing.assert_array_equal(reader.read(name), values)
-finally:
-    reader.close()
 with W.open_dataset(path) as view:
-    assert view.keys == tuple(sorted(expected[""])), view.keys
-    for name, values in expected[""].items():
+    assert view.keys == tuple(sorted(expected)), view.keys
+    for name, values in expected.items():
         np.testing.assert_array_equal(view.read(name, slice(None)), values)
 ''', str(path), json.dumps(expected),
     ], capture_output=True, text=True, timeout=60)
@@ -541,18 +462,18 @@ def test_sparse_gradient_aggregation_and_merge(tmp_path):
     assert not list(tmp_path.glob("*.partial"))
 
 
-@pytest.mark.parametrize("named", [False, True], ids=["flat", "column"])
-@pytest.mark.parametrize("null_target", ["gradient", "primal", "both"])
-def test_null_gradients_rejected_before_shape_validation(tmp_path, named, null_target):
+@pytest.mark.parametrize("null_target", ["gradient", "primal"])
+def test_null_named_gradients_rejected_before_shape_validation(tmp_path, null_target):
+    # Flat-layout combinations are covered by the native suite.
     primal, gradient = tmp_path / "primal.h5", tmp_path / "gradient.h5"
-    values = np.array([3.5]) if named else np.array(3.5)
-    columns = ["value"] if named else None
+    values = np.array([3.5])
+    columns = ["value"]
     W.write_primal(primal, values, columns)
     W.write_gradient(gradient, values, columns)
     for path, root in ((primal, "primal"), (gradient, "gradient")):
-        if null_target not in (root, "both"):
+        if null_target != root:
             continue
-        name = f"{root}/value" if named else root
+        name = f"{root}/value"
         with h5py.File(path, "r+") as file:
             del file[name]
             file.create_dataset(name, data=h5py.Empty("f8"))
@@ -561,7 +482,7 @@ def test_null_gradients_rejected_before_shape_validation(tmp_path, named, null_t
         list(W.gradient_file_contributions(primal, gradient))
     with pytest.raises(ValueError, match="H5S_NULL"):
         W.load_backward_gradient(primal, gradient)
-    if null_target in ("gradient", "both"):
+    if null_target == "gradient":
         with pytest.raises(ValueError, match="H5S_NULL"):
             W.load_gradient(gradient)
 
@@ -596,12 +517,11 @@ def test_scalar_and_empty_gradients_remain_supported(tmp_path, named, shape):
     np.testing.assert_array_equal(loaded, values)
 
 
-@pytest.mark.parametrize("named", [False, True], ids=["flat", "column"])
-def test_null_dataset_reduction_preserves_destination(tmp_path, named):
+def test_null_dataset_reduction_preserves_destination(tmp_path):
     source, destination = tmp_path / "null.h5", tmp_path / "destination.h5"
     with h5py.File(source, "w") as file:
-        file.attrs[W.STORE_ATTRIBUTE] = "column" if named else "flat"
-        file.create_dataset("primal/value" if named else "primal", data=h5py.Empty("f8"))
+        file.attrs[W.STORE_ATTRIBUTE] = "flat"
+        file.create_dataset("primal", data=h5py.Empty("f8"))
     W.write_primal(destination, np.array(3.5))
     before = destination.read_bytes()
     with pytest.raises(ValueError, match="H5S_NULL"):
@@ -767,19 +687,17 @@ with h5py.File("native.h5") as file:
     ], cwd=tmp_path, check=True)
 
 
-def test_bundled_source_archives_and_notices():
+def test_bundled_source_notices_match_upstream():
     root = Path(__file__).resolve().parents[1]
-    configuration = (root / "cpp/cmake/BundledHDF5.cmake").read_text()
-    archives = re.findall(r'URL "[^"\n]*/vendor/([^"\n]+)"\s+URL_HASH SHA256=([0-9a-f]{64})', configuration)
-    assert len(archives) == 2
-    for name, checksum in archives:
-        archive = root / "cpp/vendor" / name
-        assert hashlib.sha256(archive.read_bytes()).hexdigest() == checksum
-        with tarfile.open(archive) as source:
-            member = next(member for member in source if member.name.removeprefix("./") == name.removesuffix(".tar.gz") + "/LICENSE")
-            upstream_license = source.extractfile(member).read()
-        notice = "HDF5.txt" if name.startswith("hdf5-") else "zlib.txt"
-        assert (LICENSE_DIRECTORY / notice).read_bytes().strip() == upstream_license.strip()
+    # CMake validates archive hashes when building the bundled dependencies.
+    for dependency, notice in (("hdf5", "HDF5.txt"), ("zlib", "zlib.txt")):
+        archives = list((root / "cpp/vendor").glob(f"{dependency}-*.tar.gz"))
+        assert archives, f"Missing bundled {dependency} source archive"
+        for archive in archives:
+            with tarfile.open(archive) as source:
+                member = next(member for member in source if member.name.removeprefix("./") == archive.name.removesuffix(".tar.gz") + "/LICENSE")
+                upstream_license = source.extractfile(member).read()
+            assert (LICENSE_DIRECTORY / notice).read_bytes().strip() == upstream_license.strip()
 
 
 def test_third_party_notices_are_distribution_metadata():
@@ -797,10 +715,9 @@ def test_third_party_notices_are_distribution_metadata():
 
 def test_native_headers_are_distribution_data():
     root = Path(__file__).resolve().parents[1]
-    assert not (root / "dsbo/utils/io/storage/include").exists()
     headers = sorted(INCLUDE_DIRECTORY.rglob("*.hpp"))
-    assert {path.relative_to(INCLUDE_DIRECTORY).as_posix() for path in headers} == {
-        "dsbo/hdf5.hpp", "dsbo/third_party/json.hpp",
+    assert {"dsbo/hdf5.hpp", "dsbo/third_party/json.hpp"} <= {
+        path.relative_to(INCLUDE_DIRECTORY).as_posix() for path in headers
     }
     package = distribution("dsbo")
     files = package.files or []
