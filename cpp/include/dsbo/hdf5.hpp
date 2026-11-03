@@ -629,6 +629,13 @@ struct Statistics {
     Array squared_deviation;
 };
 
+namespace detail {
+inline void validate_statistics(const Statistics& value) {
+    if (value.mean.shape != value.squared_deviation.shape)
+        throw std::invalid_argument("HDF5 statistics mean and squared deviation shapes must match.");
+}
+} // namespace detail
+
 inline std::optional<Statistics> statistics(ArrayView value) {
     if ((value.shape.size() != 1 && value.shape.size() != 2) || value.shape[0] == 0 || value.type.kind == Kind::complex)
         return std::nullopt;
@@ -659,6 +666,7 @@ inline std::optional<Statistics> statistics(ArrayView value) {
 
 inline std::optional<Statistics> combine_statistics(const std::vector<std::optional<Statistics>>& values) {
     if (values.empty() || std::any_of(values.begin(), values.end(), [](const auto& value) { return !value; })) return std::nullopt;
+    for (const auto& value : values) detail::validate_statistics(*value);
     auto result = *values.front();
     auto mean = result.mean.values<double>(), deviation = result.squared_deviation.values<double>();
     for (std::size_t i = 1; i < values.size(); ++i) {
@@ -708,8 +716,10 @@ inline std::optional<Statistics> read_statistics(hid_t value) {
         return std::nullopt;
     const auto count = read_array_attribute(value, count_attribute, dtype<std::uint64_t>()).values<std::uint64_t>();
     if (count.size() != 1) throw std::invalid_argument("Invalid HDF5 statistics count.");
-    return Statistics{count[0], read_array_attribute(value, mean_attribute, dtype<double>()),
-                     read_array_attribute(value, deviation_attribute, dtype<double>())};
+    Statistics result{count[0], read_array_attribute(value, mean_attribute, dtype<double>()),
+                      read_array_attribute(value, deviation_attribute, dtype<double>())};
+    validate_statistics(result);
+    return result;
 }
 
 inline void create_dataset(hid_t parent, const std::string& name, ArrayView value) {

@@ -156,6 +156,51 @@ static void test_string_attributes(const std::string& path) {
     }
 }
 
+static void test_statistics_shapes() {
+    const auto expect_rejected = [](const std::vector<std::optional<io::Statistics>>& inputs) {
+        try { io::combine_statistics(inputs); }
+        catch (const std::invalid_argument& error) {
+            const std::string message = error.what();
+            expect(message.find("statistics") != std::string::npos && message.find("shapes") != std::string::npos,
+                   "Statistics validation identifies incompatible shapes");
+            return;
+        }
+        throw std::logic_error("Incompatible statistics shapes were accepted");
+    };
+    const io::Statistics valid{2, io::Array::from<double>({2, 3}, {2}), io::Array::from<double>({2, 2}, {2})};
+    for (const auto& shape : {io::Shape{}, io::Shape{0}, io::Shape{1}, io::Shape{3}, io::Shape{1, 2}}) {
+        for (bool malformed_mean : {false, true}) {
+            auto invalid = valid;
+            (malformed_mean ? invalid.mean : invalid.squared_deviation) = io::Array(io::dtype<double>(), shape);
+            expect_rejected({invalid});
+            expect_rejected({invalid, valid});
+            expect_rejected({valid, invalid});
+        }
+    }
+    const auto scalar = io::Array::from<double>({2}, {});
+    const auto singleton = io::Array::from<double>({2}, {1});
+    expect_rejected({io::Statistics{2, scalar, singleton}});
+    expect_rejected({io::Statistics{2, scalar, scalar}, io::Statistics{2, singleton, singleton}});
+
+    for (const auto& shape : {io::Shape{}, io::Shape{2}, io::Shape{0}}) {
+        const auto array = [&](double value) {
+            return io::Array::from<double>(std::vector<double>(io::elements(shape), value), shape);
+        };
+        const io::Statistics first{2, array(2), array(2)}, second{1, array(8), array(0)};
+        const auto combined = io::combine_statistics({first, second});
+        expect(combined && combined->count == 3, "Combined statistics retain the total count");
+        expect(combined->mean.shape == shape && combined->squared_deviation.shape == shape,
+               "Scalar, vector, and zero-width statistics retain their shapes");
+        expect(combined->mean.values<double>() == array(4).values<double>() &&
+               combined->squared_deviation.values<double>() == array(26).values<double>(),
+               "Combined means and squared deviations match the complete sample");
+        const auto single = io::combine_statistics({first});
+        expect(single && single->count == first.count && single->mean.storage == first.mean.storage &&
+               single->squared_deviation.storage == first.squared_deviation.storage, "Single-input statistics are preserved");
+    }
+    expect(!io::combine_statistics({}) && !io::combine_statistics({valid, std::nullopt}), "Missing statistics remain optional");
+}
+
 int main(int argc, char** argv) {
     try {
         io::check_environment();
@@ -175,6 +220,7 @@ int main(int argc, char** argv) {
         test_dataset_discovery(path("discovery.h5"));
         test_dataspace_classes(path("dataspace-classes.h5"));
         test_null_gradients(path("null-primal.h5"), path("null-gradient.h5"));
+        test_statistics_shapes();
         const auto extended = io::Array::from<long double>({1.25L, -2.5L}, {2});
         auto swapped_type = extended.type;
         swapped_type.little_endian = !swapped_type.little_endian;

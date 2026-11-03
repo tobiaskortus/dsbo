@@ -128,6 +128,43 @@ def test_null_numeric_metadata_rejected(tmp_path, attribute):
         reader.close()
 
 
+@pytest.mark.parametrize("attribute", [W.STATS_MEAN_ATTRIBUTE, W.STATS_SQUARED_DEVIATION_ATTRIBUTE])
+@pytest.mark.parametrize("shape", [(0,), (1,), (3,), (1, 2)], ids=["empty", "short", "long", "same-size-wrong-rank"])
+@pytest.mark.parametrize("source_index", [0, 1], ids=["first-source", "second-source"])
+def test_statistics_shape_mismatch_rejected_before_reduction(tmp_path, attribute, shape, source_index):
+    sources = [tmp_path / "a.h5", tmp_path / "b.h5"]
+    for index, source in enumerate(sources):
+        W.write_primal(source, np.arange(6.).reshape(3, 2) + index)
+    with h5py.File(sources[source_index], "r+") as file:
+        del file["primal"].attrs[attribute]
+        file["primal"].attrs.create(attribute, data=np.zeros(shape))
+    destination = tmp_path / "destination.h5"
+    W.write_primal(destination, np.array([42.]))
+    before = destination.read_bytes()
+
+    # A regression can index past a native array, so keep it out of pytest's process.
+    result = subprocess.run([
+        sys.executable, "-c", '''
+import sys
+import pytest
+from dsbo.utils.io.storage import HDF5Writer as W, _hdf5
+
+sources, destination, corrupted = sys.argv[1:3], sys.argv[3], sys.argv[4]
+for inputs in (sources, [corrupted]):
+    with pytest.raises(ValueError, match="statistics.*shapes"):
+        W.reduce(inputs, destination)
+reader = _hdf5.Reader(corrupted)
+try:
+    with pytest.raises(ValueError, match="statistics.*shapes"):
+        reader.statistics("primal")
+finally:
+    reader.close()
+''', *map(str, sources), str(destination), str(sources[source_index]),
+    ], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"Child exited with {result.returncode}:\n{result.stdout}\n{result.stderr}"
+    assert destination.read_bytes() == before
+
+
 @pytest.mark.parametrize("dtype", [h5py.string_dtype("utf-8"), np.dtype("S16")], ids=["variable", "fixed"])
 @pytest.mark.parametrize("shape", [None, (0,), (2,), (2, 2)], ids=["null", "empty", "two", "matrix"])
 @pytest.mark.parametrize("attribute", [W.STORE_ATTRIBUTE, W.VDS_SOURCES_ATTRIBUTE])
@@ -193,6 +230,32 @@ def test_statistics_unsupported_arrays_and_noncanonical_bool(tmp_path):
     W.write_primal(tmp_path / "bool.h5", values)
     with h5py.File(tmp_path / "bool.h5") as file:
         np.testing.assert_allclose(file["primal"].attrs[W.STATS_MEAN_ATTRIBUTE], values.astype(float).mean())
+
+
+@pytest.mark.parametrize("shape", [(3,), (3, 2), (3, 0)], ids=["scalar-stats", "vector-stats", "zero-width-stats"])
+def test_combined_statistics_match_concatenated_data(tmp_path, shape):
+    values = np.arange(np.prod(shape), dtype=float).reshape(shape)
+    sources = [tmp_path / "a.h5", tmp_path / "b.h5"]
+    batches = [values[:2], values[2:]]
+    for source, batch in zip(sources, batches):
+        W.write_primal(source, batch)
+    destination = tmp_path / "combined.h5"
+    W.reduce(sources, destination)
+    reader = _hdf5.Reader(str(destination))
+    try:
+        combined = reader.statistics("primal")
+    finally:
+        reader.close()
+    direct = W._combine_statistics([W._statistics(batch) for batch in batches])
+    mean = values.mean(axis=0)
+    deviation = ((values - mean) ** 2).sum(axis=0)
+    for count, actual_mean, actual_deviation in (combined, direct):
+        assert count == len(values)
+        assert actual_mean.shape == actual_deviation.shape == mean.shape
+        np.testing.assert_allclose(actual_mean, mean)
+        np.testing.assert_allclose(actual_deviation, deviation)
+    assert W._combine_statistics([]) is None
+    assert W._combine_statistics([combined, None]) is None
 
 
 @pytest.mark.parametrize("columns", [[""], ["a/a"], ["."], ["a\x00b"], ["same", "same"], [12]])
