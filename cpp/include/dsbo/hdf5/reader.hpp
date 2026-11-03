@@ -1,8 +1,8 @@
 #pragma once
 
 #include "types.hpp"
-#include "detail/core.hpp"
-#include "detail/datasets.hpp"
+#include "internal/core.hpp"
+#include "internal/datasets.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -20,13 +20,13 @@ namespace dsbo::io {
 // including close(), are serialized; unrelated readers use HDF5's own locking.
 class Reader {
     std::string path_;
-    detail::Handle file_;
+    internal::Handle file_;
     mutable std::mutex mutex_;
     void require_open() const { if (!file_) throw std::runtime_error("HDF5 reader has been closed."); }
 
     Array read_locked(const std::string& name, Selection selection) const {
-        auto value = detail::dataset(file_, name);
-        const auto physical = detail::dataset_shape(value);
+        auto value = internal::dataset(file_, name);
+        const auto physical = internal::dataset_shape(value);
         const Shape series = physical.empty() ? Shape{1} : physical;
         if (!selection.step) throw std::invalid_argument("slice step cannot be zero");
         if (selection.squeeze && selection.count != 1) throw std::invalid_argument("An integer selection requires exactly one row.");
@@ -42,22 +42,22 @@ class Reader {
         Shape output = series;
         output[0] = selection.count;
         if (selection.squeeze) output.erase(output.begin());
-        Array result(detail::dataset_dtype(value), output);
+        Array result(internal::dataset_dtype(value), output);
         if (!result.size()) return result;
         if (physical.empty()) {
-            auto scalar = detail::read_dataset(value);
+            auto scalar = internal::read_dataset(value);
             for (std::size_t i = 0; i < selection.count; ++i)
                 std::memcpy(result.storage.data() + i * result.type.size, scalar.storage.data(), result.type.size);
             return result;
         }
-        detail::Handle source(H5Dget_space(value), H5Sclose);
+        internal::Handle source(H5Dget_space(value), H5Sclose);
         Shape start(series.size(), 0), stride(series.size(), 1), count = series;
         start[0] = selection.step > 0 ? selection.start : selection.start + static_cast<std::int64_t>(selection.count - 1) * selection.step;
         stride[0] = static_cast<hsize_t>(selection.step > 0 ? selection.step : -selection.step);
         count[0] = selection.count;
-        detail::check(H5Sselect_hyperslab(source, H5S_SELECT_SET, start.data(), stride.data(), count.data(), nullptr), "Cannot select HDF5 rows.");
-        auto memory = detail::dataspace(output), type = detail::read_datatype(value, result.type);
-        detail::check(H5Dread(value, type, memory, source, H5P_DEFAULT, result.storage.data()), "Cannot read selected HDF5 rows.");
+        internal::check(H5Sselect_hyperslab(source, H5S_SELECT_SET, start.data(), stride.data(), count.data(), nullptr), "Cannot select HDF5 rows.");
+        auto memory = internal::dataspace(output), type = internal::read_datatype(value, result.type);
+        internal::check(H5Dread(value, type, memory, source, H5P_DEFAULT, result.storage.data()), "Cannot read selected HDF5 rows.");
         if (selection.step < 0) {
             const auto row_bytes = result.storage.size() / selection.count;
             for (std::size_t i = 0; i < selection.count / 2; ++i)
@@ -67,54 +67,54 @@ class Reader {
         return result;
     }
 public:
-    explicit Reader(const std::string& path) : path_(path), file_(detail::open_file(path)) { detail::sources(file_, path_); }
+    explicit Reader(const std::string& path) : path_(path), file_(internal::open_file(path)) { internal::sources(file_, path_); }
     Reader(const Reader&) = delete;
     Reader& operator=(const Reader&) = delete;
     std::string store() const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        return detail::string_attribute(file_, store_attribute).value_or("");
+        return internal::string_attribute(file_, store_attribute).value_or("");
     }
     std::vector<std::string> keys(const std::string& root = "") const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        return detail::dataset_paths(file_, root);
+        return internal::dataset_paths(file_, root);
     }
     std::vector<std::string> columns(const std::string& name = "primal") const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        if (detail::object_type(file_, name) == H5O_TYPE_DATASET) return {};
-        auto parent = detail::group(file_, name);
-        return detail::stored_columns(parent);
+        if (internal::object_type(file_, name) == H5O_TYPE_DATASET) return {};
+        auto parent = internal::group(file_, name);
+        return internal::stored_columns(parent);
     }
     std::vector<std::string> row_keys() const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        auto value = detail::dataset(file_, row_store_dataset);
-        const auto keys = detail::json_attribute<std::vector<std::string>>(value, keys_attribute);
+        auto value = internal::dataset(file_, row_store_dataset);
+        const auto keys = internal::json_attribute<std::vector<std::string>>(value, keys_attribute);
         if (!keys) throw std::invalid_argument("Row store has no dsbo_keys attribute.");
         return *keys;
     }
     Shape shape(const std::string& name) const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        auto value = detail::dataset(file_, name);
-        return detail::dataset_shape(value);
+        auto value = internal::dataset(file_, name);
+        return internal::dataset_shape(value);
     }
     DType type(const std::string& name) const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        auto value = detail::dataset(file_, name);
-        return detail::dataset_dtype(value);
+        auto value = internal::dataset(file_, name);
+        return internal::dataset_dtype(value);
     }
     std::vector<hsize_t> partition_sizes(const std::string& name) const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        auto value = detail::dataset(file_, name);
-        return detail::partition_sizes(value);
+        auto value = internal::dataset(file_, name);
+        return internal::partition_sizes(value);
     }
     std::optional<Statistics> statistics(const std::string& name) const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        auto value = detail::dataset(file_, name);
-        return detail::read_statistics(value);
+        auto value = internal::dataset(file_, name);
+        return internal::read_statistics(value);
     }
     Array read(const std::string& name) const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        auto value = detail::dataset(file_, name);
-        return detail::read_dataset(value);
+        auto value = internal::dataset(file_, name);
+        return internal::read_dataset(value);
     }
     Array read(const std::string& name, Selection selection) const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
@@ -122,8 +122,8 @@ public:
     }
     Array read_indices(const std::string& name, std::vector<std::int64_t> indices) const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();
-        auto value = detail::dataset(file_, name);
-        auto dimensions = detail::dataset_shape(value);
+        auto value = internal::dataset(file_, name);
+        auto dimensions = internal::dataset_shape(value);
         if (dimensions.empty()) dimensions = {1};
         for (auto& index : indices) {
             if (index < 0) index += dimensions[0];
@@ -131,7 +131,7 @@ public:
         }
         auto output = dimensions;
         output[0] = indices.size();
-        Array result(detail::dataset_dtype(value), output);
+        Array result(internal::dataset_dtype(value), output);
         if (!result.size()) return result;
         auto unique = indices;
         std::sort(unique.begin(), unique.end());
@@ -139,19 +139,19 @@ public:
         auto selected_shape = dimensions;
         selected_shape[0] = unique.size();
         Array selected(result.type, selected_shape);
-        if (detail::dataset_shape(value).empty()) {
-            selected = detail::read_dataset(value);
+        if (internal::dataset_shape(value).empty()) {
+            selected = internal::read_dataset(value);
         } else {
-            detail::Handle source(H5Dget_space(value), H5Sclose);
-            detail::check(H5Sselect_none(source), "Cannot initialize indexed selection.");
+            internal::Handle source(H5Dget_space(value), H5Sclose);
+            internal::check(H5Sselect_none(source), "Cannot initialize indexed selection.");
             Shape start(dimensions.size(), 0), count = dimensions;
             count[0] = 1;
             for (auto index : unique) {
                 start[0] = index;
-                detail::check(H5Sselect_hyperslab(source, H5S_SELECT_OR, start.data(), nullptr, count.data(), nullptr), "Cannot select indexed rows.");
+                internal::check(H5Sselect_hyperslab(source, H5S_SELECT_OR, start.data(), nullptr, count.data(), nullptr), "Cannot select indexed rows.");
             }
-            auto memory = detail::dataspace(selected_shape), type = detail::read_datatype(value, selected.type);
-            detail::check(H5Dread(value, type, memory, source, H5P_DEFAULT, selected.storage.data()), "Cannot read indexed HDF5 rows.");
+            auto memory = internal::dataspace(selected_shape), type = internal::read_datatype(value, selected.type);
+            internal::check(H5Dread(value, type, memory, source, H5P_DEFAULT, selected.storage.data()), "Cannot read indexed HDF5 rows.");
         }
         const auto row_bytes = selected.storage.size() / unique.size();
         for (std::size_t i = 0; i < indices.size(); ++i) {

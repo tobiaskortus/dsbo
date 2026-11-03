@@ -22,8 +22,8 @@ template<class Function> static void expect_null_rejected(Function&& function) {
 }
 
 static void create_null_dataset(hid_t parent, const std::string& name) {
-    io::detail::Handle space(H5Screate(H5S_NULL), H5Sclose);
-    io::detail::Handle value(H5Dcreate2(parent, name.c_str(), H5T_NATIVE_DOUBLE, space,
+    io::internal::Handle space(H5Screate(H5S_NULL), H5Sclose);
+    io::internal::Handle value(H5Dcreate2(parent, name.c_str(), H5T_NATIVE_DOUBLE, space,
                                       H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), H5Dclose);
 }
 
@@ -31,12 +31,12 @@ static void test_dataspace_classes(const std::string& path) {
     const auto scalar = io::Array::from<double>({3.5}, {});
     const io::Array empty(io::dtype<double>(), {0, 2});
     {
-        auto file = io::detail::open_file(path, true);
-        io::detail::create_dsbo_dataset(file, "scalar", scalar.view());
-        io::detail::create_dsbo_dataset(file, "empty", empty.view());
+        auto file = io::internal::open_file(path, true);
+        io::internal::create_dsbo_dataset(file, "scalar", scalar.view());
+        io::internal::create_dsbo_dataset(file, "empty", empty.view());
         create_null_dataset(file, "null");
-        io::detail::Handle space(H5Screate(H5S_NULL), H5Sclose);
-        io::detail::Handle attribute(H5Acreate2(file, "null_attribute", H5T_NATIVE_DOUBLE, space,
+        io::internal::Handle space(H5Screate(H5S_NULL), H5Sclose);
+        io::internal::Handle attribute(H5Acreate2(file, "null_attribute", H5T_NATIVE_DOUBLE, space,
                                              H5P_DEFAULT, H5P_DEFAULT), H5Aclose);
     }
     io::Reader reader(path);
@@ -52,8 +52,8 @@ static void test_dataspace_classes(const std::string& path) {
     expect_null_rejected([&] { reader.read("null", {0, 1, 0, false}); });
     expect_null_rejected([&] { reader.read_indices("null", {0}); });
     expect_null_rejected([&] { reader.read_indices("null", {}); });
-    auto file = io::detail::open_file(path);
-    expect_null_rejected([&] { io::detail::read_array_attribute(file, "null_attribute", io::dtype<double>()); });
+    auto file = io::internal::open_file(path);
+    expect_null_rejected([&] { io::internal::read_array_attribute(file, "null_attribute", io::dtype<double>()); });
 }
 
 static void test_null_gradients(const std::string& primal_path, const std::string& gradient_path) {
@@ -63,13 +63,13 @@ static void test_null_gradients(const std::string& primal_path, const std::strin
         io::HDF5Storage::write_primal(primal_path, scalar.view());
         io::HDF5Storage::write_gradient(gradient_path, scalar.view());
         if (null_primal) {
-            auto file = io::detail::open_file(primal_path, true, true);
-            io::detail::check(H5Ldelete(file, "primal", H5P_DEFAULT), "Cannot replace test primal");
+            auto file = io::internal::open_file(primal_path, true, true);
+            io::internal::check(H5Ldelete(file, "primal", H5P_DEFAULT), "Cannot replace test primal");
             create_null_dataset(file, "primal");
         }
         if (null_gradient) {
-            auto file = io::detail::open_file(gradient_path, true, true);
-            io::detail::check(H5Ldelete(file, "gradient", H5P_DEFAULT), "Cannot replace test gradient");
+            auto file = io::internal::open_file(gradient_path, true, true);
+            io::internal::check(H5Ldelete(file, "gradient", H5P_DEFAULT), "Cannot replace test gradient");
             create_null_dataset(file, "gradient");
             expect_null_rejected([&] { io::HDF5Storage::load_gradient(gradient_path); });
         }
@@ -82,28 +82,28 @@ static void test_dataset_discovery(const std::string& path) {
     const auto values = io::Array::from<double>({1, 2, 3}, {3});
     const auto external_path = fs::absolute(path + ".external.h5").string();
     {
-        auto external = io::detail::open_file(external_path, true);
-        io::detail::create_dsbo_dataset(external, "remote/values", values.view());
+        auto external = io::internal::open_file(external_path, true);
+        io::internal::create_dsbo_dataset(external, "remote/values", values.view());
     }
     {
-        auto file = io::detail::open_file(path, true);
-        io::detail::create_dsbo_dataset(file, "primal", values.view());
-        io::detail::create_dsbo_dataset(file, "nested/values", values.view());
-        io::detail::require_group(file, "empty");
-        io::detail::Handle type(H5Tcopy(H5T_NATIVE_INT), H5Tclose);
-        io::detail::check(H5Tcommit2(file, "named_type", type, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), "Cannot create test named datatype");
-        io::detail::check(H5Lcreate_hard(file, "/", file, "cycle", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test root cycle");
-        io::detail::check(H5Lcreate_hard(file, "nested", file, "nested/self", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test group cycle");
-        io::detail::check(H5Lcreate_hard(file, "nested", file, "a_group", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test group alias");
-        io::detail::check(H5Lcreate_hard(file, "primal", file, "a_primal", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test dataset alias");
-        io::detail::check(H5Lcreate_hard(file, "nested/values", file, "nested/a_values", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test nested alias");
-        io::detail::check(H5Lcreate_soft("/primal", file, "soft_dataset", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test soft dataset link");
-        io::detail::check(H5Lcreate_soft("/nested", file, "soft_group", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test soft group link");
-        io::detail::check(H5Lcreate_soft("/missing", file, "dangling", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test dangling link");
-        io::detail::check(H5Lcreate_soft("/soft_cycle", file, "soft_cycle", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test soft cycle");
-        io::detail::check(H5Lcreate_external(external_path.c_str(), "/remote/values", file, "external_dataset", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test external dataset link");
-        io::detail::check(H5Lcreate_external(external_path.c_str(), "/remote", file, "external_group", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test external group link");
-        io::detail::check(H5Lcreate_external((path + ".missing.h5").c_str(), "/", file, "dangling_external", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test dangling external link");
+        auto file = io::internal::open_file(path, true);
+        io::internal::create_dsbo_dataset(file, "primal", values.view());
+        io::internal::create_dsbo_dataset(file, "nested/values", values.view());
+        io::internal::require_group(file, "empty");
+        io::internal::Handle type(H5Tcopy(H5T_NATIVE_INT), H5Tclose);
+        io::internal::check(H5Tcommit2(file, "named_type", type, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), "Cannot create test named datatype");
+        io::internal::check(H5Lcreate_hard(file, "/", file, "cycle", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test root cycle");
+        io::internal::check(H5Lcreate_hard(file, "nested", file, "nested/self", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test group cycle");
+        io::internal::check(H5Lcreate_hard(file, "nested", file, "a_group", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test group alias");
+        io::internal::check(H5Lcreate_hard(file, "primal", file, "a_primal", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test dataset alias");
+        io::internal::check(H5Lcreate_hard(file, "nested/values", file, "nested/a_values", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test nested alias");
+        io::internal::check(H5Lcreate_soft("/primal", file, "soft_dataset", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test soft dataset link");
+        io::internal::check(H5Lcreate_soft("/nested", file, "soft_group", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test soft group link");
+        io::internal::check(H5Lcreate_soft("/missing", file, "dangling", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test dangling link");
+        io::internal::check(H5Lcreate_soft("/soft_cycle", file, "soft_cycle", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test soft cycle");
+        io::internal::check(H5Lcreate_external(external_path.c_str(), "/remote/values", file, "external_dataset", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test external dataset link");
+        io::internal::check(H5Lcreate_external(external_path.c_str(), "/remote", file, "external_group", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test external group link");
+        io::internal::check(H5Lcreate_external((path + ".missing.h5").c_str(), "/", file, "dangling_external", H5P_DEFAULT, H5P_DEFAULT), "Cannot create test dangling external link");
     }
     io::Reader reader(path);
     expect(reader.keys() == std::vector<std::string>({"a_group/a_values", "a_primal"}), "Discovery visits hard-linked objects once and skips symbolic links");
@@ -113,46 +113,46 @@ static void test_dataset_discovery(const std::string& path) {
     expect(reader.read("a_group/a_values").storage == values.storage, "Discovered hard-link paths remain readable");
     expect(reader.read("soft_dataset").storage == values.storage, "Named reads still resolve soft links");
     expect(reader.read("external_dataset").storage == values.storage, "Named reads still resolve external links");
-    auto file = io::detail::open_file(path);
-    expect(io::detail::dataset_paths(file) == std::vector<std::string>({"a_group/a_values", "a_primal"}),
+    auto file = io::internal::open_file(path);
+    expect(io::internal::dataset_paths(file) == std::vector<std::string>({"a_group/a_values", "a_primal"}),
            "Shared traversal handles cycles and aliases using an existing file handle");
-    expect(io::detail::dataset_paths(file, "/nested") == std::vector<std::string>({"/nested/a_values"}),
+    expect(io::internal::dataset_paths(file, "/nested") == std::vector<std::string>({"/nested/a_values"}),
            "Shared traversal preserves the root prefix");
-    expect(io::detail::dataset_paths(file, "empty").empty(), "Shared traversal supports empty groups");
+    expect(io::internal::dataset_paths(file, "empty").empty(), "Shared traversal supports empty groups");
 }
 
 static void test_string_attributes(const std::string& path) {
-    auto file = io::detail::open_file(path, true);
-    expect(!io::detail::string_attribute(file, io::store_attribute), "Missing string attributes remain optional");
+    auto file = io::internal::open_file(path, true);
+    expect(!io::internal::string_attribute(file, io::store_attribute), "Missing string attributes remain optional");
     const std::vector<std::optional<io::Shape>> shapes = {
         io::Shape{}, io::Shape{1}, io::Shape{1, 1}, io::Shape{0},
         io::Shape{2}, io::Shape{100}, io::Shape{2, 2}, std::nullopt,
     };
     for (bool variable : {false, true}) {
-        io::detail::Handle type(H5Tcopy(H5T_C_S1), H5Tclose);
+        io::internal::Handle type(H5Tcopy(H5T_C_S1), H5Tclose);
         constexpr std::size_t width = 8;
-        io::detail::check(H5Tset_size(type, variable ? H5T_VARIABLE : width), "Cannot set test string size");
+        io::internal::check(H5Tset_size(type, variable ? H5T_VARIABLE : width), "Cannot set test string size");
         for (const auto& shape : shapes) {
-            auto space = shape ? io::detail::dataspace(*shape) : io::detail::Handle(H5Screate(H5S_NULL), H5Sclose);
+            auto space = shape ? io::internal::dataspace(*shape) : io::internal::Handle(H5Screate(H5S_NULL), H5Sclose);
             const auto count = shape ? io::elements(*shape) : 0;
             if (H5Aexists(file, io::store_attribute) > 0)
-                io::detail::check(H5Adelete(file, io::store_attribute), "Cannot replace test string attribute");
-            io::detail::Handle attribute(H5Acreate2(file, io::store_attribute, type, space, H5P_DEFAULT, H5P_DEFAULT), H5Aclose);
+                io::internal::check(H5Adelete(file, io::store_attribute), "Cannot replace test string attribute");
+            io::internal::Handle attribute(H5Acreate2(file, io::store_attribute, type, space, H5P_DEFAULT, H5P_DEFAULT), H5Aclose);
             if (count) {
                 if (variable) {
                     const std::vector<const char*> values(count, "flat");
-                    io::detail::check(H5Awrite(attribute, type, values.data()), "Cannot write variable-length test strings");
+                    io::internal::check(H5Awrite(attribute, type, values.data()), "Cannot write variable-length test strings");
                 } else {
                     std::vector<char> values(count * width, '\0');
                     for (std::size_t i = 0; i < count; ++i) std::memcpy(values.data() + i * width, "flat", 4);
-                    io::detail::check(H5Awrite(attribute, type, values.data()), "Cannot write fixed-length test strings");
+                    io::internal::check(H5Awrite(attribute, type, values.data()), "Cannot write fixed-length test strings");
                 }
             }
             if (count == 1) {
-                expect(io::detail::string_attribute(file, io::store_attribute).value() == "flat", "Scalar and singleton string attributes are readable");
+                expect(io::internal::string_attribute(file, io::store_attribute).value() == "flat", "Scalar and singleton string attributes are readable");
             } else {
                 try {
-                    io::detail::string_attribute(file, io::store_attribute);
+                    io::internal::string_attribute(file, io::store_attribute);
                     throw std::logic_error("Non-singleton string attribute was accepted");
                 } catch (const std::invalid_argument& error) {
                     const std::string message = error.what();

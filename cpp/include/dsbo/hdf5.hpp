@@ -4,9 +4,9 @@
 //
 // Public entry point: array/value types, numeric conversion and statistics,
 // synchronized Reader, and stateless storage operations. Implementation layers
-// under hdf5/detail/ are internal; distribute the complete dsbo/ header tree.
+// under hdf5/internal/ are internal; distribute the complete dsbo/ header tree.
 #include "hdf5/types.hpp"
-#include "hdf5/detail/arrays.hpp"
+#include "hdf5/internal/arrays.hpp"
 #include "hdf5/statistics.hpp"
 #include "hdf5/reader.hpp"
 #include "hdf5/storage.hpp"

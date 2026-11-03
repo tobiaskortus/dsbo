@@ -26,7 +26,7 @@ inline constexpr char count_attribute[] = "dsbo_stats_count";
 inline constexpr char mean_attribute[] = "dsbo_stats_mean";
 inline constexpr char deviation_attribute[] = "dsbo_stats_squared_deviation";
 
-namespace detail {
+namespace internal {
 using Json = nlohmann::json;
 
 template<class T> inline std::optional<T> json_attribute(hid_t parent, const char* name) {
@@ -168,5 +168,5 @@ inline std::vector<hsize_t> partition_offsets(hid_t value, std::size_t count) {
     return offsets;
 }
 
-} // namespace detail
+} // namespace internal
 } // namespace dsbo::io

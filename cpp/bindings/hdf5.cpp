@@ -51,7 +51,7 @@ io::Columns selected_columns(py::handle object) {
         if (!py::isinstance<py::str>(column)) throw py::value_error("Column names must be valid, non-empty HDF5 names without '/'.");
         result.push_back(py::cast<std::string>(column));
     }
-    io::detail::validate_columns(result);
+    io::internal::validate_columns(result);
     return result;
 }
 
@@ -138,8 +138,8 @@ PYBIND11_MODULE(_hdf5, module) {
         unsigned major, minor, patch;
         bool threadsafe = false;
         native([&] {
-            io::detail::check(H5get_libversion(&major, &minor, &patch), "Cannot inspect HDF5 version.");
-            io::detail::check(H5is_library_threadsafe(&threadsafe), "Cannot inspect HDF5 thread safety.");
+            io::internal::check(H5get_libversion(&major, &minor, &patch), "Cannot inspect HDF5 version.");
+            io::internal::check(H5is_library_threadsafe(&threadsafe), "Cannot inspect HDF5 thread safety.");
         });
         return py::dict("version"_a=py::make_tuple(major, minor, patch), "threadsafe"_a=threadsafe);
     });

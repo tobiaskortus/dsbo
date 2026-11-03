@@ -186,7 +186,7 @@ dsbo-sdk/
 │   ├── statistics.hpp
 │   ├── reader.hpp
 │   ├── storage.hpp
-│   └── detail/
+│   └── internal/
 │       ├── core.hpp
 │       ├── arrays.hpp
 │       └── datasets.hpp
@@ -196,7 +196,7 @@ dsbo-sdk/
 
 `types.hpp` defines the public value types, `statistics.hpp` implements numeric
 summaries, `reader.hpp` provides synchronized readers, and `storage.hpp` provides
-the stateless storage facade. The `detail/` headers contain internal HDF5,
+the stateless storage facade. The `internal/` headers contain internal HDF5,
 array-operation, and DSBO-schema helpers; they are not a supported public API.
 Applications should normally include `<dsbo/hdf5.hpp>`.
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "types.hpp"
-#include "detail/arrays.hpp"
+#include "internal/arrays.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -10,7 +10,7 @@
 #include <vector>
 
 namespace dsbo::io {
-namespace detail {
+namespace internal {
 
 struct CompensatedSum {
     double sum = 0;
@@ -45,7 +45,7 @@ inline void validate_statistics(const Statistics& value) {
     if (value.mean.shape != value.squared_deviation.shape)
         throw std::invalid_argument("HDF5 statistics mean and squared deviation shapes must match.");
 }
-} // namespace detail
+} // namespace internal
 
 // Summarizes real numeric 1-D/2-D arrays along axis 0 using float64 values.
 // Returns nullopt for other ranks, complex input, or an empty sample axis.
@@ -55,7 +55,7 @@ inline std::optional<Statistics> statistics(ArrayView value) {
     if (value.size() && !value.data) throw std::invalid_argument("Non-empty array has no data buffer.");
     std::optional<Array> converted;
     if (value.type != dtype<double>()) {
-        converted = detail::cast(value, dtype<double>());
+        converted = internal::cast(value, dtype<double>());
         value = converted->view();
     }
     const auto read = [&](std::size_t index) {
@@ -66,7 +66,7 @@ inline std::optional<Statistics> statistics(ArrayView value) {
     const std::size_t width = value.shape.size() == 1 ? 1 : value.shape[1];
     Shape dimensions = value.shape.size() == 1 ? Shape{} : Shape{value.shape[1]};
     std::vector<double> means(width, 0), deviations(width, 0);
-    std::vector<detail::CompensatedSum> sums(width), residual_sums(width);
+    std::vector<internal::CompensatedSum> sums(width), residual_sums(width);
     for (std::size_t row = 0; row < value.shape[0]; ++row)
         for (std::size_t column = 0; column < width; ++column) sums[column].add(read(row * width + column));
     for (std::size_t column = 0; column < width; ++column) {
@@ -96,7 +96,7 @@ inline std::optional<Statistics> statistics(ArrayView value) {
 // missing summary yields nullopt; incompatible shapes raise invalid_argument.
 inline std::optional<Statistics> combine_statistics(const std::vector<std::optional<Statistics>>& values) {
     if (values.empty() || std::any_of(values.begin(), values.end(), [](const auto& value) { return !value; })) return std::nullopt;
-    for (const auto& value : values) detail::validate_statistics(*value);
+    for (const auto& value : values) internal::validate_statistics(*value);
     auto result = *values.front();
     auto mean = result.mean.values<double>(), deviation = result.squared_deviation.values<double>();
     for (std::size_t i = 1; i < values.size(); ++i) {

@@ -730,9 +730,9 @@ def test_native_headers_are_distribution_data():
         "dsbo/hdf5/statistics.hpp",
         "dsbo/hdf5/reader.hpp",
         "dsbo/hdf5/storage.hpp",
-        "dsbo/hdf5/detail/core.hpp",
-        "dsbo/hdf5/detail/arrays.hpp",
-        "dsbo/hdf5/detail/datasets.hpp",
+        "dsbo/hdf5/internal/core.hpp",
+        "dsbo/hdf5/internal/arrays.hpp",
+        "dsbo/hdf5/internal/datasets.hpp",
         "dsbo/third_party/json.hpp",
     } <= {
         path.relative_to(INCLUDE_DIRECTORY).as_posix() for path in headers

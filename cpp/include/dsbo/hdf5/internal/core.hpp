@@ -26,7 +26,7 @@ inline void check_environment() {
     (void)checked;
 }
 
-namespace detail {
+namespace internal {
 namespace fs = std::filesystem;
 
 // Resource ownership and file/group access.
@@ -323,5 +323,5 @@ inline std::vector<std::string> dataset_paths(hid_t file, const std::string& roo
     return result;
 }
 
-} // namespace detail
+} // namespace internal
 } // namespace dsbo::io

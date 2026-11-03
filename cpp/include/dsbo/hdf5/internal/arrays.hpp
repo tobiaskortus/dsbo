@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace dsbo::io {
-namespace detail {
+namespace internal {
 
 inline Array copy(ArrayView value) {
     Array result(value.type, value.shape);
@@ -188,9 +188,9 @@ inline Array add(ArrayView left, ArrayView right) {
     else add_values<long double>(result, other);
     return result;
 }
-} // namespace detail
+} // namespace internal
 
 // Returns an owning array with the requested dtype, preserving the shape.
-inline Array convert(ArrayView value, DType type) { return detail::cast(value, type); }
+inline Array convert(ArrayView value, DType type) { return internal::cast(value, type); }
 
 } // namespace dsbo::io
