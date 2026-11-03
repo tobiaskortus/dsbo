@@ -15,31 +15,27 @@
 
 ## Getting started
 
-DSBO's Python package includes its own thread-safe HDF5 implementation; no HDF5
-installation is required. A compatible prebuilt wheel needs no compiler either.
-Source and editable installations require C/C++17 compilers and automatically
-build the bundled dependencies using pip-provided CMake/Ninja. Python packaging
-still uses setuptools. Only standalone C++ users need their own thread-safe
-HDF5 >=2.0 installation. See [Native C++ HDF5 I/O](docs/guide/native_io.md) for
-details, copying native headers, and Python-free container examples.
+dsbo requires Python 3.10 or newer and is not yet available on PyPI. Install it from GitHub in an activated virtual environment:
 
-<!--
 ```sh
-pip install dsbo        #Full installation
-```
--->
-
-```
-git clone git@github.com:tobiaskortus/dsbo.git
-pip install .
+python -m pip install "git+https://github.com/tobiaskortus/dsbo.git"
 ```
 
+For development or to run the repository's examples, clone the source and install it in editable mode:
+
+```sh
+git clone https://github.com/tobiaskortus/dsbo.git
+cd dsbo
+python -m pip install -e .
 ```
-pip install git+https://github.com/tobiaskortus/dsbo
+
+See [installation instructions](docs/index.md#installation) for environment setup and optional GPU support.
+
+## Documentation
+
+The documentation in `docs/` covers workflow construction, optimization, and advanced topics. Serve it locally with:
+
+```sh
+python -m pip install -e ".[dev]"
+mkdocs serve
 ```
-
-### Extending dsbo 
-
-dsbo is designed to be easily extensible. TODO: CLI
-
-## License

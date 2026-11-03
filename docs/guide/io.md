@@ -1,158 +1,177 @@
-# I/O and Autograd
+# File Storage and Working Directories
 
-Modules in a DSBO workflow exchange data through files. Each module registers the files it reads and writes; the framework resolves these registrations to concrete paths inside the run directory, so one module's output file is the next module's input file.
+Modules exchange data through registered files. A registered handle identifies a file by its directory and name; the active working directory, candidate, and replica determine its location when the module runs. The file backend determines how array data is stored and read.
 
-There is a reason for this design. Modules run as short-lived, stateless tasks — on dask workers, in containers, or locally — so in-memory objects cannot cross task boundaries and the filesystem is the only channel every execution mode shares. Storing gradients in files as well keeps the task graph differentiable even when a backward pass runs on a different worker than the forward pass, and lets containerized modules take part in gradient-based optimization at all.
-
-Surrogates benefit the same way: the real module's registered files gather the training data automatically, and a surrogate writes its predictions into the same files, so downstream modules cannot tell the difference.
+Start with [Writing Modules](modules.md#module-with-file-io) for declaring `Input` and `Output` handles. This page explains how those handles map to files, how to read and write arrays, and how outputs from multiple tasks are combined.
 
 ## The Workdir
 
-The `Workdir` manages where modules read and write. Register every file a module uses in the module's `__init__`, then call the returned handle at runtime to get the resolved path. Modules downstream of this one would register the same `RECONSTRUCTION` file to read it:
+A workdir is the root directory for one execution's files. Open it explicitly around the workflow run:
 
 ```python
-from dsbo.modules import Module
-from dsbo.utils.io import Workdir, DefaultPaths, Input, Output
-from dsbo.utils.io.storage import HDF5File
+from dsbo.utils.io import Workdir
 
-class MyReconstruction(Module):
-    def __init__(self):
-        super().__init__()
-        self.input_file = Input(Workdir.register_file(DefaultPaths.SIMULATION, "simulation.h5"))
-        self.output_file = Output(Workdir.register_file(DefaultPaths.RECONSTRUCTION, "reco.h5"))
-
-    def __call__(self, design, **kwargs):
-        true = HDF5File.open(self.input_file(), device="cpu")
-        reco = reconstruct(true, energy_threshold=design["threshold"])
-        HDF5File.write(self.output_file(), reco)
-        return {"mse": torch.mean((reco - true) ** 2)}
+# With an existing workflow and candidate:
+with Workdir.create("files/run_001"):
+    result = workflow.run(candidate)
+    # Use intermediate files and run any backward pass inside this context.
 ```
 
-`DefaultPaths` provides common subdirectories: `SIMULATION`, `RECONSTRUCTION`, `SURROGATE`, `LOGS`, and `TRAINING_RECORDS`. A custom name like `"analysis"` can be used if additional separation is required.
+`Workdir.create()` requires a new directory by default and removes it on exit. Use `keep=True` to retain files for inspection, or `Workdir.load("files/run_001")` to reopen a retained workdir without deleting it on exit. Pass `error_if_exists=False` only when deliberately reusing a directory; it does not prevent cleanup when `keep=False`.
 
-Wrapping a registered file in `Input` or `Output` marks it as a declared input or output. The workflow validator uses these annotations to check that every input is produced by an upstream module, so misconfigured pipelines are caught before execution.
+Without an active workdir, registered paths resolve relative to the current working directory and a warning is emitted. For distributed execution, the workdir must be accessible to every worker; see [Parallelization with Dask](parallelization.md).
 
-The `Workdir.create` context manager creates a workdir on disk and makes it active for the duration of the block:
+### Organizing Files
 
-```python
-with Workdir.create("./run_001") as workdir:
-    ...   # all registered files now resolve under ./run_001
-```
+`Workdir.register_file("simulation", "showers.h5")` registers a file under the `simulation` subdirectory. Registration does not write the file; the producing module does that during execution.
 
-The subdirectory of a registered file is part of the registration itself (see above), so all files of a stage resolve below the same directory.
+Use a custom directory such as `"analysis"`, or import `DefaultPaths` from `dsbo.utils.io` for the predefined `SIMULATION`, `RECONSTRUCTION`, `SURROGATE`, `LOGS`, and `TRAINING_RECORDS` directories.
 
-!!! note "Subdirectories"
-
-    The framework creates additional subdirectories inside the active workdir on its own, e.g.
-
-    - batch execution scopes every candidate into its own `batch_<i>` directory,
-    - surrogate training collects its training data under `surrogate_training`.
-
-    While such a scope is active, registered files resolve below it. Depending on the implemented algorithms, additional subdirectories to scope and organize data might be beneficial — use `with Workdir.create_subdir(...)` for this.
-
-!!! note "Running without a workdir"
-
-    If no workdir is active, registered paths resolve relative to the current working directory and a warning is emitted. Open a workdir around your workflow runs.
+The framework adds scopes where needed: multi-candidate batches use `batch_<i>` directories, batch-fused stages use `batch_reduce`, and surrogate training uses `surrogate_training`. You can add your own scope with `Workdir.create_subdir(...)`; registered files resolve below it until that context exits.
 
 ## Resolving Paths
 
-A registered file is not a string but a callable. Calling it returns the path for the current execution context, which the framework sets while the workflow runs:
+Register a handle once, then call it when the file is needed. For example, given `out = Workdir.register_file("simulation", "out.h5")`, the active context determines the resolved path:
 
 | Context | Result of `out()` |
 |---|---|
-| Plain run | `<root>/simulation/out.npz` |
-| Replica *i* active | `<root>/simulation/out_2.npz` — the replica index is appended to the filename |
-| Batch subdirectory active | `<root>/batch_3/simulation/out.npz` — one subdirectory per candidate |
+| No candidate or replica scope | `<root>/simulation/out.h5` |
+| Replica 2 | `<root>/simulation/out_2.h5` |
+| Candidate 3 in a multi-candidate batch | `<root>/batch_3/simulation/out.h5` |
+| Candidate 3, replica 2 | `<root>/batch_3/simulation/out_2.h5` |
 
-By default each replica gets its own copy of a file (`unique_filename=True`). Pass `unique_filename=False` to register a file that all replicas share, such as a common design input.
+Candidate and replica indices are zero-based. A single-candidate batch does not add a `batch_0` directory.
 
-Scripts can set the context explicitly with the same context managers the framework uses:
-
-```python
-with Workdir.use_file_suffix("2"):
-    out()   # <root>/simulation/out_2.npz — resolve as replica 2
-```
-
-## Storage Backends
-
-A single **file backend** decides the format — how arrays, gradients, and replica reductions are written to and read from disk — keeping the whole workflow consistent without any module knowing about it.
-
-The default backend uses the HDF5 format (`HDF5File`), storing arrays as HDF5 datasets.
-The format is widely supported and inspectable with standard tools.
-
-For convenience a header-only C++ implementation is provided for workflow steps using C++ code.
-The same implementation is used in DSBO via pybind11, such that the functionality is always in sync.
-See [Native C++ HDF5 I/O](native_io.md) for installation, native builds, and Python-free container workflow steps.
-
-If other file backends are required, the interface `dsbo.utils.io.storage.AutogradFileInterface` can be implemented and activated as such:
+The workflow manages these scopes automatically. The equivalent manual scopes illustrate how directory names and filename suffixes compose:
 
 ```python
-import dsbo
-from myproject.storage import ROOTFile
+from dsbo.utils.io import DefaultPaths, Workdir
 
-with dsbo.config.use(file_backend=ROOTFile):
-    ...   # all reads and writes now use the ROOTFile backend
+out = Workdir.register_file(DefaultPaths.SIMULATION, "out.h5")
+
+with Workdir.create("files/path_example"):
+    print(out())  # files/path_example/simulation/out.h5
+    with Workdir.create_subdir("validation"):
+        with Workdir.use_file_suffix("2"):
+            print(out())  # files/path_example/validation/simulation/out_2.h5
 ```
 
-The backend is also applied to *filenames*: registered files whose extension matches a known backend format (`.h5`, `.hdf5`)
-are transparently rewritten to the active backend's default extension.
-Registering `results.hdf5` under the default `HDF5File` backend resolves to `results.h5`.
-Analogously, if a different file backend is to be used, e.g., your own ROOT implementation, the filename changes automatically to `results.root` —
-provided the file extension is listed in `reducible_extensions()` — so modules stay backend-agnostic while files on disk are always consistent.
-Unrelated extensions (`.npz`, `.json`, ...) pass through unchanged.
+Resolve handles inside `__call__` or `backward`, not in the module constructor. A cached filename would keep pointing to the original location when the same module runs for another candidate or replica.
 
-## Combining Replica Outputs
+By default, `unique_filename=True` adds replica suffixes. Register a file with `unique_filename=False` to suppress those suffixes, for example for an input shared by replicas. Candidate subdirectories still apply; this option does not share a file across candidates or coordinate concurrent writes.
 
-Replicas write to per-replica files (the suffix resolution in [Resolving Paths](#resolving-paths)). Whenever a module's input is written by multiple upstream tasks — a fan-in, for instance — the framework reduces them into one file before the module reads it; the same happens for batch-fused stages. Custom pipelines can call `reduce_registered_file(sources, destination)` from `dsbo.utils.io.reduce` directly.
+### Checking Dependencies
 
-Reduction is **virtual**: the destination does not copy the source data. For HDF5 it contains virtual datasets (VDS) referencing the sources plus a manifest and per-partition row counts. Reads of the reduced file therefore resolve lazily through the sources, so no data is duplicated on disk.
+File declarations describe what tasks read and write, but do not establish execution order. Connect producers and consumers in the workflow with `>>`; see [Declaring Input and Output Dependencies](modules.md#declaring-input-and-output-dependencies).
 
-## File-Based Autograd
+`validate_workflow_dependencies(wf, on_error="raise")`, imported from `dsbo.workflow`, checks non-root inputs against declared outputs encountered earlier in topological order. It is a declaration check, not a check that files exist or that all required dependency edges are present.
 
-File contents participate in automatic differentiation. The storage backends share one interface, and `HDF5File` is the default choice:
+## File Backend
 
-```python
-from dsbo.utils.io.storage import HDF5File
+The active **file backend** supplies the format for framework-managed arrays, gradients, and replica reductions. A module remains backend-neutral only if it resolves that backend at runtime rather than calling a concrete format class directly.
 
-HDF5File.write(fpath, tensor)             # stores primal (and tangent, see below)
-x = HDF5File.open(fpath, device="cpu")    # returns a torch.Tensor
-```
-
-`write()` accepts a `torch.Tensor` or an explicit `(primal, tangent)` tuple of numpy arrays — the latter lets you store tangents without a forward-AD context active. What `open()` returns depends on the surrounding AD context:
-
-- **Plain evaluation** — the values as a tensor.
-- **Reverse AD** (`torch.is_grad_enabled()`) — a tensor that tracks gradients; once backward pass accumulates a gradient into it, the gradient is written back to the file automatically.
-- **Forward AD** (inside a dual-level context) — a dual tensor carrying primal and tangent, if the file was written from a dual tensor (or tuple with tangent).
-
-The gradient round-trip in both directions:
+`HDF5File` is the default backend. It stores tensors as HDF5 datasets, which can be inspected with standard HDF5 tools. To read and write a tensor directly:
 
 ```python
 import torch
 
-HDF5File.write(fpath, torch.tensor([1.0, 2.0]))
-x = HDF5File.open(fpath, device="cpu")
+from dsbo.utils.io import Workdir
+from dsbo.utils.io.storage import HDF5File
 
-loss = (x * torch.tensor([2.0, 3.0])).sum()
-loss.backward()
+samples = Workdir.register_file("simulation", "samples.h5")
 
-HDF5File.read_backward_gradient(fpath)   # tensor([2., 3.])
+with Workdir.create("files/storage_example"), torch.no_grad():
+    HDF5File.write(samples(), torch.arange(6, dtype=torch.float32).reshape(3, 2))
+    values = HDF5File.open(samples(), device="cpu")
+    print(values.shape)  # torch.Size([3, 2])
 ```
 
-Gradients are written to a sidecar file next to the primal: `results.h5` gets `results_gradient.h5`. Multiple `backward()` calls in the same pass **accumulate** into that sidecar, and the accumulated state is reset between passes. Reading a gradient for a file whose `open()` happened in a different pass raises a `RuntimeError` naming the file.
+### Selecting a Backend
 
-This is the mechanism behind "gradients flow through files": a differentiable module writes its outputs with `write()`, and its `backward()` reads the adjoint with `read_backward_gradient()` — no tensors need to be passed between tasks (see [Writing Modules](modules.md#differentiable-module-with-backward-pass)).
+The active backend is selected through `dsbo.config`:
 
-### Named Columns
+```python
+from dsbo.config import config
+from dsbo.utils.io.storage import HDF5File
+
+with config.use(file_backend=HDF5File):
+    ...   # framework-managed I/O uses this backend
+```
+
+Custom backends implement the storage interface described in [Backend Interface](#backend-interface) and can be selected the same way.
+
+Configuration does **not** redirect explicit `HDF5File.open(...)` or `HDF5File.write(...)` calls. Those always use HDF5. Inside a backend-neutral module's `__call__` or `backward`, resolve the configured class alongside the registered paths:
+
+```python
+from dsbo.config import get_active_file_backend
+
+# Inside a module with existing Input/Output declarations:
+backend = get_active_file_backend()
+values = backend.open(self.input(), device="cpu")
+backend.write(self.output(), values.square())
+```
+
+Resolve the backend at execution time, just like the file handles, because configuration can change between runs. Reads currently produce CPU tensors; move the returned tensor explicitly with `.to(device)` when computation requires another device.
+
+Registered filenames using a known backend extension are resolved with the active backend's default extension. With HDF5, for example, `"results.hdf5"` resolves to `results.h5`. Unrelated extensions remain unchanged. Registration determines a path, not how a module serializes its contents.
+
+## Combining Replica Outputs
+
+In a fan-in such as `simulation * 3 >> reconstruction`, each simulation replica writes its own output file. When `reconstruction` resolves a matching input, the framework combines those files into one input view. The consumer reads that view through its normal input handle; it does not need to enumerate the replica files.
+
+For HDF5, this operation is **concatenation**, not a sum or average:
+
+- Arrays with shapes `(100, 4)`, `(80, 4)`, and `(120, 4)` produce a view with shape `(300, 4)`.
+- Scalar datasets become a vector with one element per source.
+- Named-column datasets concatenate along each column's sample dimension.
+
+Sources are ordered by replica index, and rows within each source retain their order. The HDF5 view uses virtual datasets that reference the original files instead of duplicating their data. Keep the source files available for as long as the combined input is needed, including any backward pass.
+
+The view is built lazily when the consumer resolves its input handle. [Batch-Fused Workflow Stages](batch-fusion.md) extends this mechanism across candidates. Custom pipelines can also call `HDF5File.reduce(sources, destination)` directly, or use `get_active_file_backend().reduce(...)` for the configured backend.
+
+## File-Based Autograd
+
+Beyond the reverse-mode interface introduced in [Differentiable Workflows](autograd.md#file-based-autograd), `HDF5File.write()` accepts an explicit `(primal, tangent)` tuple of arrays. `open()` reconstructs a plain, reverse-mode, or forward-mode tensor according to the active context. Outside an active backward pass, `read_backward_gradient()` resolves the adjacent gradient sidecar; ordinary primal reads do not load that adjoint.
+
+Tangents travel with primals; reverse-mode adjoints use separate contribution files and additive aggregation. Gradient file handling is described in [Computing a Gradient Contribution](gradient-flow.md#computing-a-gradient-contribution).
+
+## Backend Interface
+
+`HDF5File` combines `AutogradFileInterface` with `HDF5Writer`. The adapter delegates primal, tangent, and gradient I/O to its `writer`; reductions and surrogate dataset operations are also exposed on the backend class.
+
+| Surface | Backend operations |
+|---|---|
+| Tensor I/O | `open(fpath, device, columns=None)`, `write(fpath, input, columns=None)` |
+| Reductions and adjoints | `reduce`, `read_backward_gradient`, `aggregate_gradients` |
+| Dataset access | `write_named_datasets`, `write_row_store`, `open_dataset`, `shape_from_path` |
+
+`open_dataset()` returns a `DatasetView` with keys, shapes, indexed reads, partition sizes, and `close()`. Its optional `statistics()` result contains count, mean, and squared deviation. Subclassing `AutogradFileInterface` alone does not supply reductions or dataset views.
+
+## Named Columns
 
 !!! warning "Experimental"
 
     Named columns are an experimental feature; the API may still change.
 
-Arrays can carry named columns: pass `columns=[...]` to `write()` (and to any `open()` to select a subset), or write a `dict[str, np.ndarray]` with `write_named_datasets()`. Columns are stored as an HDF5 group with the column list persisted in metadata, so reads reconstruct the original column order and zero-fill gradients of columns that received no gradient. For tabular results with many rows and named features, `write_row_store(fpath, {"energy": e, "cost": c})` stores an interleaved row store that surrogate training reads efficiently.
+Arrays can carry named columns: pass `columns=[...]` to `write()` and, optionally, to `open()` to select a subset. Unlike a conventional sample-first table, the column index is tensor axis 0. For example, a tensor with shape `(2, 100)` and `columns=["energy", "cost"]` stores two columns with 100 samples each.
+
+Column names and order are stored with the data. Reads reconstruct that order, and backward propagation zero-fills gradients for columns that received no gradient.
+
+There are three distinct layouts for named data:
+
+| Method | Layout and intended use |
+| --- | --- |
+| `write(..., columns=[...])` | Named columns in the autograd-aware `primal` layout; read with `open()` |
+| `write_named_datasets(fpath, datasets)` | A flat store of named arrays from a `dict[str, np.ndarray]` |
+| `write_row_store(fpath, datasets)` | Equal-length scalar feature columns stored as rows for efficient surrogate training |
+
+These layouts are not interchangeable. Dataset views expose samples first, whereas named-column tensor reads expose columns first.
 
 ## Training Datasets
 
-The pre-built surrogates turn the files a workflow writes into training data automatically — no manual dataset code is required. Under the hood, `dsbo.utils.io.datasets` provides `torch.utils.data.Dataset` wrappers that the surrogate lifecycle feeds the recorded files into:
+The pre-built surrogates assemble training datasets from workflow files automatically. The wrappers in `dsbo.utils.io.datasets` implement `torch.utils.data.Dataset`:
 
 - **Module surrogates** wrap the contract's data and conditioning files in a `ModuleSurrogateDataset`, which serves matched `(x, c)` pairs from the module's outputs and conditioning.
 - **Workflow surrogates** wrap the row-store results file together with the design matrix in a `WorkflowSurrogateDataset`. The results file is recorded automatically while the training candidates run: each task's returned metrics are appended as rows.
+
+See [Writing Surrogates](surrogates.md) for declaring the data and conditioning that these datasets use.
