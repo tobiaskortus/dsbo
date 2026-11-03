@@ -1,7 +1,7 @@
 # Native C++ HDF5 I/O
 
-DSBO's HDF5 storage implementation is header-only C++17, in
-`cpp/include/dsbo/hdf5.hpp`. Python uses the same implementation
+DSBO's HDF5 storage implementation is header-only C++17, with the public entry
+point `cpp/include/dsbo/hdf5.hpp`. Python uses the same implementation
 through pybind11. PyTorch autograd, workflow setup, path resolution, scheduling,
 and gradient contribution bookkeeping remain in Python.
 
@@ -152,6 +152,10 @@ headers and notices into your native build context; there is no Python SDK
 setup or export API.
 This is a **build/setup step**, not something workflow steps do at runtime.
 
+Copy the **complete include directory**, including `dsbo/hdf5/` and
+`dsbo/third_party/`. The umbrella header includes the implementation layers;
+copying only `hdf5.hpp` is insufficient.
+
 From the root of a source checkout:
 
 ```bash
@@ -177,9 +181,24 @@ The resulting build input contains only sources and notices:
 ```text
 dsbo-sdk/
 ├── include/dsbo/hdf5.hpp
+├── include/dsbo/hdf5/
+│   ├── types.hpp
+│   ├── statistics.hpp
+│   ├── reader.hpp
+│   ├── storage.hpp
+│   └── detail/
+│       ├── core.hpp
+│       ├── arrays.hpp
+│       └── datasets.hpp
 ├── include/dsbo/third_party/json.hpp
 └── licenses/
 ```
+
+`types.hpp` defines the public value types, `statistics.hpp` implements numeric
+summaries, `reader.hpp` provides synchronized readers, and `storage.hpp` provides
+the stateless storage facade. The `detail/` headers contain internal HDF5,
+array-operation, and DSBO-schema helpers; they are not a supported public API.
+Applications should normally include `<dsbo/hdf5.hpp>`.
 
 Do not copy host binaries, host HDF5 libraries, or Python modules into the native
 build context. Compile against the target environment's own thread-safe HDF5
@@ -198,8 +217,8 @@ native package, generated manifest, or installed `find_package(DSBOIO)` package.
 int main() {
     namespace io = dsbo::io;
     auto values = io::Array::from<double>({1.0, 2.0, 3.0}, {3});
-    io::HDF5Writer::write_primal("values.h5", values.view());
-    auto loaded = io::HDF5Writer::open_primal("values.h5");
+    io::HDF5Storage::write_primal("values.h5", values.view());
+    auto loaded = io::HDF5Storage::open_primal("values.h5");
     auto numbers = loaded.values<double>();
 }
 ```
@@ -218,11 +237,13 @@ its lifetime and must not mutate it concurrently. `Array` owns returned data;
 `values<T>()` returns a typed copy and requires a matching dtype. Use
 `convert(array.view(), dtype<T>())` for explicit numeric conversions.
 
-`HDF5Writer` also supports primal/tangent pairs, ordered named columns, named
+The native `HDF5Storage` facade supports primal/tangent pairs, ordered named columns, named
 dataset updates, row stores, gradient files, aggregation, virtual reduction,
 and virtual-concatenation adjoint redistribution. `Reader` offers dataset
 metadata, persisted statistics, full reads, sample-axis `Selection` reads,
 ordered/duplicate indexed reads, and explicit `close()`.
+Python's `HDF5Writer` and `HDF5File` keep their existing names and delegate to
+this native implementation through the extension.
 
 Numeric arrays support booleans, signed/unsigned 8/16/32/64-bit integers,
 float16/32/64, platform long double, and their supported complex equivalents.
@@ -319,7 +340,9 @@ native build artifacts, delete `build/native/`; no separately installed SDK is
 affected.
 
 Native compilation and execution tests run through CMake/CTest, not pytest.
-They cover multiple translation units, concurrent calls, lazy selection, VDS,
+They compile every first-party header independently, check mixed/repeated
+includes and multiple translation units, and run the native SDK tests against
+both the original and a copied include tree. They also cover concurrent calls, lazy selection, VDS,
 gradients, and detailed validation and numerical-statistics cases. Python tests
 cover the bindings and file-format interoperability. CI runs both suites.
 To test a manually copied include tree, pass

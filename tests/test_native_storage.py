@@ -605,6 +605,14 @@ def test_vds_relocation_and_missing_sources(tmp_path):
     (copied / "source.h5").unlink()
     with pytest.raises(FileNotFoundError, match="missing source"):
         W.open_primal(copied / "nested/reduced.h5")
+    # Reduction now enumerates through its existing HDF5 handle. It must still
+    # validate the VDS source manifest before touching an existing destination.
+    destination = tmp_path / "destination.h5"
+    W.write_primal(destination, np.array([42.]))
+    before = destination.read_bytes()
+    with pytest.raises(FileNotFoundError, match="missing source"):
+        W.reduce([copied / "nested/reduced.h5"], destination)
+    assert destination.read_bytes() == before
 
 
 def test_gradient_validation_is_metadata_only_and_untagged(tmp_path):
@@ -716,7 +724,17 @@ def test_third_party_notices_are_distribution_metadata():
 def test_native_headers_are_distribution_data():
     root = Path(__file__).resolve().parents[1]
     headers = sorted(INCLUDE_DIRECTORY.rglob("*.hpp"))
-    assert {"dsbo/hdf5.hpp", "dsbo/third_party/json.hpp"} <= {
+    assert {
+        "dsbo/hdf5.hpp",
+        "dsbo/hdf5/types.hpp",
+        "dsbo/hdf5/statistics.hpp",
+        "dsbo/hdf5/reader.hpp",
+        "dsbo/hdf5/storage.hpp",
+        "dsbo/hdf5/detail/core.hpp",
+        "dsbo/hdf5/detail/arrays.hpp",
+        "dsbo/hdf5/detail/datasets.hpp",
+        "dsbo/third_party/json.hpp",
+    } <= {
         path.relative_to(INCLUDE_DIRECTORY).as_posix() for path in headers
     }
     package = distribution("dsbo")

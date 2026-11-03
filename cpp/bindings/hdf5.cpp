@@ -146,57 +146,57 @@ PYBIND11_MODULE(_hdf5, module) {
 
     module.def("open_primal", [](const std::string& path, py::object columns) {
         const auto selected = selected_columns(columns);
-        return array(native([&] { return io::HDF5Writer::open_primal(path, selected); }));
+        return array(native([&] { return io::HDF5Storage::open_primal(path, selected); }));
     }, py::arg("path"), py::arg("columns") = py::none());
     module.def("open_primal_tangent", [](const std::string& path, py::object columns) {
         const auto selected = selected_columns(columns);
-        auto result = native([&] { return io::HDF5Writer::open_primal_tangent(path, selected); });
+        auto result = native([&] { return io::HDF5Storage::open_primal_tangent(path, selected); });
         py::object tangent = result.second ? py::object(array(std::move(*result.second))) : py::object(py::none());
         return py::make_tuple(array(std::move(result.first)), tangent);
     }, py::arg("path"), py::arg("columns") = py::none());
     module.def("write_primal", [](const std::string& path, py::handle primal, py::object columns) {
         Input input(primal);
         const auto selected = selected_columns(columns);
-        native([&] { io::HDF5Writer::write_primal(path, input.view, selected); });
+        native([&] { io::HDF5Storage::write_primal(path, input.view, selected); });
     }, py::arg("path"), py::arg("primal"), py::arg("columns") = py::none());
     module.def("write_primal_tangent", [](const std::string& path, py::handle primal, py::handle tangent, py::object columns) {
         Input p(primal), t(tangent);
         const auto selected = selected_columns(columns);
-        native([&] { io::HDF5Writer::write_primal_tangent(path, p.view, t.view, selected); });
+        native([&] { io::HDF5Storage::write_primal_tangent(path, p.view, t.view, selected); });
     }, py::arg("path"), py::arg("primal"), py::arg("tangent"), py::arg("columns") = py::none());
     module.def("write_named_datasets", [](const std::string& path, py::dict values) {
-        named_write(path, values, io::HDF5Writer::write_named_datasets);
+        named_write(path, values, io::HDF5Storage::write_named_datasets);
     });
     module.def("write_row_store", [](const std::string& path, py::dict values) {
-        named_write(path, values, io::HDF5Writer::write_row_store);
+        named_write(path, values, io::HDF5Storage::write_row_store);
     });
-    module.def("columns", [](const std::string& path) { return native([&] { return io::HDF5Writer::columns(path); }); });
-    module.def("shape_from_path", [](const std::string& path) { return native([&] { return io::HDF5Writer::shape_from_path(path); }); });
+    module.def("columns", [](const std::string& path) { return native([&] { return io::HDF5Storage::columns(path); }); });
+    module.def("shape_from_path", [](const std::string& path) { return native([&] { return io::HDF5Storage::shape_from_path(path); }); });
     module.def("load_gradient", [](const std::string& path, py::object columns) {
         const auto selected = selected_columns(columns);
-        return array(native([&] { return io::HDF5Writer::load_gradient(path, selected); }));
+        return array(native([&] { return io::HDF5Storage::load_gradient(path, selected); }));
     }, py::arg("path"), py::arg("columns") = py::none());
     module.def("load_backward_gradient", [](const std::string& primal, const std::string& gradient) {
-        return array(native([&] { return io::HDF5Writer::load_backward_gradient(primal, gradient); }));
+        return array(native([&] { return io::HDF5Storage::load_backward_gradient(primal, gradient); }));
     });
     module.def("write_gradient", [](const std::string& path, py::handle gradient, py::object columns, bool merge) {
         Input input(gradient);
         const auto selected = selected_columns(columns);
-        native([&] { io::HDF5Writer::write_gradient(path, input.view, selected, merge); });
+        native([&] { io::HDF5Storage::write_gradient(path, input.view, selected, merge); });
     }, py::arg("path"), py::arg("gradient"), py::arg("columns") = py::none(), py::kw_only(), py::arg("merge") = false);
     module.def("aggregate_gradients", [](const std::vector<std::string>& paths, const std::string& destination) {
-        native([&] { io::HDF5Writer::aggregate_gradients(paths, destination); });
+        native([&] { io::HDF5Storage::aggregate_gradients(paths, destination); });
     });
     module.def("reduce", [](const std::vector<std::string>& paths, const std::string& destination) {
-        native([&] { io::HDF5Writer::reduce(paths, destination); });
+        native([&] { io::HDF5Storage::reduce(paths, destination); });
     });
     module.def("gradient_file_contributions", [](const std::string& path, const std::string& gradient) {
-        return contributions(native([&] { return io::HDF5Writer::gradient_file_contributions(path, gradient); }));
+        return contributions(native([&] { return io::HDF5Storage::gradient_file_contributions(path, gradient); }));
     });
     module.def("gradient_contributions", [](const std::string& path, py::handle gradient, py::object columns) {
         Input input(gradient);
         const auto selected = selected_columns(columns);
-        return contributions(native([&] { return io::HDF5Writer::gradient_contributions(path, input.view, selected); }));
+        return contributions(native([&] { return io::HDF5Storage::gradient_contributions(path, input.view, selected); }));
     }, py::arg("path"), py::arg("gradient"), py::arg("columns") = py::none());
     module.def("statistics", [](py::handle value) -> py::object {
         auto owner = py::array::ensure(value);
@@ -213,7 +213,7 @@ PYBIND11_MODULE(_hdf5, module) {
                 auto parts = py::cast<py::tuple>(item);
                 Input mean(parts[1]), deviation(parts[2]);
                 const auto count = py::cast<std::uint64_t>(parts[0]);
-                inputs.push_back(io::Statistics{count, io::detail::cast(mean.view, io::dtype<double>()), io::detail::cast(deviation.view, io::dtype<double>())});
+                inputs.push_back(io::Statistics{count, io::convert(mean.view, io::dtype<double>()), io::convert(deviation.view, io::dtype<double>())});
             }
         }
         return statistics(native([&] { return io::combine_statistics(inputs); }));

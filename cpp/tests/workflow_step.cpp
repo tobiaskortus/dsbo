@@ -35,11 +35,11 @@ int main(int argc, char** argv) {
             const auto primal = io::Array::from<float>({1, 2, 3, 4}, {2, 2});
             const io::Columns primal_columns = names.empty() ? std::nullopt : io::Columns(std::vector<std::string>{"a", "b"});
             // The adjacent primal and _gradient suffix trigger implicit column alignment.
-            io::HDF5Writer::write_primal(path("input.h5"), primal.view(), primal_columns);
+            io::HDF5Storage::write_primal(path("input.h5"), primal.view(), primal_columns);
             const auto gradient = scenario == "partial" ? io::Array::from<float>({7, 11}, {1, 2}) :
                 scenario == "reordered" ? io::Array::from<float>({7, 11, 3, 5}, {2, 2}) :
                 io::Array::from<float>({3, 5, 7, 11}, {2, 2});
-            io::HDF5Writer::write_gradient(path("input_gradient.h5"), gradient.view(), columns);
+            io::HDF5Storage::write_gradient(path("input_gradient.h5"), gradient.view(), columns);
         } else if (mode == "verify") {
             io::Reader reader(path("output_gradient.h5"));
             expect(reader.columns("gradient") == names, "Backward must preserve the gradient's column order");
