@@ -70,7 +70,11 @@ File declarations describe what tasks read and write, but do not establish execu
 
 The active **file backend** supplies the format for framework-managed arrays, gradients, and replica reductions. A module remains backend-neutral only if it resolves that backend at runtime rather than calling a concrete format class directly.
 
-`HDF5File` is the default backend. It stores tensors as HDF5 datasets, which can be inspected with standard HDF5 tools. To read and write a tensor directly:
+`HDF5File` is the default backend. It stores tensors as HDF5 datasets, which can be inspected with standard HDF5 tools.
+
+For implementation details, installation requirements, and standalone C++ usage, see [Native C++ HDF5 I/O](native_io.md).
+
+To read and write a tensor directly:
 
 ```python
 import torch
