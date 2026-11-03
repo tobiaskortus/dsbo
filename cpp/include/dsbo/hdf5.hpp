@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <complex>
 #include <cstdint>
 #include <cstring>
@@ -630,6 +631,35 @@ struct Statistics {
 };
 
 namespace detail {
+struct CompensatedSum {
+    double sum = 0;
+    double correction = 0;
+
+    void add(double value) {
+        const double next = sum + value;
+        if (!std::isfinite(next)) {
+            // Do not let compensation turn infinities into NaNs through inf - inf.
+            sum = next;
+            correction = 0;
+            return;
+        }
+        // Neumaier summation also recovers small terms when a later value
+        // cancels the running sum (unlike ordinary Kahan summation).
+        correction += std::abs(sum) >= std::abs(value) ? (sum - next) + value : (value - next) + sum;
+        sum = next;
+    }
+
+    double value() const { return sum + correction; }
+
+    double divided_by(double divisor) const {
+        const double quotient = sum / divisor;
+        if (!std::isfinite(sum)) return quotient;
+        // Preserve the low part through division instead of rounding the total
+        // first, which can shift even a constant-data mean by one ULP.
+        return quotient + (std::fma(-quotient, divisor, sum) + correction) / divisor;
+    }
+};
+
 inline void validate_statistics(const Statistics& value) {
     if (value.mean.shape != value.squared_deviation.shape)
         throw std::invalid_argument("HDF5 statistics mean and squared deviation shapes must match.");
@@ -653,14 +683,29 @@ inline std::optional<Statistics> statistics(ArrayView value) {
     const std::size_t width = value.shape.size() == 1 ? 1 : value.shape[1];
     Shape dimensions = value.shape.size() == 1 ? Shape{} : Shape{value.shape[1]};
     std::vector<double> means(width, 0), deviations(width, 0);
+    std::vector<detail::CompensatedSum> sums(width), residual_sums(width);
     for (std::size_t row = 0; row < value.shape[0]; ++row)
-        for (std::size_t column = 0; column < width; ++column) means[column] += read(row * width + column);
-    for (auto& mean : means) mean /= value.shape[0];
+        for (std::size_t column = 0; column < width; ++column) sums[column].add(read(row * width + column));
+    for (std::size_t column = 0; column < width; ++column) {
+        means[column] = sums[column].divided_by(static_cast<double>(value.shape[0]));
+        sums[column] = {};
+    }
+    // Keep a centered second pass: E[x*x] - E[x]*E[x] loses small variances
+    // for large-offset data, even when its reductions are compensated.
     for (std::size_t row = 0; row < value.shape[0]; ++row)
         for (std::size_t column = 0; column < width; ++column) {
             const double delta = read(row * width + column) - means[column];
-            deviations[column] += delta * delta;
+            residual_sums[column].add(delta);
+            sums[column].add(delta * delta);
         }
+    for (std::size_t column = 0; column < width; ++column) {
+        deviations[column] = sums[column].value();
+        const double residual = residual_sums[column].value();
+        // Correct for rounding the mean, especially when the spread is near
+        // one ULP of a large offset. Clamp only finite roundoff, not NaNs/infs.
+        if (std::isfinite(deviations[column]) && std::isfinite(residual))
+            deviations[column] = std::max(0.0, deviations[column] - residual * (residual / value.shape[0]));
+    }
     return Statistics{value.shape[0], Array::from(means, dimensions), Array::from(deviations, dimensions)};
 }
 

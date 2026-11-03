@@ -232,6 +232,109 @@ def test_statistics_unsupported_arrays_and_noncanonical_bool(tmp_path):
         np.testing.assert_allclose(file["primal"].attrs[W.STATS_MEAN_ATTRIBUTE], values.astype(float).mean())
 
 
+@pytest.mark.parametrize("matrix", [False, True], ids=["scalar-stats", "vector-stats"])
+@pytest.mark.parametrize("case", ["cancellation", "short-cancellation", "constant", "short-constant", "large-offset", "near-ulp", "squared-sum"])
+def test_statistics_numerical_accuracy_and_persistence(tmp_path, matrix, case):
+    offset = 1e12 + 0.1
+    # Analytical references avoid using another ordinary floating-point reduction
+    # as the accuracy oracle. All offsets below are representable in float64.
+    if case == "cancellation":
+        values = np.r_[1e16, np.ones(100_000), -1e16]
+        mean, deviation = 100_000 / 100_002, 2e32
+    elif case == "short-cancellation":
+        values = np.array([1e16, 1., -1e16])
+        mean, deviation = 1 / 3, 2e32
+    elif case in ("constant", "short-constant"):
+        values = np.full(1_000_000 if case == "constant" else 9, offset)
+        mean, deviation = offset, 0.
+    elif case == "large-offset":
+        values = offset + np.tile([-0.25, 0., 0.25], 33_334)
+        mean, deviation = offset, 33_334 / 8
+    elif case == "near-ulp":
+        step = np.spacing(offset)
+        values = np.array([offset, offset, offset + step])
+        mean, deviation = offset, step * step * (2 / 3)
+    else:
+        values = np.r_[1e8, np.tile([1., -1.], 50_000), -1e8]
+        mean, deviation = 0., 2e16 + 100_000
+    expected_mean = np.array([mean, -mean]) if matrix else np.array(mean)
+    expected_deviation = np.full(2, deviation) if matrix else np.array(deviation)
+    if matrix:
+        values = np.column_stack((values, -values))
+
+    path = tmp_path / "accurate-statistics.h5"
+    W.write_primal(path, values)
+    reader = _hdf5.Reader(str(path))
+    try:
+        persisted = reader.statistics("primal")
+    finally:
+        reader.close()
+    with h5py.File(path) as file:
+        attributes = file["primal"].attrs
+        independent = (
+            attributes[W.STATS_COUNT_ATTRIBUTE],
+            attributes[W.STATS_MEAN_ATTRIBUTE],
+            attributes[W.STATS_SQUARED_DEVIATION_ATTRIBUTE],
+        )
+    for count, actual_mean, actual_deviation in (W._statistics(values), persisted, independent):
+        assert count == len(values)
+        assert actual_mean.shape == actual_deviation.shape == expected_mean.shape
+        # Exact mean equality for constants also catches one-ULP drift at 1e12.
+        if case in ("constant", "short-constant", "near-ulp"):
+            np.testing.assert_array_equal(actual_mean, expected_mean)
+        else:
+            np.testing.assert_allclose(actual_mean, expected_mean, rtol=2e-15, atol=0)
+        np.testing.assert_allclose(actual_deviation, expected_deviation, rtol=2e-15, atol=0)
+
+
+@pytest.mark.parametrize("values,mean,deviation", [
+    ([np.nan, 1.], np.nan, np.nan),
+    ([np.inf, 1.], np.inf, np.nan),
+    ([-np.inf, 1.], -np.inf, np.nan),
+    ([np.inf, np.inf], np.inf, np.nan),
+    ([np.inf, -np.inf], np.nan, np.nan),
+    ([1e200, -1e200], 0., np.inf),
+])
+def test_statistics_nonfinite_propagation(values, mean, deviation):
+    count, actual_mean, actual_deviation = W._statistics(np.array(values))
+    assert count == len(values)
+    np.testing.assert_equal(actual_mean, mean)
+    np.testing.assert_equal(actual_deviation, deviation)
+
+
+@pytest.mark.parametrize("matrix", [False, True], ids=["scalar-stats", "vector-stats"])
+@pytest.mark.parametrize("constant", [False, True], ids=["large-offset", "constant"])
+def test_combined_large_offset_statistics(tmp_path, matrix, constant):
+    offset = 1e12 + 0.1
+    if constant:
+        batches = [np.full(500_000, offset), np.full(500_000, offset)]
+        deviation = 0.
+    else:
+        residuals = np.tile([-0.25, 0.25], 50_000)
+        batches = [offset - 0.5 + residuals, offset + 0.5 + residuals]
+        deviation = 200_000 * (0.5 ** 2 + 0.25 ** 2)
+    if matrix:
+        batches = [np.column_stack((batch, -batch)) for batch in batches]
+    sources = [tmp_path / "a.h5", tmp_path / "b.h5"]
+    for source, batch in zip(sources, batches):
+        W.write_primal(source, batch)
+    destination = tmp_path / "combined.h5"
+    W.reduce(sources, destination)
+    reader = _hdf5.Reader(str(destination))
+    try:
+        persisted = reader.statistics("primal")
+    finally:
+        reader.close()
+    direct = W._combine_statistics([W._statistics(batch) for batch in batches])
+    expected_mean = np.array([offset, -offset]) if matrix else np.array(offset)
+    expected_deviation = np.full(2, deviation) if matrix else np.array(deviation)
+    for count, actual_mean, actual_deviation in (persisted, direct):
+        assert count == sum(len(batch) for batch in batches)
+        assert actual_mean.shape == actual_deviation.shape == expected_mean.shape
+        np.testing.assert_array_equal(actual_mean, expected_mean)
+        np.testing.assert_allclose(actual_deviation, expected_deviation, rtol=2e-15, atol=0)
+
+
 @pytest.mark.parametrize("shape", [(3,), (3, 2), (3, 0)], ids=["scalar-stats", "vector-stats", "zero-width-stats"])
 def test_combined_statistics_match_concatenated_data(tmp_path, shape):
     values = np.arange(np.prod(shape), dtype=float).reshape(shape)

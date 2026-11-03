@@ -383,6 +383,30 @@ def test_file_backend_workflow_surrogate_dataset_records(file_backend):
         torch.testing.assert_close(y.mean(dim=0), torch.zeros(2), atol=1e-6, rtol=0)
 
 
+def test_workflow_surrogate_constant_large_offset_normalization(file_backend, tmp_path):
+    backend, extension = file_backend
+    sources = [tmp_path / f"candidate_{candidate}{extension}" for candidate in range(2)]
+    offset = 1e12 + 0.1
+    for source in sources:
+        backend.write_named_datasets(source, {"energy": np.full(500_000, offset)})
+    records_path = tmp_path / f"records{extension}"
+    backend.reduce(sources, records_path)
+
+    with WorkflowSurrogateDataset(
+        records_path, torch.tensor([[1.0], [2.0]]), get_active_file_backend()
+    ) as dataset:
+        with patch.object(
+            dataset._records,
+            "read_many",
+            side_effect=AssertionError("normalization scanned record values"),
+        ):
+            dataset.compute_stats()
+        torch.testing.assert_close(dataset.mean_y, torch.tensor([offset]), rtol=0, atol=0)
+        torch.testing.assert_close(dataset.std_y, torch.tensor([1e-8]), rtol=0, atol=0)
+        for _, normalized in dataset.__getitems__([0, len(dataset) - 1]):
+            torch.testing.assert_close(normalized, torch.zeros(1), rtol=0, atol=0)
+
+
 def test_nested_record_vds_merge_roundtrip():
     with TemporaryDirectory() as tempdir:
         sources = []

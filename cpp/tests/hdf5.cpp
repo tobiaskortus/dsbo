@@ -1,4 +1,5 @@
 #include <dsbo/hdf5.hpp>
+#include <cmath>
 #include <future>
 #include <iostream>
 
@@ -201,6 +202,66 @@ static void test_statistics_shapes() {
     expect(!io::combine_statistics({}) && !io::combine_statistics({valid, std::nullopt}), "Missing statistics remain optional");
 }
 
+static void test_statistics_accuracy(const std::string& path) {
+    const auto close = [](double actual, double expected) {
+        return actual == expected || (std::isnan(actual) && std::isnan(expected)) ||
+               (std::isfinite(actual) && std::isfinite(expected) && std::abs(actual - expected) <= 2e-15 * std::abs(expected));
+    };
+    const auto check = [&](const std::vector<double>& values, double mean, double squared_deviation) {
+        for (bool matrix : {false, true}) {
+            const std::size_t width = matrix ? 2 : 1;
+            std::vector<double> data;
+            data.reserve(values.size() * width);
+            for (auto value : values) {
+                data.push_back(value);
+                if (matrix) data.push_back(-value);
+            }
+            const auto array = io::Array::from<double>(data, matrix ? io::Shape{values.size(), width} : io::Shape{values.size()});
+            const auto verify = [&](const std::optional<io::Statistics>& stats) {
+                expect(stats && stats->count == values.size(), "Accurate statistics retain the count");
+                const auto shape = matrix ? io::Shape{width} : io::Shape{};
+                expect(stats->mean.shape == shape && stats->squared_deviation.shape == shape, "Accurate statistics retain their shapes");
+                const auto means = stats->mean.values<double>(), deviations = stats->squared_deviation.values<double>();
+                for (std::size_t column = 0; column < width; ++column) {
+                    const double expected_mean = column ? -mean : mean;
+                    expect(squared_deviation == 0 ? means[column] == expected_mean : close(means[column], expected_mean),
+                           "Statistics means resist cancellation and large offsets");
+                    expect(close(deviations[column], squared_deviation), "Statistics squared deviations use stable summation");
+                }
+            };
+            verify(io::statistics(array.view()));
+            io::HDF5Writer::write_primal(path, array.view());
+            verify(io::Reader(path).statistics("primal"));
+        }
+    };
+    check({1e16, 1, -1e16}, 1.0 / 3, 2e32);
+    std::vector<double> cancellation(100002, 1);
+    cancellation.front() = 1e16;
+    cancellation.back() = -1e16;
+    check(cancellation, 100000.0 / 100002, 2e32);
+    const double offset = 1e12 + 0.1;
+    check(std::vector<double>(9, offset), offset, 0);
+    check(std::vector<double>(1000000, offset), offset, 0);
+    const double step = std::nextafter(offset, std::numeric_limits<double>::infinity()) - offset;
+    check({offset, offset, offset + step}, offset, step * step * (2.0 / 3));
+    std::vector<double> varied(100002);
+    for (std::size_t i = 0; i < varied.size(); ++i) varied[i] = offset + (static_cast<int>(i % 3) - 1) * 0.25;
+    check(varied, offset, 33334.0 / 8);
+    std::vector<double> squared_sum(100002);
+    for (std::size_t i = 1; i + 1 < squared_sum.size(); ++i) squared_sum[i] = i % 2 ? 1 : -1;
+    squared_sum.front() = 1e8;
+    squared_sum.back() = -1e8;
+    check(squared_sum, 0, 2e16 + 100000);
+
+    const double infinity = std::numeric_limits<double>::infinity(), nan = std::numeric_limits<double>::quiet_NaN();
+    check({nan, 1}, nan, nan);
+    check({infinity, 1}, infinity, nan);
+    check({-infinity, 1}, -infinity, nan);
+    check({infinity, infinity}, infinity, nan);
+    check({infinity, -infinity}, nan, nan);
+    check({1e200, -1e200}, 0, infinity);
+}
+
 int main(int argc, char** argv) {
     try {
         io::check_environment();
@@ -221,6 +282,7 @@ int main(int argc, char** argv) {
         test_dataspace_classes(path("dataspace-classes.h5"));
         test_null_gradients(path("null-primal.h5"), path("null-gradient.h5"));
         test_statistics_shapes();
+        test_statistics_accuracy(path("statistics-accuracy.h5"));
         const auto extended = io::Array::from<long double>({1.25L, -2.5L}, {2});
         auto swapped_type = extended.type;
         swapped_type.little_endian = !swapped_type.little_endian;

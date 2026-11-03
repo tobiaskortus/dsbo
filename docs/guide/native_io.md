@@ -237,6 +237,17 @@ no DSBO store tag for primal/gradient operations; training dataset views and
 reductions require the store tag. Writers use explicit HDF5 2.0 format bounds
 and retain the existing compound representation for complex outputs.
 
+Statistics for nonempty real 1-D and 2-D arrays use compensated summation for
+the mean and a corrected, centered second pass for the sum of squared deviations.
+They retain the existing float64 attribute format and are used for surrogate
+normalization. Files written with the earlier sequential-summation implementation
+may contain inaccurate statistics, particularly for cancellation or large-offset
+data. Updating DSBO does not repair existing attributes: recompute them from the
+underlying arrays by rewriting the source datasets with the updated writer, then
+rebuild any virtual reductions. Reducing files with stale attributes alone does
+not repair their statistics. Rebuild native workflow executables using the updated
+headers as well as updating the Python extension.
+
 External tools reading DSBO outputs must use **HDF5 >=2.0**, including the HDF5
 library used by h5py. Older HDF5 versions are outside the supported environment.
 
