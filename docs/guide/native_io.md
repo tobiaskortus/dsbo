@@ -15,6 +15,9 @@ private, statically linked copies of thread-safe **HDF5 2.0.0** and **zlib 1.3.2
 including DEFLATE/gzip support. Their symbols are hidden so DSBO can coexist with
 packages such as h5py that load different HDF5/zlib libraries.
 
+The bundled Python backend **does not support LZF compression**. Use uncompressed
+or DEFLATE/gzip-compressed datasets when preparing input files for DSBO.
+
 - When a compatible prebuilt wheel is available, pip installs it without needing
   a compiler, CMake, or HDF5 on the user's machine.
 - Source and editable installs require C and C++17 compilers. Pip supplies the
@@ -233,6 +236,9 @@ columns on the final axis. Ordinary native `/primal` and `/gradient` files need
 no DSBO store tag for primal/gradient operations; training dataset views and
 reductions require the store tag. Writers use explicit HDF5 2.0 format bounds
 and retain the existing compound representation for complex outputs.
+
+External tools reading DSBO outputs must use **HDF5 >=2.0**, including the HDF5
+library used by h5py. Older HDF5 versions are outside the supported environment.
 
 ## Python-free container example
 
