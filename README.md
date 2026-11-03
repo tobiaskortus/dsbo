@@ -15,23 +15,27 @@
 
 ## Getting started
 
-<!--
+dsbo requires Python 3.10 or newer and is not yet available on PyPI. Install it from GitHub in an activated virtual environment:
+
 ```sh
-pip install dsbo        #Full installation
-```
--->
-
-```
-git clone git@github.com:tobiaskortus/dsbo.git
-pip install .
+python -m pip install "git+https://github.com/tobiaskortus/dsbo.git"
 ```
 
+For development or to run the repository's examples, clone the source and install it in editable mode:
+
+```sh
+git clone https://github.com/tobiaskortus/dsbo.git
+cd dsbo
+python -m pip install -e .
 ```
-pip install git+https://github.com/tobiaskortus/dsbo
+
+See [installation instructions](docs/index.md#installation) for environment setup and optional GPU support.
+
+## Documentation
+
+The documentation in `docs/` covers workflow construction, optimization, and advanced topics. Serve it locally with:
+
+```sh
+python -m pip install -e ".[dev]"
+mkdocs serve
 ```
-
-### Extending dsbo 
-
-dsbo is designed to be easily extensible. TODO: CLI
-
-## License
