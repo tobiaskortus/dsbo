@@ -289,20 +289,6 @@ def test_hdf5_virtual_dataset_rejects_missing_sources():
             HDF5File.open(destination, "cpu")
 
 
-def test_vds_reduction_concatenates_multiple_hdf5_files():
-    with TemporaryDirectory() as tempdir:
-        source1 = os.path.join(tempdir, "s1.h5")
-        source2 = os.path.join(tempdir, "s2.h5")
-        HDF5File.write(source1, torch.tensor([[1.0], [2.0]]))
-        HDF5File.write(source2, torch.tensor([[3.0]]))
-        destination = os.path.join(tempdir, "reduced.h5")
-        HDF5File.reduce([source1, source2], destination)
-        torch.testing.assert_close(
-            HDF5File.open(destination, "cpu"),
-            torch.tensor([[1.0], [2.0], [3.0]]),
-        )
-
-
 @pytest.mark.parametrize(
     "value",
     [

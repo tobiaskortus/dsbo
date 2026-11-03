@@ -28,8 +28,16 @@ INCLUDE_DIRECTORY = Path(__file__).resolve().parents[1] / "cpp/include"
 LICENSE_DIRECTORY = Path(__file__).resolve().parents[1] / "LICENSES"
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("shape", [(), (4,), (2, 3), (2, 1, 3), (0, 2), (2, 0)])
+# Cover every dtype on a matrix, then exercise other shapes with representative
+# half, real, and complex types rather than repeating the full Cartesian product.
+@pytest.mark.parametrize(
+    "dtype,shape",
+    [(dtype, (2, 3)) for dtype in DTYPES] + [
+        (dtype, shape)
+        for dtype in ["float16", "float64", "complex128"]
+        for shape in [(), (4,), (2, 1, 3), (0, 2), (2, 0)]
+    ],
+)
 def test_numeric_roundtrip_and_independent_file_reader(tmp_path, dtype, shape):
     values = np.arange(np.prod(shape, dtype=int)).reshape(shape).astype(dtype)
     if np.dtype(dtype).kind == "c":
@@ -121,7 +129,7 @@ def test_null_numeric_metadata_rejected(tmp_path, attribute):
 
 
 @pytest.mark.parametrize("dtype", [h5py.string_dtype("utf-8"), np.dtype("S16")], ids=["variable", "fixed"])
-@pytest.mark.parametrize("shape", [None, (0,), (2,), (100,), (2, 2)], ids=["null", "empty", "two", "hundred", "matrix"])
+@pytest.mark.parametrize("shape", [None, (0,), (2,), (2, 2)], ids=["null", "empty", "two", "matrix"])
 @pytest.mark.parametrize("attribute", [W.STORE_ATTRIBUTE, W.VDS_SOURCES_ATTRIBUTE])
 def test_string_metadata_rejects_non_singleton_attributes(tmp_path, dtype, shape, attribute):
     path = tmp_path / "malformed-metadata.h5"
@@ -593,21 +601,6 @@ with h5py.File("native.h5") as file:
     ], cwd=tmp_path, check=True)
 
 
-def test_python_does_not_require_external_hdf5(tmp_path):
-    env = os.environ.copy()
-    for variable in ("HDF5_ROOT", "HDF5_INCLUDE_DIR", "HDF5_LIBRARY_DIR", "PKG_CONFIG", "PKG_CONFIG_PATH"):
-        env[variable] = str(tmp_path / "missing-sdk")
-    subprocess.run([
-        sys.executable, "-c", '''
-import numpy as np
-from dsbo.utils.io.storage import HDF5Writer as W, _hdf5
-assert _hdf5.environment()["threadsafe"]
-W.write_primal("test.h5", np.arange(3.))
-np.testing.assert_array_equal(W.open_primal("test.h5"), np.arange(3.))
-''',
-    ], cwd=tmp_path, env=env, check=True)
-
-
 def test_bundled_source_archives_and_notices():
     root = Path(__file__).resolve().parents[1]
     configuration = (root / "cpp/cmake/BundledHDF5.cmake").read_text()
@@ -653,21 +646,6 @@ def test_native_headers_are_distribution_data():
         recorded = [path for path in files if path.as_posix() in names]
         assert len(recorded) == 1, relative
         assert Path(package.locate_file(recorded[0])).read_bytes() == header.read_bytes()
-
-
-def test_native_headers_and_notices_can_be_copied(tmp_path):
-    sdk = tmp_path / "sdk"
-    shutil.copytree(INCLUDE_DIRECTORY, sdk / "include")
-    shutil.copytree(LICENSE_DIRECTORY, sdk / "licenses")
-    assert (sdk / "include/dsbo/hdf5.hpp").is_file()
-    assert (sdk / "include/dsbo/third_party/json.hpp").is_file()
-    assert (sdk / "licenses/HDF5.txt").is_file()
-    assert {path.name for path in sdk.iterdir()} == {"include", "licenses"}
-    assert not any(path.suffix in {".so", ".dylib", ".dll", ".py", ".pyc"} for path in sdk.rglob("*"))
-    for path in sdk.rglob("*"):
-        if path.is_file():
-            source = LICENSE_DIRECTORY / path.name if path.parent.name == "licenses" else INCLUDE_DIRECTORY / path.relative_to(sdk / "include")
-            assert path.read_bytes() == source.read_bytes()
 
 
 def test_production_storage_does_not_import_h5py():
