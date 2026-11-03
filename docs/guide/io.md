@@ -135,7 +135,7 @@ The view is built lazily when the consumer resolves its input handle. [Batch-Fus
 
 ## File-Based Autograd
 
-Beyond the reverse-mode interface introduced in [Differentiable Workflows](autograd.md#file-based-autograd), `HDF5File.write()` accepts an explicit `(primal, tangent)` tuple of arrays. `open()` reconstructs a plain, reverse-mode, or forward-mode tensor according to the active context. Outside an active backward pass, `read_backward_gradient()` resolves the adjacent gradient sidecar; ordinary primal reads do not load that adjoint.
+Beyond the reverse-mode interface introduced in [Differentiable Workflows](autograd.md#file-based-autograd), `HDF5File.write()` accepts an explicit `(primal, tangent)` tuple of arrays. `open()` reconstructs a plain, reverse-mode, or forward-mode tensor according to the active context. Outside an active backward pass, `read_backward_gradient()` resolves the adjacent gradient; ordinary primal reads do not load that adjoint.
 
 Tangents travel with primals; reverse-mode adjoints use separate contribution files and additive aggregation. Gradient file handling is described in [Computing a Gradient Contribution](gradient-flow.md#computing-a-gradient-contribution).
 
