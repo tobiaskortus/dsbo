@@ -33,7 +33,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "grpcio-tools",
+    "mkdocs>=1.6,<2",
     "pre-commit",
+    "pymdown-extensions>=10.0",
     "pytest",
 ]
 
