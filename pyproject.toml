@@ -36,7 +36,9 @@ dependencies = [
 dev = [
     "build",
     "grpcio-tools",
+    "mkdocs>=1.6,<2",
     "pre-commit",
+    "pymdown-extensions>=10.0",
     "pytest",
     "h5py>=3.16",
 ]
