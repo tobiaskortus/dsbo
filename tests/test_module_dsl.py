@@ -1,3 +1,5 @@
+from types import MappingProxyType
+
 import pytest
 
 from dsbo.modules.dsl import ModuleDslMixin, DependencyDict, dynamic, Dynamic
@@ -160,4 +162,57 @@ def test_depdict_mul_int(depdict_obj_factory):
         for v in val:
             assert v.i == i
 
+
+def test_dynamic_module_preserves_groups():
+    source, target = ModuleDslMixin(), ModuleDslMixin()
+    left = source * 3
+
+    result = left >> target * dynamic()
+
+    assert len(result.groups) == 2
+    assert result.groups[0] is left.groups[0]
+    group = result.groups[1]
+    assert group.template is target
+    assert group.count == 3
+    assert group.nodes == result.nodes - left.nodes
+    assert set(result.template_to_nodes[target]) == group.nodes
+    for node in left:
+        assert result[node][0].i == node.i
+
+
+@pytest.mark.parametrize("dynamic_outer", [False, True])
+@pytest.mark.parametrize("dynamic_inner", [False, True])
+def test_nested_replication_remaps_inner_groups(dynamic_outer, dynamic_inner):
+    target = ModuleDslMixin()
+    inner = target * 2
+    if dynamic_inner:
+        inner = ModuleDslMixin() * 2 >> target * dynamic()
+
+    result = (
+        ModuleDslMixin() * 3 >> inner * dynamic()
+        if dynamic_outer else inner * 3
+    )
+
+    groups = [group for group in result.groups if group.template is target]
+    assert len(groups) == 3
+    assert all(group.count == 2 for group in groups)
+    assert len(set().union(*(group.nodes for group in groups))) == 6
+    assert all(group.nodes <= result.nodes for group in result.groups)
+    assert all(group.nodes.isdisjoint(inner.nodes) for group in result.groups)
+    assert all(group.nodes <= inner.nodes for group in inner.groups)
+
+
+@pytest.mark.parametrize("immutable", [False, True])
+def test_resolver_mapping_is_copied(immutable):
+    source, target = ModuleDslMixin(), ModuleDslMixin()
+    mapping = {None: [target]}
+
+    class Resolver:
+        def __rrshift__(self, leaves):
+            return MappingProxyType(mapping) if immutable else mapping
+
+    result = DependencyDict({source: []}) >> Resolver()
+
+    assert result == {source: [target]}
+    assert mapping == {None: [target]}
 

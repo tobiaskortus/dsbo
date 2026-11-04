@@ -136,6 +136,7 @@ class DependencyDict(dict):
             stride = max_inner + 1 if max_inner >= 0 else 1
             start = self._replica_count
             out = {}
+            groups = []
             node_to_template: dict[ModuleDslMixin, ModuleDslMixin] = {}
             for outer_i in range(other):
                 copied = {
@@ -146,12 +147,13 @@ class DependencyDict(dict):
                     )
                     for orig in all_nodes
                 }
+                groups.extend(group.relabel(copied) for group in self.groups)
                 node_to_template.update({copy: orig for orig, copy in copied.items()})
                 for orig_k, orig_vs in self.items():
                     out[copied[orig_k]] = [copied[v] for v in orig_vs]
             self._replica_count = start + other * stride
             dd = DependencyDict(out)
-            dd.groups = list(self.groups) + [DependencyGroup(
+            dd.groups = groups + [DependencyGroup(
                 template=self,
                 count=other,
                 node_to_template=node_to_template,
@@ -191,7 +193,7 @@ class DependencyDict(dict):
             if hasattr(rhs, '__rrshift__') and not isinstance(rhs, DependencyDict):
                 cand = rhs.__rrshift__(list(self_leaves))
                 if isinstance(cand, Mapping):
-                    return dict(cand)
+                    return cand
 
             match rhs:
                 case Mapping() as m:
@@ -202,6 +204,11 @@ class DependencyDict(dict):
                     return {None: [rhs]}
 
         rhs_map = _normalize(other)
+        rhs_groups = DependencyDict._combine_groups(
+            rhs_groups,
+            rhs_map.groups if isinstance(rhs_map, DependencyDict) else [],
+        )
+        rhs_map = dict(rhs_map)
 
         # --- Auto 1:1 pairing by replica index ---
         # When both the leaves AND the RHS roots are replicated with matching
@@ -297,15 +304,21 @@ class Dynamic:
         # left -> [replica] mapping.
         if self.module is not None and self.subgraph is None:
             mapping = {}
+            node_to_template = {}
             for i, left in enumerate(left_list):
                 idx = getattr(left, 'i', None) if getattr(left, 'i', None) is not None else i
                 if self.module is None:
                     raise TypeError("Dynamic not bound to a module")
-                mapping[left] = [self.module.replicate(idx)]
-            return mapping
+                replica = self.module.replicate(idx)
+                mapping[left] = [replica]
+                node_to_template[replica] = self.module
+            result = DependencyDict(mapping)
+            result.groups = [DependencyGroup(self.module, len(left_list), node_to_template)]
+            return result
 
         elif self.subgraph is not None and self.module is None:
             mapping = {}
+            groups = []
 
             # get roots of the subgraph
             sub_keys = list(self.subgraph.keys())
@@ -314,6 +327,7 @@ class Dynamic:
             if not roots:
                 roots = sub_keys
 
+            node_to_template: dict[ModuleDslMixin, ModuleDslMixin] = {}
             for i, left in enumerate(left_list):
                 idx = getattr(left, 'i', None) if getattr(left, 'i', None) is not None else i
 
@@ -328,7 +342,11 @@ class Dynamic:
                         new_i = idx * stride + orig_i
                     else:
                         new_i = idx
-                    copied[orig] = orig.replicate(new_i)
+                    copy = orig.replicate(new_i)
+                    copied[orig] = copy
+                    node_to_template[copy] = orig
+
+                groups.extend(group.relabel(copied) for group in self.subgraph.groups)
 
                 # Patch any copied submodule's _parent to point to the
                 # corresponding copied parent (if present).
@@ -343,7 +361,10 @@ class Dynamic:
                     mapping[k_copy] = [copied[v] for v in orig_vs]
 
                 mapping[left] = [copied[r] for r in roots]
-            return mapping
+
+            result = DependencyDict(mapping)
+            result.groups = groups + [DependencyGroup(self.subgraph, len(left_list), node_to_template)]
+            return result
 
         raise TypeError("Dynamic resolver is not bound to a Module or subgraph")
 

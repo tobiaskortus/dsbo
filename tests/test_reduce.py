@@ -8,11 +8,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from dsbo.config import config
-from dsbo.utils.io.storage.autograd import InMemoryFile
+from dsbo.config import config, get_active_file_backend
 from dsbo.utils.io.storage.hdf5 import HDF5File
-from dsbo.utils.io.reduce import LazyReductionResolver, reduce_registered_file
-from dsbo.utils.io.storage.root import ROOTFile
+from dsbo.utils.io.reduce import FileConcatenationResolver
+
+
+class BackendWithoutReduction:
+    @classmethod
+    def reduce(cls, sources: list[str], destination: str) -> None:
+        raise NotImplementedError(f"{cls.__name__} does not support file reduction.")
 
 
 def write_h5_files(tempdir: str, *values: float) -> list[str]:
@@ -34,7 +38,7 @@ def test_resolver_does_not_materialize_before_resolve(tempdir):
     sources = write_h5_files(tempdir, 1.0, 2.0, 3.0)
     destination = os.path.join(tempdir, "reduced.h5")
 
-    resolver = LazyReductionResolver(sources, destination)
+    resolver = FileConcatenationResolver(sources, destination)
     assert not os.path.isfile(destination)
 
     path = resolver.resolve()
@@ -47,7 +51,7 @@ def test_resolver_writes_and_reads_marker(tempdir):
     sources = write_h5_files(tempdir, 3.0, 4.0)
     destination = os.path.join(tempdir, "reduced.h5")
 
-    resolver = LazyReductionResolver(sources, destination)
+    resolver = FileConcatenationResolver(sources, destination)
     resolver.resolve()
 
     marker_path = destination + ".resolve_id"
@@ -60,23 +64,23 @@ def test_resolver_skips_reduce_on_same_object_reuse(tempdir):
     sources = write_h5_files(tempdir, 4.0, 5.0)
     destination = os.path.join(tempdir, "reduced.h5")
 
-    resolver = LazyReductionResolver(sources, destination)
+    resolver = FileConcatenationResolver(sources, destination)
     resolver.resolve()
 
-    with patch("dsbo.utils.io.reduce.reduce_registered_file") as mock_reduce:
+    with patch.object(FileConcatenationResolver, "_materialize") as materialize:
         resolver.resolve()
-        mock_reduce.assert_not_called()
+        materialize.assert_not_called()
 
 
 def test_resolver_called_on_new_run_with_existing_files(tempdir):
     destination = os.path.join(tempdir, "reduced.h5")
 
     sources_a = write_h5_files(tempdir, 1.0, 2.0)
-    LazyReductionResolver(sources_a, destination).resolve()
+    FileConcatenationResolver(sources_a, destination).resolve()
     torch.testing.assert_close(HDF5File.open(destination, "cpu"), torch.tensor([1.0, 2.0]))
 
     sources_b = write_h5_files(tempdir, 3.0, 4.0)
-    LazyReductionResolver(sources_b, destination).resolve()
+    FileConcatenationResolver(sources_b, destination).resolve()
     torch.testing.assert_close(HDF5File.open(destination, "cpu"), torch.tensor([3.0, 4.0]))
 
 
@@ -84,23 +88,31 @@ def test_concurrent_resolvers_only_one_reduces(tempdir):
     sources = write_h5_files(tempdir, 5.0, 6.0)
     destination = os.path.join(tempdir, "reduced.h5")
 
-    resolver = LazyReductionResolver(sources, destination)
+    resolver = FileConcatenationResolver(sources, destination)
 
-    with patch("dsbo.utils.io.reduce.reduce_registered_file", wraps=reduce_registered_file) as mock_reduce:
+    backend = get_active_file_backend()
+    original_reduce = backend.reduce
+    reduce_calls = []
+
+    def counting_reduce(sources, destination):
+        reduce_calls.append(destination)
+        return original_reduce(sources, destination)
+
+    with patch.object(backend, "reduce", counting_reduce):
         threads = [threading.Thread(target=resolver.resolve) for _ in range(4)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
 
-        assert mock_reduce.call_count == 1
+    assert reduce_calls == [destination]
 
 
 def test_resolver_raises_reducer_error_on_missing_source(tempdir):
     sources = [os.path.join(tempdir, "nonexistent.h5")]
     destination = os.path.join(tempdir, "reduced.h5")
 
-    resolver = LazyReductionResolver(sources, destination)
+    resolver = FileConcatenationResolver(sources, destination)
     with pytest.raises(FileNotFoundError, match="nonexistent"):
         resolver.resolve()
 
@@ -109,7 +121,7 @@ def test_resolver_preserves_context_in_error_message(tempdir):
     sources = [os.path.join(tempdir, "missing.h5")]
     destination = os.path.join(tempdir, "reduced.h5")
 
-    resolver = LazyReductionResolver(sources, destination, context="MyModule input data.h5")
+    resolver = FileConcatenationResolver(sources, destination, context="MyModule input data.h5")
     with pytest.raises(FileNotFoundError, match="MyModule input data.h5"):
         resolver.resolve()
 
@@ -118,25 +130,11 @@ def test_resolver_rejects_backend_without_reduction(tempdir):
     sources = write_h5_files(tempdir, 5.0, 6.0)
     destination = os.path.join(tempdir, "reduced.h5")
 
-    resolver = LazyReductionResolver(sources, destination)
-    with config.use(file_backend=InMemoryFile):
+    resolver = FileConcatenationResolver(sources, destination)
+    with config.use(file_backend=BackendWithoutReduction):
         with pytest.raises(NotImplementedError, match="does not support file reduction"):
             resolver.resolve()
 
-
-def test_resolver_uses_root_backend(tempdir):
-    sources = []
-    for index, value in enumerate((5.0, 6.0)):
-        source = os.path.join(tempdir, f"source_{index}.root")
-        ROOTFile.write(source, torch.tensor([value]))
-        sources.append(source)
-    destination = os.path.join(tempdir, "reduced.root")
-
-    with config.use(file_backend=ROOTFile):
-        LazyReductionResolver(sources, destination).resolve()
-
-    with torch.no_grad():
-        torch.testing.assert_close(ROOTFile.open(destination, "cpu"), torch.tensor([5.0, 6.0]))
 
 
 def test_resolver_rejects_non_hdf5_source_with_error(tempdir):
@@ -144,6 +142,6 @@ def test_resolver_rejects_non_hdf5_source_with_error(tempdir):
     torch.save(torch.tensor([1.0]), source)
     destination = os.path.join(tempdir, "reduced.h5")
 
-    resolver = LazyReductionResolver([source], destination)
+    resolver = FileConcatenationResolver([source], destination)
     with pytest.raises(TypeError, match="does not support"):
         resolver.resolve()

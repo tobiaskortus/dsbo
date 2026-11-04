@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
 from typing import Callable
 from abc import ABC, abstractmethod
 
@@ -125,22 +124,3 @@ class RowStoreDatasetView(DatasetView):
     @abstractmethod
     def read_many(self, keys: list[str], index: int | slice) -> np.ndarray:
         ...
-
-
-class InMemoryDatasetView(DatasetView):
-    def __init__(self, datasets: dict[str, torch.Tensor]):
-        self._datasets = dict(datasets)
-        self._keys = tuple(sorted(self._datasets))
-
-    def shape(self, key: str) -> tuple[int, ...]:
-        return tuple(self._datasets[key].shape)
-
-    def read(self, key: str, index: int | slice):
-        return self._datasets[key][index]
-
-    def partition_sizes(self, key: str) -> tuple[int, ...]:
-        shape = self.shape(key)
-        return (1 if shape == () else shape[0],)
-
-    def close(self) -> None:
-        pass

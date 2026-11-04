@@ -148,10 +148,10 @@ class Workflow:
                     if use_cache:
                         return cache.load_or_compute(
                             candidates,
-                            lambda misses: run_batch(self, misses, catch),
+                            lambda misses: run_batch(self, misses, catch, tangent_sampler=tangent_sampler),
                         )
     
-                    results = run_batch(self, candidates, catch)
+                    results = run_batch(self, candidates, catch, tangent_sampler=tangent_sampler)
                     if use_cache:
                         cache.save_all(candidates, results)
     

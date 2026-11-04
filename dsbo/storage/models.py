@@ -71,8 +71,10 @@ class Intermediate(SQLModel, table=True):
     id:        str   = Field(default_factory=_new_id, primary_key=True)
     timestamp: float = Field(sa_column=Column(Double), default_factory=time.time)
     tag:       str   = Field(index=True)
+    run_id:    int | None = Field(default=None, index=True)
     step:      int
     value:     float
+    walltime:  float = Field(sa_column=Column(Double))
 
 
 class Trial(SQLModel, table=True):

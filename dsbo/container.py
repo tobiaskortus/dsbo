@@ -673,9 +673,11 @@ class ContainerWrapperBase:
             stderr = lambda x: print(x)
 
         process_returncode = subprocess_run(cmd, stdout, stderr)
-        if process_returncode != 0 and logger is not None:
-            logger.log(f"Container process failed with return code {process_returncode}",
-                       log_type=logging.ERROR)
+        if process_returncode != 0:
+            if logger is not None:
+                logger.log(f"Container process failed with return code {process_returncode}",
+                           log_type=logging.ERROR)
+            raise subprocess.CalledProcessError(process_returncode, cmd)
 
     def run_container(self, args: List[str]) -> None:
         self._run_with_logging(self.__construct_cmd(args, is_exec=False))

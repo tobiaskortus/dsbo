@@ -154,14 +154,14 @@ class TestDuplicateResultKeys:
 
         return Workflow(Dup() >> Dup())
 
-    def test_local_run_batch_merges_duplicate_result_keys(self):
+    def test_local_run_batch_raises_on_duplicate_result_keys(self):
         wf = self._duplicate_key_workflow()
         cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
 
-        result = run_batch(wf, [cand])
-        assert torch.allclose(result[0]["out"], torch.tensor(6.0))
+        with pytest.raises(ValueError, match="result keys"):
+            run_batch(wf, [cand])
 
-    def test_distributed_run_batch_merges_duplicate_result_keys(self):
+    def test_distributed_run_batch_raises_on_duplicate_result_keys(self):
         from tests.workflow.conftest import MockDaskWorker
         from dsbo.worker.dask import WorkerContext
 
@@ -171,13 +171,14 @@ class TestDuplicateResultKeys:
         worker = MockDaskWorker()
 
         def colliding_gather(futures, catch=()):
+            # Both scheduled tasks report results under the same key.
             return [(tid, {"out": torch.tensor(1.0)}) for tid, _, _, _ in worker.scheduled]
 
         worker.gather = colliding_gather
 
         with WorkerContext.use_worker(worker):
-            result = run_batch(wf, [cand])
-        assert torch.allclose(result[0]["out"], torch.tensor(1.0))
+            with pytest.raises(ValueError, match="result keys"):
+                run_batch(wf, [cand])
 
 
 class TestRunBatchReverseAutograd:

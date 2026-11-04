@@ -130,14 +130,28 @@ class RandomForwardContext:
         return self.policy.gradient(directional, directions)
 
 
-def _pack(m: dict[str, Any]) -> dict[str, Any]:
-    return {k: (SerializedTensor(*fw.unpack_dual(v)) if isinstance(v, torch.Tensor) else v) for k, v in m.items()}
+def _serialize(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return SerializedTensor(*fw.unpack_dual(value))
+    return value
 
 
-def _unpack(m: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(m, dict):
-        return m
-    return {k: (fw.make_dual(v.primal, v.tangent) if isinstance(v, SerializedTensor) and v.tangent is not None and fw._current_level != -1 else v.primal if isinstance(v, SerializedTensor) else v) for k, v in m.items()}
+def _deserialize(value: Any) -> Any:
+    if not isinstance(value, SerializedTensor):
+        return value
+    if value.tangent is not None and fw._current_level != -1:
+        return fw.make_dual(value.primal, value.tangent)
+    return value.primal
+
+
+def _pack(results: dict[str, Any]) -> dict[str, Any]:
+    return {key: _serialize(value) for key, value in results.items()}
+
+
+def _unpack(results: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(results, dict):
+        return results
+    return {key: _deserialize(value) for key, value in results.items()}
 
 
 def train_op(func: Callable):

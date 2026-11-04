@@ -3,6 +3,7 @@ from __future__ import annotations
 import dask
 import uuid
 import torch
+import warnings
 import contextvars
 import torch.autograd.forward_ad as fw
 
@@ -10,11 +11,11 @@ from collections import ChainMap
 from dask.delayed import Delayed, delayed
 from dask.distributed import Client, Future
 
+import dsbo
 from contextlib import contextmanager
-from dsbo.config import config
 from dsbo.storage import get_current_storage, use_storage
 from dsbo.autograd import _pack, _unpack
-from dask_heterogeneous.hybrid import HybridCluster
+from dsbo_heterogeneous.hybrid import HybridCluster
 from dsbo.utils.io import get_workdir, get_file_suffix, get_subdir
 from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 
@@ -41,6 +42,8 @@ def _unpack_tensor(t):
 
 
 class DaskWorkerBase:
+    job_specs: tuple[WorkerSpec, ...] = ()
+
     def __init__(self, cluster):
         self.client = Client(cluster)
 
@@ -57,6 +60,15 @@ class DaskWorkerBase:
 
     def compute(self, objs, **kwargs):
         return self.client.compute(objs, **kwargs)
+
+    def _task_resources(self, module: Module) -> dict[str, int]:
+        spec = module.resources
+        if spec is None:
+            raise ValueError(
+                f"Module '{module.name}' has no worker spec; assign one with "
+                f"module.to(spec) or problem.to({{type(module): spec}})."
+            )
+        return spec.resources
 
     def gather(self, futures: Iterable[Future], catch: tuple = ()) -> list:
         """Should be okay since client.gather implements
@@ -92,23 +104,23 @@ class DaskWorkerBase:
         file_overlays=None,
         tangent_sampler=None,
     ) -> tuple[uuid.UUID, Delayed]:
+        resources = self._task_resources(module)
         suffix = get_file_suffix()
         subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
-        resources = getattr(module.resources, "resources", None)
         packed_design = _pack(design)
         packed_design_tensor = _pack_tensor(design_tensor)
 
         is_forward_ad = fw._current_level > -1
         is_grad_enabled = torch.is_grad_enabled()
 
-        config_state = config.state()
+        config_state = dsbo.config.state()
         storage = get_current_storage(create=False)
 
         task_id = uuid.uuid4()
 
         def _module_wrapper(module, design_arg, design_tensor_arg, tangent_sampler, *deps):
-            config._set(config_state)
+            dsbo.config._set(config_state)
             task_kwargs = dict(
                 design=design_arg,
                 workdir=workdir,
@@ -136,25 +148,25 @@ class DaskWorkerBase:
         return task_id, delayed_obj
 
     def schedule_backward(
-        self,
-        module: Module,
-        candidate,
-        grad_output=None,
-        dependencies: Iterable = (),
-        priority: int | None = None,
-        file_overlays=None,
+        self, module: Module, candidate, grad_output=None,
+        dependencies: Iterable = (), priority: int | None = None,
+        file_overlays=None, gradient_overlays=None, 
+        pass_id: uuid.UUID | None = None,
+        task_id: uuid.UUID | None = None,
     ) -> tuple[uuid.UUID, Delayed]:
+        resources = self._task_resources(module)
+
         suffix = get_file_suffix()
         subdir = get_subdir()
         workdir = getattr(get_workdir(), "workdir_root", None)
-        resources = getattr(module.resources, "resources", None)
 
-        config_state = config.state()
+        config_state = dsbo.config.state()
         storage = get_current_storage(create=False)
-        task_id = uuid.uuid4()
+        task_id = task_id or uuid.uuid4()
+        pass_id = pass_id or uuid.uuid4()
 
         def _backward_wrapper(module, candidate, *deps):
-            config._set(config_state)
+            dsbo.config._set(config_state)
             grad_candidate = candidate.detach().requires_grad_()
             design_tensor = grad_candidate.tensor if getattr(module, "requires_design_tensor", False) else None
             with use_storage(storage), torch.enable_grad():
@@ -163,13 +175,25 @@ class DaskWorkerBase:
                     design_tensor=design_tensor,
                     workdir=workdir, suffix=suffix, subdir=subdir,
                     file_overlays=file_overlays,
+                    gradient_overlays=gradient_overlays,
+                    pass_id=pass_id,
+                    gradient_writer_id=task_id.hex,
                 )
-            return task_id, grad_candidate.grad.clone() if grad_candidate.grad is not None else None
+            gradient = grad_candidate.grad.clone() if grad_candidate.grad is not None else None
+            return task_id, gradient
 
         with dask.annotate(resources=(resources or {}), priority=priority):
             delayed_obj = delayed(_backward_wrapper, name=f"{module.name}_bwd")(module, candidate, *dependencies)
 
         return task_id, delayed_obj
+
+
+def check_worker_available(worker: Optional[DaskWorkerBase]) -> bool:
+    """Return whether every job queue backend required by ``worker`` is available."""
+    if worker is None:
+        return True
+    return all(spec.is_available() for spec in worker.job_specs)
+
 
 class WorkerContext:
     _current_worker = contextvars.ContextVar("current_worker", default=None)
@@ -178,6 +202,15 @@ class WorkerContext:
     @contextmanager
     def use_worker(cls, worker: Optional[DaskWorkerBase]) -> Generator[None, Any, None]:
         assert worker == None or isinstance(worker, DaskWorkerBase), "Worker must be an instance of DaskWorkerBase"
+        if worker is not None and not check_worker_available(worker):
+            unavailable = [type(spec).__name__ for spec in worker.job_specs if not spec.is_available()]
+            warnings.warn(
+                f"Job queue system required by the worker is not available on this machine "
+                f"({', '.join(unavailable)}). Falling back to local execution.",
+                UserWarning,
+                stacklevel=2,
+            )
+            worker = None
         token = cls._current_worker.set(worker)
         try:
             yield
@@ -192,11 +225,12 @@ class WorkerContext:
 class HeterogeneousDaskWorker(DaskWorkerBase):
     def __init__(self, job_specs: Iterable[WorkerSpec], logdir: str = "logs"):
         self.logdir = logdir
-        cluster_spec = dict(ChainMap(*[s.get_spec_dict() for s in job_specs]))
+        self.job_specs = tuple(job_specs)
+        cluster_spec = dict(ChainMap(*[s.get_spec_dict() for s in self.job_specs]))
 
         adapt_config = dict()
 
-        for spec in job_specs:
+        for spec in self.job_specs:
             assert (spec.min_worker is not None and 
                     spec.max_worker is not None), "Define static or adaptive scaling with .scale() or .adapt()"
 
@@ -204,7 +238,11 @@ class HeterogeneousDaskWorker(DaskWorkerBase):
             adapt_config[spec.spec_key] = (spec.min_worker, spec.max_worker)
 
         self.cluster = HybridCluster(spec=cluster_spec, log_directory=logdir)
-        self.cluster.adapt(adapt_config, interval="5s", wait_count=6)
+        if check_worker_available(self):
+            if all(minimum == maximum for minimum, maximum in adapt_config.values()):
+                self.cluster.scale({key: minimum for key, (minimum, _) in adapt_config.items()})
+            else:
+                self.cluster.adapt(adapt_config)
         super().__init__(self.cluster)
 
     @classmethod

@@ -44,7 +44,8 @@ class MockDaskWorker(DaskWorkerBase):
         return tid, delayed
 
     def schedule_backward(self, module, candidate, grad_output=None,
-                          dependencies=(), priority=None, file_overlays=None):
+                          dependencies=(), priority=None, file_overlays=None,
+                          gradient_overlays=None, pass_id=None, task_id=None):
         tid = UUID(int=self.task_counter, version=4)
         self.task_counter += 1
         delayed = MagicMock()
@@ -89,6 +90,9 @@ class LocalDaskWorker(DaskWorkerBase):
         self.cluster = LocalCluster(cores=1, memory="2GB")
         self.cluster.scale(2)
         super().__init__(self.cluster)
+
+    def _task_resources(self, module):
+        return {}
 
 class SimpleModule(Module):
     def __init__(self):

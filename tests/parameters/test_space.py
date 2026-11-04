@@ -143,6 +143,77 @@ def test_getitem():
     assert "g.inner" in c and "g" not in c
 
 
+def test_parameter_blocks_are_named_tensor_views_with_gradients():
+    space = full_space()
+    candidate = Candidate.from_values(space, sample_values(), requires_grad=True)
+    blocks = list(candidate.parameters())
+
+    assert [name for name, _, _ in blocks] == ["x", "n", "m", "v_1", "v_2", "g.inner"]
+    assert [tuple(tensor.shape) for _, _, tensor in blocks] == [(1,), (1,), (3,), (1,), (1,), (1,)]
+    assert all(parameter is dict(space)[name] for name, parameter, _ in blocks)
+    assert candidate._index is space._index
+    torch.testing.assert_close(torch.cat([tensor for _, _, tensor in blocks]), candidate.tensor)
+    for _, _, tensor in blocks:
+        assert tensor.untyped_storage().data_ptr() == candidate.tensor.untyped_storage().data_ptr()
+
+    sum((i + 1) * tensor.sum() for i, (_, _, tensor) in enumerate(blocks)).backward()
+    torch.testing.assert_close(candidate.grad, torch.tensor([1., 2., 3., 3., 3., 4., 5., 6.]))
+
+
+def test_parameter_blocks_can_be_transformed_and_concatenated_with_gradients():
+    space = full_space()
+    candidate = Candidate(space, space.encode(sample_values()).double().requires_grad_())
+    blocks = []
+    for _, parameter, tensor in candidate.parameters():
+        blocks.append(tensor + 1 if isinstance(parameter, Continuous) else tensor)
+    updated = Candidate(space, torch.cat(blocks))
+
+    assert updated.tensor.dtype == candidate.tensor.dtype
+    assert updated.tensor.device == candidate.tensor.device
+    assert updated.values["x"].item() == pytest.approx(2.5)
+    assert updated.values["n"] == 4 and updated.values["m"] == "b"
+    torch.testing.assert_close(updated.values["v"], candidate.values["v"] + 1)
+    assert candidate.values["x"].item() == pytest.approx(1.5)
+
+    updated.tensor.sum().backward()
+    torch.testing.assert_close(candidate.grad, torch.ones_like(candidate.tensor))
+
+
+def test_constant_only_space_has_no_encoded_parameter_blocks():
+    candidate = Candidate.from_values(ParameterSpace(k=Constant(42)), {})
+    assert list(candidate.parameters()) == []
+    assert candidate.values == {"k": 42}
+
+
+def test_binding_uses_names_for_reused_definitions_and_custom_nested_keys():
+    shared = Continuous(0.0, 10.0)
+    space = ParameterSpace(
+        key_fn="/".join,
+        g=Group(x=shared, y=shared, m=Categorical(["only"])),
+        v=Vector(0.0, 1.0, size=2),
+    )
+    candidate = Candidate.from_values(space, {"g/x": 1., "g/y": 2., "g/m": "only", "v": [0.1, 0.2]})
+    assert [name for name, _, _ in candidate.parameters()] == ["g/x", "g/y", "g/m", "v_1", "v_2"]
+    updated = Candidate(space, torch.cat([
+        tensor + 2 if name == "g/y" else tensor
+        for name, _, tensor in candidate.parameters()
+    ]))
+    assert updated.values["g/x"] == pytest.approx(1.0)
+    assert updated.values["g/y"] == pytest.approx(4.0)
+    assert updated.values["g/m"] == "only"
+
+
+def test_parameter_iteration_and_concatenation_preserve_forward_ad():
+    candidate = Candidate.from_values(full_space(), sample_values())
+    tangent = torch.arange(8, dtype=candidate.tensor.dtype)
+    with fw.dual_level():
+        dual = candidate.set_tangent(tangent)
+        assembled = torch.cat([tensor for _, _, tensor in dual.parameters()])
+        primal, assembled_tangent = fw.unpack_dual(assembled)
+        torch.testing.assert_close(primal, candidate.tensor)
+        torch.testing.assert_close(assembled_tangent, tangent)
+
+
 def test_eq_compares_decoded_values():
     space = full_space()
     a = Candidate.from_values(space, sample_values())

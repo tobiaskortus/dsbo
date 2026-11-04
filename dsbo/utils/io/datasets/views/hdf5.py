@@ -14,9 +14,9 @@ from dsbo.utils.io.datasets.views.base import (
 
 
 def _hdf5_partition_sizes(dataset: h5py.Dataset) -> tuple[int, ...]:
-    from dsbo.utils.io.storage.hdf5 import HDF5File
+    from dsbo.utils.io.storage.hdf5 import HDF5Writer
 
-    stored = dataset.attrs.get(HDF5File.PARTITION_SIZES_ATTRIBUTE)
+    stored = dataset.attrs.get(HDF5Writer.PARTITION_SIZES_ATTRIBUTE)
     if stored is not None:
         return tuple(json.loads(stored))
     if dataset.is_virtual:
@@ -32,10 +32,10 @@ class HDF5DatasetView(DatasetView):
     def __init__(self, fpath: str, file: h5py.File | None = None):
         self._file = file if file is not None else h5py.File(fpath, "r")
         try:
-            from dsbo.utils.io.storage.hdf5 import HDF5File
+            from dsbo.utils.io.storage.hdf5 import HDF5Writer
 
             if file is None:
-                HDF5File._validate_vds_sources(self._file)
+                HDF5Writer._validate_vds_sources(self._file)
             root = self._file
             if not isinstance(root, h5py.Group):
                 raise ValueError("HDF5 dataset root is not a group.")
@@ -60,10 +60,10 @@ class HDF5DatasetView(DatasetView):
         return _hdf5_partition_sizes(self._datasets[key])
 
     def statistics(self, keys: list[str]) -> tuple[int, np.ndarray, np.ndarray] | None:
-        from dsbo.utils.io.storage.hdf5 import HDF5File
+        from dsbo.utils.io.storage.hdf5 import HDF5Writer
 
         return _stack_statistics(
-            [HDF5File._read_statistics(self._datasets[key]) for key in keys]
+            [HDF5Writer._read_statistics(self._datasets[key]) for key in keys]
         )
 
     def close(self) -> None:
@@ -72,12 +72,12 @@ class HDF5DatasetView(DatasetView):
 
 class HDF5RowStoreDatasetView(RowStoreDatasetView):
     def __init__(self, file: h5py.File):
-        from dsbo.utils.io.storage.hdf5 import HDF5File
+        from dsbo.utils.io.storage.hdf5 import HDF5Writer
 
         self._file = file
         try:
-            self._dataset = file[HDF5File.ROW_STORE_DATASET]
-            keys = tuple(json.loads(self._dataset.attrs[HDF5File.ROW_STORE_KEYS_ATTRIBUTE]))
+            self._dataset = file[HDF5Writer.ROW_STORE_DATASET]
+            keys = tuple(json.loads(self._dataset.attrs[HDF5Writer.ROW_STORE_KEYS_ATTRIBUTE]))
         except Exception:
             file.close()
             raise
@@ -105,9 +105,9 @@ class HDF5RowStoreDatasetView(RowStoreDatasetView):
         return _hdf5_partition_sizes(self._dataset)
 
     def statistics(self, keys: list[str]) -> tuple[int, np.ndarray, np.ndarray] | None:
-        from dsbo.utils.io.storage.hdf5 import HDF5File
+        from dsbo.utils.io.storage.hdf5 import HDF5Writer
 
-        statistics = HDF5File._read_statistics(self._dataset)
+        statistics = HDF5Writer._read_statistics(self._dataset)
         if statistics is None:
             return None
         count, means, squared_deviations = statistics
@@ -125,13 +125,13 @@ class HDF5ColumnStoreDatasetView(ColumnStoreDatasetView):
         group_name: str = "primal",
         file: h5py.File | None = None,
     ):
-        from dsbo.utils.io.storage.hdf5 import HDF5File
+        from dsbo.utils.io.storage.hdf5 import HDF5Writer
         self._file = file if file is not None else h5py.File(fpath, "r")
         try:
             group = self._file[group_name]
             if not isinstance(group, h5py.Group):
                 raise ValueError(f"HDF5 dataset '{group_name}' is not a group of named columns.")
-            stored = group.attrs.get(HDF5File.COLUMNS_ATTRIBUTE)
+            stored = group.attrs.get(HDF5Writer.COLUMNS_ATTRIBUTE)
             columns = tuple(json.loads(stored)) if stored else tuple(group.keys())
             if not columns:
                 raise ValueError(f"HDF5 group '{group_name}' contains no columns.")

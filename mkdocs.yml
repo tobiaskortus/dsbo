@@ -1,11 +1,11 @@
-site_name: DSBO - Distributed Surrogate-Based Optimization
-site_description: Distributed Surrogate-Based Optimization framework for particle detector design
+site_name: dsbo - Distributed Surrogate-Based Optimization
+site_description: Distributed, differentiable workflows for particle detector design optimization
 site_author: Tobias Kortus
 repo_url: https://github.com/tobiaskortus/dsbo
 repo_name: tobiaskortus/dsbo
-copyright: "&copy; 2024 Tobias Kortus"
-markdown_extensions:
-  - admonition
+edit_uri: edit/main/docs/
+copyright: "&copy; 2026 Tobias Kortus"
+
 theme:
   name: readthedocs
   highlightjs: true
@@ -13,24 +13,57 @@ theme:
     - python
     - yaml
     - bash
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+
+plugins:
+  - search
+validation:
+  links:
+    anchors: warn
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
 nav:
-  - Home: index.md
+  - Introduction: index.md
   - Guide:
-    - Writing Modules: guide/modules.md
-    - Building Workflows: guide/workflows.md
-    - I/O and Autograd: guide/io.md
-    - Parallelization with Dask: guide/parallelization.md
-    - Using Surrogates: guide/surrogates.md
-  - API Reference:
-    - dsbo.modules: reference/modules.md
-    - dsbo.workflow: reference/workflow.md
-    - dsbo.surrogates: reference/surrogates.md
-    - dsbo.autograd: reference/autograd.md
-    - dsbo.objectives: reference/objectives.md
-    - dsbo.utils.io: reference/io.md
-    - dsbo.utils.compile: reference/compile.md
+      - Getting Started:
+          - Parameter Spaces and Candidates: guide/parameters.md
+          - Writing Modules: guide/modules.md
+          - File Storage and Working Directories: guide/io.md
+          - Building Workflows: guide/workflows.md
+          - Differentiable Workflows: guide/autograd.md
+          - Parallelization with Dask: guide/parallelization.md
+          - Writing Surrogates: guide/surrogates.md
+      - Putting It Together:
+          - Gradient-Based Optimization: guide/gradient-based-optimization.md
+          - Surrogate-Assisted Optimization: guide/surrogate-assisted-optimization.md
+      - Advanced Topics:
+          - Module Templates and Dynamic Submodules: guide/module-templates-and-dynamic-submodules.md
+          - Containerized Modules: guide/containers.md
+          - Reverse and Forward Gradient Flow: guide/gradient-flow.md
+          - Stochastic Execution and Reproducibility: guide/reproducibility.md
+          - Batch-Fused Workflow Stages: guide/batch-fusion.md
+          - Logging Metrics: guide/metrics.md
+          - Artifacts: guide/artifacts.md
   - Examples:
-    - HepEmShow: examples/hepemshow.md
-  - Troubleshooting: troubleshooting.md
-  - Contributing:
-    - Overview: contributing.md
+      - HepEmShow Calorimeter: examples/hepemshow.md
+  - Contributing: contributing.md

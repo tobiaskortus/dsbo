@@ -44,6 +44,14 @@ class ParameterSpace:
         self._spec = spec
         vectors = {key: vector for key, (vector, _) in _collect_vectors(spec, key_fn).items()}
         self._params = _ParameterCollection(_collect(spec, key_fn), vectors)
+        self._index: Dict[str, Tuple[int, int]] = {}
+        offset = 0
+        for name, parameter in self._params.items():
+            width = parameter.width()
+            if width == 0:
+                continue
+            self._index[name] = (offset, width)
+            offset += width
         self._sampler: Sampler | None = None
 
     @staticmethod
@@ -130,7 +138,7 @@ class CandidateTensor(torch.Tensor):
         candidate = getattr(self, "candidate", None)
         if candidate is None:
             return None
-        grads = [candidate.parameters[name].grad for name in candidate.parameter_names]
+        grads = [candidate.parameter_dict[name].grad for name in candidate.parameter_names]
         return None if any(value is None for value in grads) else torch.cat(grads)
 
     @grad.setter
@@ -139,7 +147,7 @@ class CandidateTensor(torch.Tensor):
         if candidate is None:
             torch.Tensor.grad.__set__(self, gradient)
             return
-        parameters = candidate.parameters
+        parameters = candidate.parameter_dict
         for name, (offset, width) in candidate._index.items():
             parameters[name].grad = gradient[offset:offset + width].detach()
 
@@ -151,15 +159,7 @@ class Candidate:
     _index: Dict[str, Tuple[int, int]] = field(init=False)
 
     def __post_init__(self):
-        index: Dict[str, Tuple[int, int]] = {}
-        offset = 0
-        for n, p in self.space._params.items():
-            w = p.width()
-            if w == 0:
-                continue
-            index[n] = (offset, w)
-            offset += w
-        object.__setattr__(self, '_index', index)
+        object.__setattr__(self, '_index', self.space._index)
         object.__setattr__(self, '_parameters', None)
 
         tensor = self.tensor
@@ -175,7 +175,7 @@ class Candidate:
         return tuple(self._index)
 
     @property
-    def parameters(self) -> Dict[str, nn.Parameter]:
+    def parameter_dict(self) -> Dict[str, nn.Parameter]:
         parameters = self._parameters
         if parameters is None:
             parameters = {
@@ -184,6 +184,10 @@ class Candidate:
             }
             object.__setattr__(self, '_parameters', parameters)
         return parameters
+
+    def parameters(self) -> Iterator[Tuple[str, DesignParameter, torch.Tensor]]:
+        for name, (offset, width) in self._index.items():
+            yield name, self.space._params[name], self.tensor[offset:offset + width]
 
     @classmethod
     def from_values(cls, space: ParameterSpace, values: Dict[str, Any], requires_grad: bool = False) -> Candidate:
