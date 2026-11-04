@@ -1,4 +1,5 @@
-"""Setuptools builds a self-contained extension using private HDF5/zlib sources.
+"""
+Setuptools builds a self-contained extension using private HDF5/zlib sources.
 
 Use pip/build to invoke this file. CMake only builds native code; setuptools
 remains the Python build backend. No system HDF5 or installation-time downloads

@@ -39,7 +39,7 @@ dev = [
     "pre-commit==4.6.2",
     "pymdown-extensions==12.2",
     "pytest==9.0.3",
-    "h5py>=3.16",
+    "h5py==3.16.0",
 ]
 
 [tool.pytest.ini_options]
