@@ -4,7 +4,7 @@ Use DSBO's header-only C++17 HDF5 backend to read and write workflow files from
 your own C++ code. Native executables can run without Python, including in
 containers. DSBO's Python implementation uses this same backend via **pybind11**.
 
-## Set up your C++ project
+## Set Up Your C++ Project
 
 You need a C++17 compiler and **HDF5 >=2.0 with thread safety enabled**. Use a
 prebuilt thread-safe installation or build HDF5 with
@@ -22,7 +22,7 @@ Headers are also available in installed wheels under
 For editable installs, use the checkout's `cpp/include/`. Link your application
 to its own HDF5 installation, not the Python extension's bundled libraries.
 
-## Read and write arrays
+## Read and Write Arrays
 
 Save this as `step.cpp`; it writes a primal array and reads its values back:
 
@@ -41,9 +41,10 @@ int main() {
 }
 ```
 
-On Unix/macOS, compile and run with the command below, adjusting the DSBO include
-path and pointing `PKG_CONFIG_PATH` at your HDF5 installation's `lib/pkgconfig`
-directory. This links the HDF5 C library and embeds its runtime library path:
+On Unix-like systems (e.g., Linux, macOS), compile and run with the command below,
+adjusting the DSBO include path and pointing `PKG_CONFIG_PATH` at your HDF5
+installation's `lib/pkgconfig` directory. This links the HDF5 C library and embeds
+its runtime library path:
 
 ```bash
 export PKG_CONFIG_PATH="/path/to/hdf5/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
@@ -58,7 +59,7 @@ dtype. `ArrayView` borrows contiguous, row-major data: keep the buffer alive and
 unmodified for the duration of the call. Use
 `dsbo::io::convert(array.view(), dsbo::io::dtype<T>())` for numeric conversions.
 
-## Available operations and file compatibility
+## Available Operations and File Compatibility
 
 The main APIs in `dsbo::io` are:
 
@@ -86,16 +87,11 @@ need a separate HDF5 installation: DSBO bundles it. For files shared with the
 Python backend, use uncompressed or DEFLATE/gzip-compressed datasets; the bundled
 backend does not support LZF.
 
-Files written with the older sequential-summation writer may have inaccurate
-normalization statistics. To refresh them, rewrite the source datasets with the
-current writer and rebuild virtual reductions. Updating DSBO alone does not
-repair existing attributes; rebuild native executables to use updated headers.
-
 Calls on a `Reader`, including `close()`, are serialized. Keep live readers
 within one process; reopen them after a fork. Coordinate writes to the same
 file externally: thread-safe HDF5 does not make multi-call updates transactional.
 
-## Use in a DSBO workflow
+## Use in a DSBO Workflow
 
 Have your Python module pass resolved file paths to the native executable:
 
