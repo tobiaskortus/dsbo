@@ -6,28 +6,28 @@ build-backend = "setuptools.build_meta"
 name = "dsbo"
 version = "0.1.0"
 description = "Detector Surrogate-Based Optimization"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 dependencies = [
-    "cryptography==45.0.7",
+    "cryptography==50.0.2",
     "dask[distributed]==2026.3.0",
     "dask-jobqueue==0.9.0",
     "dsbo_heterogeneous @ git+https://github.com/tobiaskortus/dsbo_heterogeneous.git@main",
     "diffusers==0.38.0",
-    "filelock==3.29.3",
+    "filelock==4.2.8",
     "graphviz==0.21",
     "h5py==3.16.0",
-    "ipython==9.14.1",
-    "lightning==2.6.5",
+    "ipython==8.39.0",
+    "lightning==2.6.6",
     "matplotlib==3.10.9",
-    "networkx==3.6.1",
-    "numpy==2.4.6",
+    "networkx==3.4.2",
+    "numpy==2.2.6",
     "psutil==7.2.2",
-    "pytorch-lightning==2.6.5",
+    "pytorch-lightning==2.6.6",
     "sqlalchemy==2.0.51",
     "sqlmodel==0.0.39",
     "sqlite-vec==0.1.9",
-    "torch==2.12.0",
+    "torch==2.15.0",
     "tqdm==4.67.3",
 ]
 

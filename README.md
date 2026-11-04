@@ -3,7 +3,7 @@
 <h1 style="font-size: clamp(1.0rem, 5vw, 2.5rem);">dsbo - Distributed Surrogate-based Optimization for Detector Design</h1>
 <br clear="left"/>
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue)]()
+[![Python](https://img.shields.io/badge/Python-3.11+-blue)]()
 [![Tests](https://img.shields.io/github/actions/workflow/status/tobiaskortus/dsbo/tests.yml)](https://github.com/tobiaskortus/dsbo/actions/workflows/tests.yml)
 [![Issues](https://img.shields.io/github/issues/tobiaskortus/dsbo)](https://github.com/tobiaskortus/dsbo/issues)
 [![Pull Requests](https://img.shields.io/github/issues-pr/tobiaskortus/dsbo)](https://github.com/tobiaskortus/dsbo/pulls)
@@ -15,7 +15,7 @@
 
 ## Getting started
 
-dsbo requires Python 3.10 or newer and is not yet available on PyPI. Install it from GitHub in an activated virtual environment:
+dsbo requires Python 3.11 or newer and is not yet available on PyPI. Install it from GitHub in an activated virtual environment:
 
 ```sh
 python -m pip install "git+https://github.com/tobiaskortus/dsbo.git"
