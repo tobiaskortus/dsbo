@@ -29,7 +29,7 @@ dsbo is not yet available on PyPI. Install from a source checkout or directly fr
 
 ### Requirements
 
-Python 3.10 or newer.
+Python 3.11 or newer.
 
 ### Install from source
 
