@@ -15,5 +15,5 @@ standalone SDK from these archives as documented in `docs/guide/native_io.md`.
 CMake validates these hashes before extraction and never downloads dependencies.
 When updating, replace the archives and hashes together, preserve the upstream
 licenses in `LICENSES/`, and rerun the isolation, compression,
-native interoperability, and source-distribution-to-wheel checks documented in
-`docs/guide/native_io.md`. The archives themselves are not included in wheels.
+native interoperability, and source-distribution-to-wheel checks. The archives
+themselves are not included in wheels.
