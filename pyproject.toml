@@ -9,34 +9,35 @@ description = "Detector Surrogate-Based Optimization"
 requires-python = ">=3.10"
 
 dependencies = [
-    "dask[distributed]",
-    "dask-jobqueue",
+    "cryptography==45.0.7",
+    "dask[distributed]==2026.3.0",
+    "dask-jobqueue==0.9.0",
     "dsbo_heterogeneous @ git+https://github.com/tobiaskortus/dsbo_heterogeneous.git@main",
-    "diffusers",
-    "filelock",
-    "graphviz",
-    "h5py",
-    "ipython",
-    "lightning",
-    "matplotlib",
-    "networkx",
-    "numpy",
-    "psutil",
-    "pytorch-lightning",
-    "sqlalchemy",
-    "sqlmodel",
-    "sqlite-vec",
-    "torch",
-    "tqdm",
+    "diffusers==0.38.0",
+    "filelock==3.29.3",
+    "graphviz==0.21",
+    "h5py==3.16.0",
+    "ipython==9.14.1",
+    "lightning==2.6.5",
+    "matplotlib==3.10.9",
+    "networkx==3.6.1",
+    "numpy==2.4.6",
+    "psutil==7.2.2",
+    "pytorch-lightning==2.6.5",
+    "sqlalchemy==2.0.51",
+    "sqlmodel==0.0.39",
+    "sqlite-vec==0.1.9",
+    "torch==2.12.0",
+    "tqdm==4.67.3",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "grpcio-tools",
-    "mkdocs>=1.6,<2",
-    "pre-commit",
-    "pymdown-extensions>=10.0",
-    "pytest",
+    "grpcio-tools==1.81.1",
+    "mkdocs==1.6.1",
+    "pre-commit==4.6.2",
+    "pymdown-extensions==12.2",
+    "pytest==9.0.3",
 ]
 
 [tool.pytest.ini_options]
