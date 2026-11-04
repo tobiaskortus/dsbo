@@ -91,7 +91,7 @@ class BundledBuildExt(build_ext):
             raise CompileError(
                 "Building DSBO's bundled HDF5 extension failed. Source installations require "
                 "a C/C++17 compiler and the CMake/Ninja build dependencies; a system HDF5 "
-                "installation is not required. See docs/guide/native_io.md."
+                "installation is not required. Refer to the documentation for details."
             ) from error
 
 

@@ -1,5 +1,3 @@
-"""DatasetView adapters; native readers own and access all HDF5 handles."""
-
 from __future__ import annotations
 
 import os

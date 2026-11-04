@@ -3,4 +3,3 @@ recursive-include cpp *.cpp *.cmake CMakeLists.txt
 recursive-include cpp/python *.map
 recursive-include cpp/vendor *.tar.gz *.md
 recursive-include examples/cpp_container *
-include docs/guide/native_io.md
