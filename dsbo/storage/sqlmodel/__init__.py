@@ -329,6 +329,12 @@ class IntermediatesStorage(IntermediatesStorageBase):
             ).all()
         return list(rows)
 
+    def get_scalar_records(self) -> list[Intermediate]:
+        with Session(self._engine) as session:
+            return list(
+                session.exec(select(Intermediate).order_by(Intermediate.walltime, Intermediate.step)).all()
+            )
+
     def get_run_ids(self, tag: str | None = None) -> list[int]:
         with Session(self._engine) as session:
             query = (
