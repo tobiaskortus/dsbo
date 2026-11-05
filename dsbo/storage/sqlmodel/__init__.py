@@ -13,7 +13,7 @@ from typing import List, Optional
 
 import networkx as nx
 from sqlalchemy import Engine, event as sa_event, inspect
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -641,6 +641,22 @@ class StudyStorage(StudyStorageBase):
             artifact_root=state.get("artifact_root"),
         )
 
+
+    @classmethod
+    def is_study_database(cls, db_path: Path | str) -> bool:
+        try:
+            path = Path(db_path).resolve()
+            if not path.is_file():
+                return False
+            engine = create_engine(f"sqlite:///{path.as_uri()}?mode=ro&uri=true", poolclass=NullPool)
+            try:
+                with engine.connect() as connection:
+                    required = {model.__table__.name for model in (Trial, Workflow, Execution)}
+                    return required.issubset(inspect(connection).get_table_names())
+            finally:
+                engine.dispose()
+        except (OSError, ValueError, RuntimeError, SQLAlchemyError):
+            return False
 
     @classmethod
     def create(cls, db_path: Path | str, *, readonly: bool = False,
