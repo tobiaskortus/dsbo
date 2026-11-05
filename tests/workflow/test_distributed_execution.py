@@ -1,8 +1,13 @@
 import pytest
 import os
+import tempfile
 import torch
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import UUID
+
+from dsbo.storage.models import JobStatus
+from dsbo.storage.sqlmodel import StudyStorage
 
 from dsbo.parameters import ParameterSpace, Continuous, Candidate
 from dsbo.modules import Module, batch_fuse
@@ -134,6 +139,7 @@ class TestDistributedRunBatch:
 
         mock_storage.workflow.add_workflow.assert_called_once()
         mock_storage.workflow.add_runs.assert_called_once()
+        assert mock_storage.workflow.add_runs.call_args.kwargs["num_jobs"] == 1
         mock_storage.workflow.create_task_stream_plugin.assert_called_once()
         worker.client.register_plugin.assert_called_once_with("plugin", name="dsbo_task_stream")
 
@@ -148,6 +154,50 @@ class TestDistributedRunBatch:
             fused({"x": torch.tensor([1.0])})
         result = fused({"x": torch.tensor([1.0])})
         assert result == {}
+
+
+class TestTransitionWriterCompletion:
+    def test_execution_completes_when_job_count_matches_scheduled_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "study.sqlite"
+            storage = StudyStorage.create(path)
+            try:
+                workflow = Workflow(SimpleModule() >> SimpleModule())
+                workflow_record = storage.workflow.add_workflow(workflow.task_graph)
+                exec_id = "backward-run"
+                storage.workflow.add_runs(
+                    workflow_record,
+                    [exec_id],
+                    "batch",
+                    num_jobs=1,
+                )
+
+                writer = storage.workflow._make_transition_writer()
+                writer(
+                    "task-key",
+                    "task-name",
+                    "worker",
+                    1.0,
+                    2.0,
+                    exec_id,
+                    "",
+                    JobStatus.SUCCESS,
+                )
+
+                execution = next(
+                    execution
+                    for execution in storage.workflow.get_executions()
+                    if execution.exec_id == exec_id
+                )
+                assert execution.num_jobs == 1
+                assert execution.num_successful_jobs == 1
+                assert execution.status == JobStatus.SUCCESS
+
+                traces = storage.workflow.get_job_traces(exec_id)
+                assert len(traces) == 1
+                assert traces[0].status == JobStatus.SUCCESS
+            finally:
+                storage.close()
 
 
 class TestDistributedRunBatchReverseAutograd:
@@ -262,9 +312,31 @@ class TestDistributedRunBatchReverseAutograd:
 
         mock_storage.workflow.add_workflow.assert_called_once()
         mock_storage.workflow.add_runs.assert_called_once()
+        assert mock_storage.workflow.add_runs.call_args.kwargs["num_jobs"] == 1
         mock_storage.workflow.create_task_stream_plugin.assert_called_once()
         worker.client.register_plugin.assert_called_once_with("bwd-plugin",
                                                               name="dsbo_task_stream_bwd")
+
+    def test_registers_only_grad_jobs_for_backward(self):
+        a = NoGradModule(); a._alias = "A"
+        b = BackwardModule(); b._alias = "B"
+        c = BackwardModule(); c._alias = "C"
+        d = BackwardModule(); d._alias = "D"
+        wf = Workflow(a >> (b | c) >> d)
+        cand = Candidate(ParameterSpace(x=Continuous(0, 10)), torch.tensor([3.0]))
+        grad_outputs = [{"out": torch.tensor(1.0)}]
+
+        mock_storage = MagicMock()
+        mock_storage.workflow.add_workflow.return_value = MagicMock()
+        mock_storage.workflow.create_task_stream_plugin.return_value = "bwd-plugin"
+
+        worker = MockDaskWorker()
+        with WorkerContext.use_worker(worker):
+            with patch("dsbo.workflow.runner.get_current_storage", return_value=mock_storage):
+                run_batch_reverse_autograd(wf, [cand], grad_outputs)
+
+        assert wf.task_graph.number_of_nodes() == 4
+        assert mock_storage.workflow.add_runs.call_args.kwargs["num_jobs"] == 3
 
 
 

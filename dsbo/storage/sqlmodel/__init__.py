@@ -70,7 +70,7 @@ class SQLModelTransitionWriter(TransitionWriter):
         engine = create_engine(self.url, poolclass=NullPool)
         with Session(engine) as session:
             execution = session.exec(select(Execution).where(Execution.exec_id == exec_id)).one()
-            wf = session.get(Workflow, execution.workflow_id)
+            previous_status = None
 
             if status in (JobStatus.RUNNING, JobStatus.QUEUED):
                 query = select(JobTrace).where(
@@ -101,13 +101,27 @@ class SQLModelTransitionWriter(TransitionWriter):
                     JobTrace.execution_id == execution.id,
                     JobTrace.task_key == key
                 )
-                job_trace = session.exec(query).one()
-                job_trace.worker = worker
-                job_trace.start = start
-                job_trace.stop = stop
-                job_trace.log = log
-                job_trace.status = status
-                job_trace.tag = tag
+                job_trace = session.exec(query).first()
+                previous_status = job_trace.status if job_trace is not None else None
+                if job_trace is None:
+                    job_trace = JobTrace(
+                        execution_id=execution.id,
+                        task_key=key,
+                        name=name,
+                        worker=worker,
+                        start=start,
+                        stop=stop,
+                        log=log,
+                        status=status,
+                        tag=tag,
+                    )
+                else:
+                    job_trace.worker = worker
+                    job_trace.start = start
+                    job_trace.stop = stop
+                    job_trace.log = log
+                    job_trace.status = status
+                    job_trace.tag = tag
 
             session.add(job_trace)
 
@@ -115,7 +129,8 @@ class SQLModelTransitionWriter(TransitionWriter):
 
             match status:
                 case JobStatus.SUCCESS:
-                    execution.num_successful_jobs += 1
+                    if previous_status != JobStatus.SUCCESS:
+                        execution.num_successful_jobs += 1
                 case JobStatus.FAILED:
                     execution.status = JobStatus.FAILED
                 case JobStatus.RUNNING:
@@ -125,8 +140,8 @@ class SQLModelTransitionWriter(TransitionWriter):
                 case _:
                     execution.status = JobStatus.PENDING
             
-            #Mark execution as SUCCESS if all jobs are done and none have failed
-            if execution.num_successful_jobs >= wf.num_tasks and execution.status != JobStatus.FAILED:
+            # Backward executions can skip no-grad modules in the workflow.
+            if execution.num_successful_jobs >= execution.num_jobs and execution.status != JobStatus.FAILED:
                 execution.status = JobStatus.SUCCESS
                 execution.stop = stop
 
@@ -162,7 +177,13 @@ class WorkflowStorage(WorkflowStorageBase):
         return wf
 
 
-    def add_runs(self, wf: Workflow, exec_ids: list[str], batch_id: str) -> Batch:
+    def add_runs(
+        self,
+        wf: Workflow,
+        exec_ids: list[str],
+        batch_id: str,
+        num_jobs: int | None = None,
+    ) -> Batch:
         if self._readonly:
             raise RuntimeError("Cannot register runs to readonly StudyStorage.")
         
@@ -170,6 +191,7 @@ class WorkflowStorage(WorkflowStorageBase):
         if len(exec_ids) > 1:
             batch = Batch(workflow_id=wf.id, batch_id=batch_id)
 
+        registered_jobs = wf.num_tasks if num_jobs is None else num_jobs
         with Session(self._engine) as session:
             if batch is not None:
                 session.add(batch)
@@ -177,7 +199,7 @@ class WorkflowStorage(WorkflowStorageBase):
 
             for exec_id in exec_ids:
                 session.add(Execution(workflow_id=wf.id, batch_id=batch.id if batch is not None else None, 
-                                      exec_id=exec_id, num_jobs=wf.num_tasks))
+                                      exec_id=exec_id, num_jobs=registered_jobs))
             
             try:
                 session.commit()
