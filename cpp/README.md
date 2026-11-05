@@ -14,7 +14,7 @@ dependency sources and build artifacts stay in the selected build directory.
 
 ## Build and run the C++ tests
 
-From the repository root:
+From the repository or extracted native source release root:
 
 ```bash
 cmake -S cpp -B build/native
@@ -42,6 +42,22 @@ The checks cover:
 - Runtime rejection of unsupported HDF5 versions, non-thread-safe libraries,
   and failed environment queries, using controlled query results.
 - The example executable's backward operation with named and unnamed gradients.
+
+## Package and release native sources
+
+```bash
+cmake -DVERSION=0.1.0 -DOUTPUT_DIR=dist/native -P cpp/cmake/PackageSource.cmake
+```
+
+Produces `dsbo-native-0.1.0.tar.gz` and its `.tar.gz.sha256` checksum in
+`dist/native/`. The archive includes headers, vendored sources, native build/tests/
+example, documentation, licenses, and version/commit metadata—not Python bindings
+or binaries. Extract it and use the build commands above; no network is needed.
+
+Normal CI tests the extracted archive without retaining Actions artifacts. Push
+a tag such as `native-v0.1.0` to publish the validated archive and checksum as a
+GitHub Release; prerelease versions are marked accordingly. Before publishing,
+see [`LICENSES/README.md`](../LICENSES/README.md).
 
 ## Test a copied include tree
 

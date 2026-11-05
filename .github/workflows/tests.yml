@@ -2,6 +2,10 @@ name: Tests
 
 on:
   push:
+    branches:
+      - "**"
+    tags-ignore:
+      - "native-v*"
   pull_request:
 
 permissions:
@@ -41,7 +45,19 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Build and run native tests
+      - name: Package native sources
         run: |
-          cmake -S cpp -B build/native -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
-          cmake --build build/native --target check --parallel 2
+          cmake -DVERSION=0.0.0-ci -DSOURCE_REVISION="$GITHUB_SHA" -DOUTPUT_DIR=dist/native -P cpp/cmake/PackageSource.cmake
+
+      - name: Verify checksum and extract package
+        working-directory: dist/native
+        run: |
+          sha256sum --check dsbo-native-0.0.0-ci.tar.gz.sha256
+          tar -xzf dsbo-native-0.0.0-ci.tar.gz -C "$RUNNER_TEMP"
+
+      - name: Build and run native tests without network access
+        run: |
+          sudo unshare --net -- sh -ec '
+            cmake -S "$1/cpp" -B "$2" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+            cmake --build "$2" --target check --parallel 2
+          ' sh "$RUNNER_TEMP/dsbo-native-0.0.0-ci" "$RUNNER_TEMP/native-package-build"
