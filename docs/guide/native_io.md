@@ -6,16 +6,23 @@ containers. DSBO's Python implementation uses this same backend via **pybind11**
 
 ## Set Up Your C++ Project
 
+Native source releases are published on
+[GitHub Releases](https://github.com/tobiaskortus/dsbo/releases). The
+`dsbo-native-<version>.tar.gz` archive includes headers, vendored dependency sources,
+tests, and a CMake build. It builds offline without Python; no precompiled libraries
+are included. See the
+[native build instructions](https://github.com/tobiaskortus/dsbo/blob/main/cpp/README.md).
+
 You need a C++17 compiler and **HDF5 >=2.0 with thread safety enabled**. Use a
 prebuilt thread-safe installation or build HDF5 with
 `HDF5_ENABLE_THREADSAFE=ON`. DSBO uses HDF5's core C library; HDF5's own C++
 wrapper is unnecessary. DSBO checks the loaded library's version and thread
 safety at runtime.
 
-Add the checkout's `cpp/include/` directory to your compiler's include path and
-include `<dsbo/hdf5.hpp>`. If copying headers into another project or container
-build context, copy the **complete include directory**, including `dsbo/hdf5/`
-and `dsbo/third_party/`. See [Licensing](#licensing) before redistributing.
+Add `cpp/include/` from the checkout or extracted release to your compiler's
+include path and include `<dsbo/hdf5.hpp>`. If copying headers into another project
+or container build context, copy the **complete include directory**, including
+`dsbo/hdf5/` and `dsbo/third_party/`. See [Licensing](#licensing) before redistributing.
 
 Headers are also available in installed wheels under
 `dsbo/utils/io/storage/include/`; locate them with `python -m pip show -f dsbo`.
@@ -110,7 +117,8 @@ Python wrapper handles workflow integration. See
 For a complete example, `cpp/examples/workflow_step.cpp` doubles values, forward
 tangents, and incoming adjoints. Its Python wrapper is
 `examples/cpp_container/workflow.py`. With Docker and DSBO installed on the host,
-run these commands from the checkout to build and run a Python-free container:
+run these commands from the full checkout to build and run a Python-free container
+(the Python wrapper and Dockerfile are not included in native releases):
 
 ```bash
 mkdir -p build/container-context/dsbo-sdk/{include,licenses}
