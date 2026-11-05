@@ -597,13 +597,16 @@ class ArtifactStorage(ArtifactStorageBase):
 
         return [
             {
+                "id": e.id,
                 "name": e.name,
                 "type": e.type,
                 "version": e.version,
+                "root": e.root,
                 "stage": e.stage,
                 "step": e.step,
                 "metadata": dict(e.meta),
                 "created_at": e.created_at,
+                "filepath": e.filepath,
             }
             for e in entries
         ]
