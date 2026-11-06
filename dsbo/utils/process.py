@@ -1,23 +1,24 @@
+from __future__ import annotations
+
 import os
 import shutil
 import subprocess
 from threading import Thread
-from typing import Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
+
+if TYPE_CHECKING:
+    from dsbo.worker.spec import WorkerSpec
 
 
-def available_cores() -> int:
+def available_cores(resources: WorkerSpec | None = None) -> int:
     """Return the number of CPUs available to the current process.
 
-    SLURM exposes the per-task CPU allocation through ``SLURM_CPUS_PER_TASK``;
-    otherwise fall back to the process CPU affinity and finally to the total
+    Use the configured Dask cores per worker process when resources are supplied.
+    Otherwise use local process CPU availability, falling back to the total
     number of CPUs on the machine.
     """
-    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
-    if slurm_cpus:
-        try:
-            return max(1, int(slurm_cpus))
-        except ValueError:
-            pass
+    if resources is not None:
+        return max(1, resources.cores // resources.processes)
 
     process_cpu_count = getattr(os, "process_cpu_count", None)
     if process_cpu_count is not None:
