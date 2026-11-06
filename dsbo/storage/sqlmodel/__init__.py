@@ -12,12 +12,12 @@ from pathlib import Path
 from typing import List, Optional
 
 import networkx as nx
-from sqlalchemy import Engine, event as sa_event, inspect
+from sqlalchemy import Engine, event as sa_event, func, inspect
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase, ArtifactStorageBase, Artifact
+from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, StudySummary, TransitionWriter, TrialStorageBase, WorkflowStorageBase, ArtifactStorageBase, Artifact
 from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow, ArtifactEntry, StudyMetadata
 from dsbo.utils.io.workdir import Workdir
 
@@ -644,6 +644,28 @@ class StudyStorage(StudyStorageBase):
         with Session(self._engine) as session:
             metadata = session.get(StudyMetadata, 1)
             return metadata.created_at if metadata is not None else None
+
+    def get_summary(self) -> StudySummary:
+        with Session(self._engine) as session:
+            total, active = session.exec(
+                select(
+                    func.count(Execution.id),
+                    func.count(Execution.id).filter(
+                        Execution.status.in_(
+                            (JobStatus.PENDING, JobStatus.QUEUED, JobStatus.RUNNING)
+                        )
+                    ),
+                )
+            ).one()
+            has_records = total > 0 or any(
+                session.exec(select(select(model.id).exists())).one()
+                for model in (Trial, Intermediate, ArtifactEntry, JobTrace)
+            )
+        return StudySummary(
+            created_at=self.created_at,
+            active_executions=active,
+            has_records=has_records,
+        )
 
     def __getstate__(self) -> dict:
         url = self._engine.url.render_as_string(hide_password=False)

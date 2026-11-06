@@ -11,6 +11,7 @@ import networkx as nx
 from pathlib import Path
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Callable, Dict, Generator, List, Mapping, Optional, TYPE_CHECKING
 
 from dsbo.utils.functools import auto_wrap
@@ -208,6 +209,13 @@ class TrialStorageBase(ABC):
         pass
 
 
+@dataclass(frozen=True)
+class StudySummary:
+    created_at: float | None
+    active_executions: int
+    has_records: bool
+
+
 class StudyStorageBase:
     def __init__(self, db_path: Path | str):
         self._trial_storage: Optional[TrialStorageBase] = None
@@ -217,6 +225,9 @@ class StudyStorageBase:
 
     @property
     def created_at(self) -> float | None:
+        raise NotImplementedError
+
+    def get_summary(self) -> StudySummary:
         raise NotImplementedError
 
     @property
