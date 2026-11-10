@@ -18,7 +18,7 @@ from dsbo.storage.artifact import Artifact, ArtifactRef
 
 if TYPE_CHECKING:
     from dsbo.utils.plugins import TaskStreamPlugin
-    from dsbo.storage.models import Batch, Execution, JobStatus, JobTrace, Workflow, Trial
+    from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Workflow, Trial
 
 
 class TransitionWriter(ABC):
@@ -90,7 +90,13 @@ class WorkflowStorageBase(ABC):
         pass
         
     @abstractmethod
-    def add_runs(self, wf: Workflow, exec_ids: list[str], batch_id: str) -> "Batch":
+    def add_runs(
+        self,
+        wf: Workflow,
+        exec_ids: list[str],
+        batch_id: str,
+        num_jobs: int | None = None,
+    ) -> "Batch":
         pass
 
     @abstractmethod
@@ -150,6 +156,10 @@ class IntermediatesStorageBase(ABC):
 
     @abstractmethod
     def get_tags(self) -> list[str]:
+        pass
+
+    @abstractmethod
+    def get_scalar_records(self) -> list[Intermediate]:
         pass
 
 

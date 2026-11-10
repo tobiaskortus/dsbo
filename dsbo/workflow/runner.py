@@ -24,6 +24,7 @@ from dsbo.modules.fused import (
 )
 
 if TYPE_CHECKING:
+    from dsbo.worker.dask import DaskWorkerBase
     from dsbo.workflow import Workflow, ResultsBatch
     from dsbo.parameters import ParameterSpace
 
@@ -66,12 +67,22 @@ def update_task_stream_plugin(name, writer, task_map, name_map, tag, dask_schedu
     return True
 
 
-def register_task_stream(worker, graph, exec_ids, batch_path, task_map, name_map, name, tag=""):
+def register_task_stream(
+    worker: DaskWorkerBase,
+    graph: nx.DiGraph,
+    exec_ids: list[str],
+    batch_path: str,
+    task_map: dict[str, str | tuple[str, ...]],
+    name_map: dict[str, str],
+    name: str,
+    tag: str = "",
+    num_jobs: int | None = None,
+) -> None:
     storage = get_current_storage()
     if storage is None:
         return
     workflow_record = storage.workflow.add_workflow(graph)
-    storage.workflow.add_runs(workflow_record, exec_ids, batch_path)
+    storage.workflow.add_runs(workflow_record, exec_ids, batch_path, num_jobs=num_jobs)
     writer = storage.workflow._make_transition_writer()
     if worker.client.run_on_scheduler(update_task_stream_plugin, name, writer, task_map, name_map, tag):
         return
@@ -214,7 +225,8 @@ def run_batch(
 
         register_task_stream(worker, task_graph, exec_ids, batch_path, 
                              task_map, name_map, "dsbo_task_stream", 
-                             tag=workflow.graph_context.mode.value)
+                             tag=workflow.graph_context.mode.value,
+                             num_jobs=len(batch_task_ids[0]))
 
         futures = worker.compute([d for *_, d in scheduled_tasks])
 
@@ -328,6 +340,7 @@ def run_batch_reverse_autograd(
             worker, G, exec_ids, batch_path,
             task_map, name_map, "dsbo_task_stream_bwd",
             tag=workflow.graph_context.mode.value,
+            num_jobs=len(tasks_rev),
         )
 
         futures_computed = worker.compute(batch_delays)
