@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 import torch.autograd.forward_ad as fw
-from torch import nn
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -127,29 +126,53 @@ class ParameterSpace:
         ])
 
 
-class CandidateTensor(torch.Tensor):
-    """Flat candidate tensor whose gradients are shared with the candidate's parameters."""
+class TensorView(torch.Tensor):
+    """Named view of a candidate tensor whose gradient lives on the parent.
+
+    Views share storage with the parent tensor, so optimizer updates apply to
+    the flat design vector in place while allowing per-parameter learning rates.
+    ``view.grad`` proxies the corresponding slice of ``parent.grad`` rather than
+    storing a separate gradient buffer.
+    """
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    @staticmethod
+    def __new__(cls, parent: torch.Tensor, index: slice) -> "TensorView":
+        if not isinstance(parent, torch.Tensor):
+            raise TypeError("parent must be a torch.Tensor")
+        if not isinstance(index, slice):
+            raise TypeError("index must be a slice; advanced indexing copies storage")
+
+        view = parent[index].as_subclass(cls)
+        view._parent = parent
+        view._index = index
+        if view.requires_grad:
+            # Optimizers reject non-leaf tensors unless they retain gradients.
+            view.retain_grad()
+        return view
 
     @property
-    def grad(self):
-        grad = torch.Tensor.grad.__get__(self) if self.is_leaf else None
-        if grad is not None:
-            return grad
-        candidate = getattr(self, "candidate", None)
-        if candidate is None:
-            return None
-        grads = [candidate.parameter_dict[name].grad for name in candidate.parameter_names]
-        return None if any(value is None for value in grads) else torch.cat(grads)
+    def grad(self) -> Optional[torch.Tensor]:
+        gradient = self._parent.grad
+        return None if gradient is None else gradient[self._index]
 
     @grad.setter
-    def grad(self, gradient):
-        candidate = getattr(self, "candidate", None)
-        if candidate is None:
-            torch.Tensor.grad.__set__(self, gradient)
+    def grad(self, value: Optional[torch.Tensor]) -> None:
+        parent = self._parent
+        if value is None:
+            # All views share the parent gradient, so clearing one clears all.
+            parent.grad = None
             return
-        parameters = candidate.parameter_dict
-        for name, (offset, width) in candidate._index.items():
-            parameters[name].grad = gradient[offset:offset + width].detach()
+        if fw.unpack_dual(parent).tangent is not None:
+            raise RuntimeError("cannot assign gradients to a forward-AD dual tensor")
+        if value.shape != self.shape or value.dtype != self.dtype or value.device != self.device:
+            raise ValueError("gradient must match the view's shape, dtype, and device")
+
+        with torch.no_grad():
+            if parent.grad is None:
+                parent.grad = torch.zeros_like(parent)
+            parent.grad[self._index].copy_(value)
 
 
 @dataclass(frozen=True)
@@ -157,37 +180,31 @@ class Candidate:
     space: ParameterSpace
     tensor: torch.Tensor
     _index: Dict[str, Tuple[int, int]] = field(init=False)
+    _parameter_views: Optional[Dict[str, TensorView]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         object.__setattr__(self, '_index', self.space._index)
-        object.__setattr__(self, '_parameters', None)
-
-        tensor = self.tensor
-        if not isinstance(tensor, CandidateTensor):
-            if fw.unpack_dual(tensor).tangent is None:
-                tensor = torch.Tensor._make_subclass(CandidateTensor, tensor, tensor.requires_grad)
-                object.__setattr__(self, 'tensor', tensor)
-        if isinstance(tensor, CandidateTensor):
-            object.__setattr__(tensor, 'candidate', self)
+        object.__setattr__(self, '_parameter_views', None)
 
     @property
     def parameter_names(self) -> Tuple[str, ...]:
         return tuple(self._index)
 
     @property
-    def parameter_dict(self) -> Dict[str, nn.Parameter]:
-        parameters = self._parameters
-        if parameters is None:
-            parameters = {
-                name: nn.Parameter(self.tensor.detach()[offset:offset + width])
+    def parameter_dict(self) -> Dict[str, TensorView]:
+        views = self._parameter_views
+        if views is None:
+            views = {
+                name: TensorView(self.tensor, slice(offset, offset + width))
                 for name, (offset, width) in self._index.items()
             }
-            object.__setattr__(self, '_parameters', parameters)
-        return parameters
+            object.__setattr__(self, '_parameter_views', views)
+        return views
 
-    def parameters(self) -> Iterator[Tuple[str, DesignParameter, torch.Tensor]]:
-        for name, (offset, width) in self._index.items():
-            yield name, self.space._params[name], self.tensor[offset:offset + width]
+    def parameters(self) -> Iterator[Tuple[str, DesignParameter, TensorView]]:
+        views = self.parameter_dict
+        for name in self._index:
+            yield name, self.space._params[name], views[name]
 
     @classmethod
     def from_values(cls, space: ParameterSpace, values: Dict[str, Any], requires_grad: bool = False) -> Candidate:
@@ -220,7 +237,14 @@ class Candidate:
         return type(self)(self.space, self.tensor.detach().clone())
 
     def requires_grad_(self, requires_grad: bool = True) -> Candidate:
+        if self.tensor.requires_grad == requires_grad:
+            # No state change: existing views still share the same tensor and
+            # must keep their identity (optimizers may hold references to them).
+            return self
         self.tensor.requires_grad_(requires_grad)
+        # Views created before this call are not connected to the new autograd
+        # leaf, so rebuild them on next access.
+        object.__setattr__(self, '_parameter_views', None)
         return self
 
     @property

@@ -5,7 +5,8 @@ import torch
 import torch.autograd.forward_ad as fw
 
 from dsbo.parameters import (Candidate, Categorical, Constant, Continuous,
-                             Encoding, Group, Integer, ParameterSpace, UniformSampler, Vector)
+                             Encoding, Group, Integer, ParameterSpace, TensorView,
+                             UniformSampler, Vector)
 
 
 def full_space():
@@ -158,6 +159,130 @@ def test_parameter_blocks_are_named_tensor_views_with_gradients():
 
     sum((i + 1) * tensor.sum() for i, (_, _, tensor) in enumerate(blocks)).backward()
     torch.testing.assert_close(candidate.grad, torch.tensor([1., 2., 3., 3., 3., 4., 5., 6.]))
+
+
+def test_parameter_dict_returns_cached_gradient_sharing_views():
+    candidate = Candidate.from_values(full_space(), sample_values(), requires_grad=True)
+    views = candidate.parameter_dict
+    blocks = list(candidate.parameters())
+
+    assert views is candidate.parameter_dict
+    assert all(isinstance(view, TensorView) for view in views.values())
+    assert [name for name, _, _ in blocks] == list(views)
+    assert all(tensor is views[name] for name, _, tensor in blocks)
+
+    for name, view in views.items():
+        offset, width = candidate._index[name]
+        torch.testing.assert_close(view, candidate.tensor[offset:offset + width])
+        assert view.untyped_storage().data_ptr() == candidate.tensor.untyped_storage().data_ptr()
+
+
+def test_parameter_views_share_gradients_with_parent():
+    candidate = Candidate.from_values(full_space(), sample_values(), requires_grad=True)
+    views = candidate.parameter_dict
+
+    candidate.tensor.square().sum().backward()
+
+    for name, view in views.items():
+        offset, width = candidate._index[name]
+        torch.testing.assert_close(view.grad, candidate.tensor.grad[offset:offset + width])
+
+    views["x"].grad = torch.tensor([3.0])
+    offset, width = candidate._index["x"]
+    torch.testing.assert_close(candidate.tensor.grad[offset:offset + width], torch.tensor([3.0]))
+
+    # Clearing one view clears the parent gradient shared by all views.
+    views["x"].grad = None
+    assert candidate.tensor.grad is None
+
+
+def test_parameter_views_support_per_parameter_optimizer_updates():
+    space = ParameterSpace(a=Continuous(-10.0, 10.0), b=Continuous(-10.0, 10.0))
+    candidate = Candidate.from_values(space, {"a": 2.0, "b": 2.0}, requires_grad=True)
+    views = candidate.parameter_dict
+    optimizer = torch.optim.SGD([
+        {"params": [views["a"]], "lr": 0.1},
+        {"params": [views["b"]], "lr": 0.2},
+    ])
+
+    optimizer.zero_grad(set_to_none=True)
+    (0.5 * candidate.tensor.square().sum()).backward()
+    optimizer.step()
+
+    torch.testing.assert_close(candidate.tensor, torch.tensor([1.8, 1.6]))
+
+
+def test_parameter_views_preserve_forward_ad():
+    candidate = Candidate.from_values(full_space(), sample_values())
+    tangent = torch.arange(candidate.tensor.numel(), dtype=candidate.tensor.dtype)
+
+    with fw.dual_level():
+        dual = candidate.set_tangent(tangent)
+        views = dual.parameter_dict
+
+        for name, view in views.items():
+            offset, width = dual._index[name]
+            primal, view_tangent = fw.unpack_dual(view)
+            torch.testing.assert_close(primal, candidate.tensor[offset:offset + width])
+            torch.testing.assert_close(view_tangent, tangent[offset:offset + width])
+
+        assembled = torch.cat(list(views.values()))
+        _, assembled_tangent = fw.unpack_dual(assembled)
+        torch.testing.assert_close(assembled_tangent, tangent)
+
+
+def test_detached_candidate_views_do_not_require_grad():
+    candidate = Candidate.from_values(full_space(), sample_values()).detach()
+    views = candidate.parameter_dict
+
+    assert all(not view.requires_grad for view in views.values())
+    assert all(view.grad is None for view in views.values())
+
+
+def test_requires_grad_rebuilds_parameter_views():
+    candidate = Candidate.from_values(ParameterSpace(x=Continuous(0.0, 1.0)), {"x": 0.5})
+    old_view = candidate.parameter_dict["x"]
+
+    candidate.requires_grad_(True)
+    new_view = candidate.parameter_dict["x"]
+
+    assert new_view is not old_view
+    assert new_view.requires_grad
+    (2.0 * new_view).sum().backward()
+    torch.testing.assert_close(candidate.tensor.grad, torch.tensor([2.0]))
+
+
+def test_requires_grad_true_preserves_parameter_views():
+    candidate = Candidate.from_values(
+        ParameterSpace(x=Continuous(0.0, 1.0)), {"x": 0.5}, requires_grad=True
+    )
+    view = candidate.parameter_dict["x"]
+
+    candidate.requires_grad_(True)
+
+    assert candidate.parameter_dict["x"] is view
+    assert candidate.tensor.requires_grad
+
+
+def test_tensor_view_operations_return_plain_tensors():
+    parent = torch.ones(4, requires_grad=True)
+    view = TensorView(parent, slice(0, 2))
+
+    assert type(view + 1) is torch.Tensor
+    assert type(view.detach()) is torch.Tensor
+    assert type(view.clone()) is torch.Tensor
+
+
+def test_tensor_view_rejects_advanced_indexing():
+    parent = torch.ones(4, requires_grad=True)
+    with pytest.raises(TypeError, match="slice"):
+        TensorView(parent, [0, 1])
+
+
+def test_tensor_view_rejects_mismatched_gradient():
+    candidate = Candidate.from_values(ParameterSpace(v=Vector(0.0, 1.0, size=2)), {"v": [0.0, 1.0]})
+    with pytest.raises(ValueError, match="shape"):
+        candidate.parameter_dict["v_1"].grad = torch.ones(2)
 
 
 def test_parameter_blocks_can_be_transformed_and_concatenated_with_gradients():
