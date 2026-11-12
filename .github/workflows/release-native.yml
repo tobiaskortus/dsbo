@@ -1,0 +1,61 @@
+name: Release native sources
+
+on:
+  push:
+    tags:
+      - "native-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Package native sources
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME#native-v}"
+          cmake -DVERSION="$version" -DSOURCE_REVISION="$GITHUB_SHA" -DOUTPUT_DIR=dist/native -P cpp/cmake/PackageSource.cmake
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify checksum and extract release
+        working-directory: dist/native
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          sha256sum --check "dsbo-native-${VERSION}.tar.gz.sha256"
+          tar -xzf "dsbo-native-${VERSION}.tar.gz" -C "$RUNNER_TEMP"
+
+      - name: Build and test extracted release without network access
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          sudo unshare --net -- sh -ec '
+            cmake -S "$1/cpp" -B "$2" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+            cmake --build "$2" --target check --parallel 2
+          ' sh "$RUNNER_TEMP/dsbo-native-${VERSION}" "$RUNNER_TEMP/native-release-build"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          flags=()
+          if [[ "${VERSION%%+*}" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "DSBO native ${VERSION}" \
+            --notes "Self-contained C++ source distribution. See README.md in the archive for offline build instructions." \
+            "${flags[@]}" \
+            "dist/native/dsbo-native-${VERSION}.tar.gz" \
+            "dist/native/dsbo-native-${VERSION}.tar.gz.sha256"
