@@ -19,9 +19,9 @@ file(MAKE_DIRECTORY "${root}")
 set(inputs
   cpp/CMakeLists.txt cpp/README.md cpp/vendor/README.md
   cpp/cmake/BundledHDF5.cmake cpp/cmake/PackageSource.cmake
-  cpp/examples/workflow_step.cpp
-  cpp/tests/environment.cpp cpp/tests/hdf5.cpp cpp/tests/second_translation_unit.cpp
-  cpp/tests/workflow_step.cpp cpp/tests/workflow_step.cmake
+  cpp/examples/CMakeLists.txt cpp/examples/workflow_step.cpp
+  cpp/tests/CMakeLists.txt cpp/tests/doctest.h cpp/tests/environment.cpp cpp/tests/hdf5.cpp
+  cpp/tests/header_linkage_check.cpp cpp/tests/test_support.hpp cpp/tests/workflow_step.cpp
   docs/guide/native_io.md)
 file(GLOB_RECURSE headers RELATIVE "${source_root}" "${source_root}/cpp/include/*.hpp")
 file(GLOB archives LIST_DIRECTORIES FALSE RELATIVE "${source_root}" "${source_root}/cpp/vendor/*.tar.gz")
@@ -47,7 +47,7 @@ if(NOT SOURCE_REVISION)
 endif()
 file(WRITE "${root}/RELEASE.txt" "Version: ${VERSION}\nSource revision: ${SOURCE_REVISION}\n")
 file(WRITE "${root}/README.md" "# DSBO native ${VERSION}\n\n"
-  "Self-contained C++ sources, including HDF5/zlib archives and the JSON header.\n"
+  "Self-contained C++ sources, including HDF5/zlib archives, the JSON header, and the test-only doctest header.\n"
   "Requires CMake >=3.26, C/C++17 compilers, and Make or Ninja; no Python or network access.\n"
   "From this directory:\n\n```sh\n"
   "cmake -S cpp -B build/native -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON\n"
