@@ -14,8 +14,8 @@ import dsbo
 from contextlib import contextmanager
 from dsbo.storage import get_current_storage, use_storage
 from dsbo.autograd import _pack, _unpack
-from dask_heterogeneous.hybrid import HybridCluster
-from dask_heterogeneous.scheduler import HeterogeneousScheduler
+from dsbo_heterogeneous.hybrid import HybridCluster
+from dsbo_heterogeneous.scheduler import HeterogeneousScheduler
 from dsbo.surrogates.easyscale.scheduler import (
     EASYSCALE_PLUGIN_NAME,
     EASYSCALE_RUNTIME_PLUGIN_NAME,
@@ -335,7 +335,8 @@ class HeterogeneousDaskWorker(DaskWorkerBase):
         if all(minimum == maximum for minimum, maximum in adapt_config.values()):
             self.cluster.scale({key: minimum for key, (minimum, _) in adapt_config.items()})
         else:
-            self.cluster.adapt(adapt_config)
+            #TODO: How should this be handled and should it be configurable?
+            self.cluster.adapt(adapt_config, interval="10s", wait_count=12)
 
         super().__init__(self.cluster)
 

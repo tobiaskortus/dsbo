@@ -12,7 +12,7 @@ dependencies = [
     "attrs",
     "dask[distributed]",
     "dask-jobqueue",
-    "dask_heterogeneous @ git+https://github.com/tobiaskortus/dask_heterogeneous.git@main",
+    "dsbo_heterogeneous @ git+https://github.com/tobiaskortus/dsbo_heterogeneous.git@main",
     "diffusers",
     "filelock",
     "graphviz",
