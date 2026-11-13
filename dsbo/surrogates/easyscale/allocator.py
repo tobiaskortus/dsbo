@@ -49,6 +49,7 @@ class Capacity:
     allocation_revision: int
     ready: bool
     ready_live: dict[str, int] = field(default_factory=dict, kw_only=True)
+    worker_hardware: tuple[str | None, ...] = field(default=(), kw_only=True)
 
 
 class ClientResourceAllocator:
@@ -177,6 +178,7 @@ class ClientResourceAllocator:
             approved_allocation=dict(response["approved_allocation"]),
             allocation_revision=int(response["allocation_revision"]),
             ready=bool(response["ready"]),
+            worker_hardware=tuple(response["worker_hardware"]),
         )
 
     def close_job(self, job_id: str) -> None:

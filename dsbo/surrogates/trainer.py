@@ -10,6 +10,7 @@ import lightning as L
 from torch.utils.data import DataLoader
 
 from dsbo.logger import WorkflowTaskLogger
+from dsbo.surrogates.easyscale.profile import profile_details
 from dsbo.surrogates.easyscale.protocol import EasyScaleSchedulerConfig
 from dsbo.storage import get_current_storage
 
@@ -36,10 +37,6 @@ class TrainingConfig:
     )
 
     def __post_init__(self) -> None:
-        if isinstance(self.virtual_world_size, bool) or not isinstance(self.virtual_world_size, int):
-            raise TypeError("virtual_world_size must be an integer.")
-        if self.virtual_world_size < 1:
-            raise ValueError("virtual_world_size must be positive.")
         if self.elastic is None:
             self.elastic = self.virtual_world_size > 1
 
@@ -83,7 +80,8 @@ class PerfCallback(L.Callback):
         self._prev_batch_end = 0.0
         self._fit_start: float | None = None
         self._first_batch_logged = False
-        self._metrics = {"data_load": [], "train_step": []}
+        self._metrics = {"data_load": [], "train_step_ms": []}
+        self.easyscale_performance = {"steps": [], "epochs": []}
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         if not trainer.is_global_zero:
@@ -101,44 +99,28 @@ class PerfCallback(L.Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if not trainer.is_global_zero:
             return
-        step = (time.perf_counter() - self._batch_start) * 1000.0
+        train_step_ms = (time.perf_counter() - self._batch_start) * 1000.0
         self._prev_batch_end = time.perf_counter()
-        self._metrics["train_step"].append(step)
+        self._metrics["train_step_ms"].append(train_step_ms)
         if self.log_every_n > 0 and (batch_idx + 1) % self.log_every_n == 0:
             WorkflowTaskLogger.get_current().log(
-                f"perf step {batch_idx + 1}: train_step={step:.2f}ms"
+                f"perf step {batch_idx + 1}: train_step_ms={train_step_ms:.2f}ms"
             )
             profile = getattr(trainer.strategy, "last_step_profile", None)
             if profile:
                 strategy = trainer.strategy
-                profile_fields = (
-                    ("est_data_transfer", "data_transfer"),
-                    ("est_compute", "est_compute"),
-                    ("gradient_pre_collective_wait", "gradient_wait"),
-                    ("gradient_metadata_all_reduce", "gradient_metadata_all_reduce"),
-                    ("gradient_rank_all_gather", "gradient_rank_all_gather"),
-                    ("gradient_shard_exchange", "gradient_shard_exchange"),
-                    ("gradient_result_wait", "gradient_result_wait"),
-                    ("gradient_result_all_gather", "gradient_result_all_gather"),
-                    ("gradient_collective_total", "gradient_collective"),
-                    ("gradient_aggregation_total", "gradient_aggregation"),
-                    ("metric_all_reduce", "metric_all_reduce"),
-                    ("metric_aggregation_total", "metric_aggregation"),
-                    ("gradient_assignment", "gradient_assignment"),
-                    ("backward_total", "backward"),
-                    ("step_total", "step_total"),
-                )
-                details = " ".join(
-                    f"{label}={profile.get(name, 0.0) * 1000.0:.2f}ms"
-                    for name, label in profile_fields
-                )
+                self.easyscale_performance["steps"].append({
+                    "global_step": trainer.global_step,
+                    "train_step_seconds": train_step_ms / 1000.0,
+                    "est_data_transfer": profile.get("est_data_transfer"),
+                    "est_compute": profile.get("est_compute"),
+                })
                 WorkflowTaskLogger.get_current().log(
                     f"easyscale profile step={batch_idx + 1} "
                     f"rank={getattr(strategy, 'physical_rank', '?')} "
                     f"world={getattr(strategy, 'physical_world_size', '?')} "
                     f"ests={getattr(strategy, 'assigned_ests', ())} "
-                    f"gradient_mb={profile.get('gradient_elements', 0.0) * 4.0 / 1e6:.2f} "
-                    f"{details}"
+                    f"{profile_details(profile, prefix='')}"
                 )
 
     def on_train_epoch_end(self, trainer, pl_module):
@@ -147,10 +129,16 @@ class PerfCallback(L.Callback):
         metrics = self._metrics
         if metrics["data_load"]:
             means = {key: sum(values) / len(values) for key, values in metrics.items()}
+            if hasattr(trainer.strategy, "last_step_profile"):
+                self.easyscale_performance["epochs"].append({
+                    "epoch": trainer.current_epoch,
+                    "data_load": means["data_load"] / 1000.0,
+                    "train_step_seconds": means["train_step_ms"] / 1000.0,
+                })
             WorkflowTaskLogger.get_current().log(
                 f"perf epoch {trainer.current_epoch}: "
                 f"data_load mean={means['data_load']:.2f}ms "
-                f"train_step mean={means['train_step']:.2f}ms"
+                f"train_step_ms mean={means['train_step_ms']:.2f}ms"
             )
         for values in metrics.values():
             values.clear()
@@ -216,6 +204,7 @@ class Trainer:
         self.resources = resources
         self._callbacks = list(callbacks or [])
         self._elastic = self.config.elastic
+        self._uses_spawn_ddp = False
         if self._elastic:
             if enable_checkpointing:
                 raise ValueError(
@@ -226,6 +215,13 @@ class Trainer:
                 raise ValueError("EasyScale requires accumulate_grad_batches=1.")
             self._lightning = None
         else:
+            if devices == "auto" and resources is not None and resources.num_gpus > 1:
+                if resources.processes != 1:
+                    raise ValueError("Multi-GPU DDP requires WorkerSpec(processes=1).")
+                devices = resources.num_gpus
+                if "strategy" not in kwargs:
+                    kwargs["strategy"] = "ddp_spawn"
+                self._uses_spawn_ddp = kwargs["strategy"] == "ddp_spawn"
             self._lightning = _build_lightning_trainer(
                 self.config,
                 accelerator=accelerator,
@@ -249,6 +245,11 @@ class Trainer:
         from dsbo.surrogates.surrogate_model import SurrogateModel
 
         assert isinstance(model, SurrogateModel), "model must be a SurrogateModel"
+        if mp.current_process().daemon and self._uses_spawn_ddp:
+            raise RuntimeError(
+                "Multi-GPU DDP cannot start rank processes from a daemonic "
+                "Dask worker. Configure WorkerSpec(daemon=False)."
+            )
         if mp.current_process().daemon and (
             (not self._elastic and train_loader.num_workers > 0)
             or (val_loader is not None and val_loader.num_workers > 0)

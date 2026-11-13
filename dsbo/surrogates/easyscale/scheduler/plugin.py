@@ -31,12 +31,14 @@ _HANDLERS = {
 
 class EasyScaleRuntimePlugin(WorkerPlugin):
     def setup(self, worker) -> None:
-        import dsbo.surrogates.easyscale.runner  # noqa: F401
-
         self._dataloaders = {}
 
+        import torch
+        from dsbo.surrogates.easyscale.runner import hardware_identity
+        hardware = hardware_identity(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
         async def report_ready() -> None:
-            await worker.scheduler.dsbo_easyscale_worker_ready(address=worker.address)
+            await worker.scheduler.dsbo_easyscale_worker_ready(address=worker.address, hardware=hardware)
 
         worker.loop.add_callback(report_ready)
 
@@ -75,6 +77,7 @@ class EasyScaleSchedulerPlugin(SchedulerPlugin):
 
         self._scheduler = None
         self._ready_workers: set[str] = set()
+        self._worker_hardware: dict[str, str | None] = {}
 
     async def start(self, scheduler: Any) -> None:
         self._scheduler = scheduler
@@ -93,9 +96,11 @@ class EasyScaleSchedulerPlugin(SchedulerPlugin):
                 self.arbiter.discard(job_id)
         self.arbiter.reset()
         self._ready_workers.intersection_update(scheduler.workers)
+        self._worker_hardware = {address: hardware for address, hardware in self._worker_hardware.items() if address in scheduler.workers}
 
     def remove_worker(self, scheduler: Any, worker: Any, **kwargs: Any) -> None:
         self._ready_workers.discard(getattr(worker, "address", str(worker)))
+        self._worker_hardware.pop(getattr(worker, "address", str(worker)), None)
 
     def remove_client(self, scheduler: Any, client: str, **kwargs: Any) -> None:
         for job in self.registry.values():
@@ -301,19 +306,24 @@ class EasyScaleSchedulerPlugin(SchedulerPlugin):
         job = self.registry.get(job_id)
         live = {resource_type: 0 for resource_type in self.provision_limits}
         ready_live = {resource_type: 0 for resource_type in self.provision_limits}
+        worker_hardware = []
 
         if self._scheduler is not None:
             for worker in self._scheduler.workers.values():
                 resource_type = self._worker_resource_type(worker)
                 live[resource_type] += 1
-                if worker.address in self._ready_workers and worker.status == Status.running:
+                is_ready = worker.address in self._ready_workers and worker.status == Status.running
+                if is_ready:
                     ready_live[resource_type] += 1
+                if is_ready and job.approved_allocation.get(resource_type, 0):
+                    worker_hardware.append(self._worker_hardware.get(worker.address))
 
         approved = self.registry.total_approved(self.provision_limits).to_dict()
         return {
             "job_id": job_id,
             "live": live,
             "ready_live": ready_live,
+            "worker_hardware": worker_hardware,
             "approved_total": approved,
             "approved_allocation": dict(job.approved_allocation),
             "allocation_revision": job.allocation_revision,
@@ -323,10 +333,11 @@ class EasyScaleSchedulerPlugin(SchedulerPlugin):
             ),
         }
 
-    def _worker_ready(self, comm: Any = None, *, address: str) -> dict[str, Any]:
+    def _worker_ready(self, comm: Any = None, *, address: str, hardware: str | None = None) -> dict[str, Any]:
         if self._scheduler is None or address not in self._scheduler.workers:
             raise RuntimeError(f"unknown EasyScale worker: {address}")
         self._ready_workers.add(address)
+        self._worker_hardware[address] = hardware
         return {"address": address, "ready": True}
 
     def _close_job(self, comm: Any = None, *, job_id: str) -> dict[str, Any]:

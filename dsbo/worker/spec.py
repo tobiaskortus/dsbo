@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import shlex
+import hashlib
 import multiprocessing as mp
 from dataclasses import dataclass, replace
 from abc import ABC, abstractmethod
@@ -119,7 +121,13 @@ class SLURMWorkerSpec(WorkerSpec):
 
     min_worker: int | None = None
     max_worker: int | None = None
-    daemon: bool = True
+    daemon: bool | None = None
+    env: tuple[tuple[str, str], ...] = ()
+    job_extra_directives: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.daemon is None:
+            object.__setattr__(self, "daemon", self.num_gpus <= 1)
 
     @property
     def spec_key(self) -> str:
@@ -132,6 +140,12 @@ class SLURMWorkerSpec(WorkerSpec):
             str(self.gpu_resources or ""),
             "nondaemon" if not self.daemon else "",
         ])
+        if self.env:
+            normalized = "\0".join(f"{key}={value}" for key, value in sorted(self.env))
+            raw += f"_env_{hashlib.sha256(normalized.encode()).hexdigest()[:8]}"
+        if self.job_extra_directives:
+            normalized = "\0".join(self.job_extra_directives)
+            raw += f"_directives_{hashlib.sha256(normalized.encode()).hexdigest()[:8]}"
         return sanitize(raw)
 
     @property
@@ -141,6 +155,8 @@ class SLURMWorkerSpec(WorkerSpec):
         return int(self.gpu_resources.split(":")[-1])
     
     def get_spec_dict(self) -> dict[str, any]:
+        directives = list(get_extra_args(self)[1])
+        directives.extend(self.job_extra_directives)
         job = {
             "cls": SLURMJob,
             "cores": self.cores,
@@ -150,11 +166,12 @@ class SLURMWorkerSpec(WorkerSpec):
             "walltime": self.walltime,
             "account": self.account,
             "queue": self.partition,
-            "job_extra_directives": get_extra_args(self)[1],
+            "job_extra_directives": directives,
             "resources": self.resources,
         }
+        exports = list(self.env)
         if not self.daemon:
-            job["job_script_prologue"] = [
-                "export DASK_DISTRIBUTED__WORKER__DAEMON=False",
-            ]
+            exports.append(("DASK_DISTRIBUTED__WORKER__DAEMON", "False"))
+        if exports:
+            job["job_script_prologue"] = [f"export {key}={shlex.quote(value)}" for key, value in exports]
         return {self.spec_key: job}

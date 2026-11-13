@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -19,10 +18,10 @@ from dsbo.surrogates.easyscale.random import (
     VirtualRankContext,
     virtual_rng_scope,
 )
+from dsbo.surrogates.easyscale.profile import timed
 from dsbo.surrogates.easyscale.strategy.reduction import (
     aggregate_metrics,
     assign_gradients,
-    log_metrics,
     reduce_gradients,
 )
 from dsbo.surrogates.easyscale.strategy.validation import (
@@ -49,6 +48,16 @@ def training_rng_scope(module: L.LightningModule, device: torch.device) -> Gener
     finally:
         process_rng.restore()
         module.zero_grad(set_to_none=True)
+
+
+def log_metrics(module, averaged_metrics, averaged_loss, batch_size: int) -> None:
+    averaged_metrics = dict(averaged_metrics)
+    averaged_metrics.setdefault("train_loss", (averaged_loss.detach().item(), (), {"on_step": False, "on_epoch": True, "prog_bar": True}))
+    for name, (value, args, kwargs) in averaged_metrics.items():
+        kwargs = dict(kwargs, sync_dist=False)
+        if kwargs.get("on_epoch"):
+            kwargs["batch_size"] = batch_size
+        module.log(name, value, *args, **kwargs)
 
 
 class EasyScaleStrategy(SingleDeviceStrategy):
@@ -85,7 +94,7 @@ class EasyScaleStrategy(SingleDeviceStrategy):
         self.last_step_profile: dict[str, float] = {}
         self.profile_totals: dict[str, float] = {}
         self.profile_steps = 0
-        self._step_profile: dict[str, float] | None = None
+        self._step_profile: dict[str, float] = {}
 
     @property
     def is_global_zero(self) -> bool:
@@ -100,15 +109,19 @@ class EasyScaleStrategy(SingleDeviceStrategy):
             return super().batch_to_device(batch, device, dataloader_idx)
         return batch
 
+    def optimizer_step(self, optimizer, closure, model=None, **kwargs):
+        self._step_profile.clear()
+        with timed(self._step_profile, "step_total", device=self.root_device):
+            result = super().optimizer_step(optimizer, closure, model=model, **kwargs)
+        self.last_step_profile = self._step_profile.copy()
+        self.profile_steps += 1
+        for name, value in self._step_profile.items(): 
+            self.profile_totals[name] = self.profile_totals.get(name, 0.0) + value
+        return result
+
     def training_step(self, batch: VirtualBatch, batch_idx: int):
         validate_virtual_batch(batch, self.assigned_ests)
 
-        step_started = time.perf_counter()
-        profile = {
-            "est_data_transfer": 0.0,
-            "est_compute": 0.0,
-            "_step_started": step_started,
-        }
         pending = []
         parameters = [parameter for parameter in self.lightning_module.parameters() if parameter.requires_grad]
         parameter_sizes = [parameter.numel() for parameter in parameters]
@@ -116,37 +129,28 @@ class EasyScaleStrategy(SingleDeviceStrategy):
         with training_rng_scope(self.lightning_module, self.root_device):
             for rank, est_batch in batch.items():
 
-                transfer_started = time.perf_counter()
-                est_batch = move_data_to_device(est_batch, self.root_device)
-                if self.root_device.type == "cuda":
-                    torch.cuda.synchronize(self.root_device)
-                profile["est_data_transfer"] += time.perf_counter() - transfer_started
+                with timed(self._step_profile, "est_data_transfer", device=self.root_device):
+                    est_batch = move_data_to_device(est_batch, self.root_device)
 
-                compute_started = time.perf_counter()
-                self.lightning_module.zero_grad(set_to_none=True)
-                
-                with virtual_rng_scope(self.contexts[rank], self.root_device), capture_log(self.lightning_module) as metrics:
-                    loss = extract_loss(self.lightning_module.training_step(est_batch, batch_idx))
+                with timed(self._step_profile, "est_compute", device=self.root_device):
+                    self.lightning_module.zero_grad(set_to_none=True)
 
-                gradients = (
-                    torch.autograd.grad(loss, parameters, allow_unused=True)
-                    if parameters
-                    else ()
-                )
+                    with virtual_rng_scope(self.contexts[rank], self.root_device), capture_log(self.lightning_module) as metrics:
+                        loss = extract_loss(self.lightning_module.training_step(est_batch, batch_idx))
 
-                flattened, mask = flatten_gradients(gradients, parameter_sizes, self.root_device)
-                if self.root_device.type == "cuda":
-                    torch.cuda.synchronize(self.root_device)
-                profile["est_compute"] += time.perf_counter() - compute_started
-                pending.append(PendingEST(rank, flattened, mask, float(loss.detach().cpu()), metrics))
-                self.est_steps += 1
+                    gradients = (
+                        torch.autograd.grad(loss, parameters, allow_unused=True)
+                        if parameters
+                        else ()
+                    )
+
+                    flattened, mask = flatten_gradients(gradients, parameter_sizes, self.root_device)
+
+                    pending.append(PendingEST(rank, flattened, mask, float(loss.detach().cpu()), metrics))
+                    self.est_steps += 1
 
         self._pending = pending
         self._pending_batch_size = sum(len(indices) for indices in batch.indices)
-        profile["est_count"] = float(len(pending))
-        profile["gradient_elements"] = float(sum(parameter_sizes))
-        profile["parameter_count"] = float(len(parameter_sizes))
-        self._step_profile = profile
         return torch.tensor(
             sum(item.loss for item in pending) / len(pending),
             device=self.root_device,
@@ -155,9 +159,6 @@ class EasyScaleStrategy(SingleDeviceStrategy):
 
     def backward(self, closure_loss, optimizer, *args, **kwargs):
         assert self._pending is not None, "EasyScale backward has no EST gradients."
-
-        profile = dict(self._step_profile or {})
-        backward_started = time.perf_counter()
         self.pre_backward(closure_loss)
         closure_loss = self.precision_plugin.pre_backward(
             closure_loss,
@@ -170,15 +171,12 @@ class EasyScaleStrategy(SingleDeviceStrategy):
             self.physical_world_size,
             self.root_device,
         )
-        averages, global_mask, averaged_loss = reduce_gradients(
-            *reduction, timings=profile
-        )
-        averaged_metrics = aggregate_metrics(*reduction, timings=profile)
+        with timed(self._step_profile, "gradient_aggregation_total", device=self.root_device):
+            averages, global_mask, averaged_loss = reduce_gradients(*reduction)
+        averaged_metrics = aggregate_metrics(*reduction)
         self._pending = None
 
-        assignment_started = time.perf_counter()
         assign_gradients(self.lightning_module, averages, global_mask)
-        profile["gradient_assignment"] = time.perf_counter() - assignment_started
         closure_loss.detach().copy_(averaged_loss)
         log_metrics(
             self.lightning_module,
@@ -191,13 +189,6 @@ class EasyScaleStrategy(SingleDeviceStrategy):
             self.lightning_module,
         )
         self.post_backward(closure_loss)
-        profile["backward_total"] = time.perf_counter() - backward_started
-        step_started = profile.pop("_step_started", backward_started)
-        profile["step_total"] = time.perf_counter() - step_started
-        self.last_step_profile = profile
-        self.profile_steps += 1
-        for name, value in profile.items():
-            self.profile_totals[name] = self.profile_totals.get(name, 0.0) + value
         return closure_loss
 
     def validation_step(self, *args, **kwargs):
@@ -222,6 +213,8 @@ class EasyScaleStrategy(SingleDeviceStrategy):
     def reduce(self, tensor, group=None, reduce_op="mean"):
         if self.physical_world_size == 1 or not isinstance(tensor, torch.Tensor):
             return tensor
+        # Lightning passes ReduceOp enums (str() -> "RedOpType.AVG") 
+        # or strings ("mean"/"avg"); match both.
         operation = str(reduce_op).lower()
         if operation.endswith("mean") or operation.endswith("avg"):
             result = self.collective.all_reduce(tensor.clone(), op="sum")

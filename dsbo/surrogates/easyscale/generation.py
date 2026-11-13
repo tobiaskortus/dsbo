@@ -50,9 +50,14 @@ class GenerationResult(GenerationHeader):
     should_stop: bool = False
     action: GenerationAction = GenerationAction.STOP
     timings: dict[str, float] = dataclasses.field(default_factory=dict, kw_only=True)
+    worker: str = ""
+    worker_address: str = ""
+    device: str = ""
+    hardware: str | None = dataclasses.field(default=None, kw_only=True)
+    capability: float | None = dataclasses.field(default=None, kw_only=True)
+    performance: dict[str, Any] = dataclasses.field(default_factory=dict, kw_only=True)
+    gradient_bytes: int | None = dataclasses.field(default=None, kw_only=True)
 
     @property
     def model_state(self) -> dict[str, torch.Tensor] | None:
-        if self.rank_zero_state is None:
-            return None
         return self.rank_zero_state.get("model_state")

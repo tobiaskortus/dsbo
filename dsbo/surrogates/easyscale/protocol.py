@@ -5,6 +5,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+ExecutionLayout = tuple[tuple[str, int], ...]
+
 @dataclass(frozen=True)
 class EasyScaleSchedulerConfig:
     proposal_count: int = 3
@@ -13,6 +15,9 @@ class EasyScaleSchedulerConfig:
     proposal_increment: int = 1
     control_interval_steps: int = 25
     capabilities: Mapping[str, float] = field(default_factory=dict)
+    scale_out_settle_seconds: float = 10.0
+    scale_out_max_wait_seconds: float = 30.0
+    min_generation_seconds: float = 30.0
 
 
 def calculate_est_count(resource_count: int, assigned_count: int) -> int:
@@ -25,7 +30,7 @@ def is_same_config(a: ESTPlan, b: ESTPlan) -> bool:
     return (
         a.resource_type == b.resource_type
         and a.resource_count == b.resource_count
-        and a.assigned_count == b.assigned_count
+        and a.est_counts == b.est_counts
     )
 
 
@@ -63,6 +68,8 @@ class ESTPlan:
     waste: float
     estimated_throughput: float
     measured_throughput: float | None = None
+    est_counts: tuple[int, ...] = field(kw_only=True)
+    execution_layout: ExecutionLayout | None = field(default=None, kw_only=True)
 
 @dataclass(frozen=True)
 class Proposal:
@@ -132,73 +139,71 @@ class PlanDatabase:
         self.resource_type = resource_type
         self.config = config
         self.capability = config.capabilities.get(resource_type)
+        self.hardware_capabilities: dict[str, float] = dict(config.capabilities)
         self.current_plan: ESTPlan | None = None
         self.previous_plan: ESTPlan | None = None
-        self._profiled_throughputs: dict[tuple[int, int], float] = {}
+        self.worker_hardware: tuple[str | None, ...] = ()
+        self._profiled_throughputs: dict[ExecutionLayout, float] = {}
 
     def set_capability(self, capability: float) -> None:
         self.capability = capability
 
-    def enumerate_plans(self, resource_count: int) -> tuple[ESTPlan, ...]:
-        if resource_count < 1:
-            raise ValueError("resource_count must be >= 1.")
+    def update_capabilities(self, capabilities: Sequence[float | None]) -> None:
+        if self.current_plan is None or self.current_plan.execution_layout is None or len(capabilities) != self.current_plan.resource_count:
+            raise ValueError("capability samples must match the bound execution layout.")
+        
+        grouped: dict[str, list[float]] = {}
+        for (hardware, _), capability in zip(self.current_plan.execution_layout, capabilities):
+            if capability is not None and math.isfinite(capability) and capability > 0:
+                grouped.setdefault(hardware, []).append(capability)
+
+        for hardware, samples in grouped.items():
+            self.hardware_capabilities[hardware] = sum(sample / len(samples) for sample in samples)
+        
+        identities = {hardware for hardware, _ in self.current_plan.execution_layout}
+
+        if len(identities) == 1 and (hardware := next(iter(identities))) in self.hardware_capabilities:
+            self.capability = self.hardware_capabilities[hardware]
+            plan = self.current_plan
+            overload = calculate_overload(plan.assigned_count, self.capability)
+            waste = calculate_waste(plan.assigned_count, self.capability, plan.n_est, self.max_p, overload)
+            estimated = self._profiled_throughputs.get(plan.execution_layout, calculate_throughput(plan.resource_count, self.capability, waste))
+            self.current_plan = replace(plan, f_overload=overload, waste=waste, estimated_throughput=estimated)
+
+    def enumerate_plans(self, resource_count: int, *, hardware: Sequence[str] | None = None) -> tuple[ESTPlan, ...]:
+        plan = self.initial_plan(resource_count)
         if self.capability is None:
             raise ValueError(
                 f"No EasyScale capability profile for resource type: {self.resource_type}"
             )
 
-        plans = []
-        for assigned_count in range(1, self.max_p + 1):
-            n_est = calculate_est_count(resource_count, assigned_count)
-            if n_est < self.max_p:
-                continue
+        if hardware is None and len(self.worker_hardware) >= resource_count:
+            identities = set(self.worker_hardware)
+            active_layout = None if self.current_plan is None else self.current_plan.execution_layout
+            if len(identities) == 1 and None not in identities and (active_layout is None or all(identity in identities for identity, _ in active_layout)):
+                hardware = (self.worker_hardware[0],) * resource_count
+        
+        if hardware is not None and len(hardware) != resource_count:
+            raise ValueError("hardware must identify every physical rank.")
 
-            f_overload = calculate_overload(assigned_count, self.capability)
-            waste = calculate_waste(
-                assigned_count, self.capability, n_est, self.max_p, f_overload
-            )
-            analytical_throughput = calculate_throughput(
-                resource_count, self.capability, waste
-            )
-
-            # A profiled throughput corrects the analytical estimate when model bias is too high.
-            profiled_throughput = self._profiled_throughputs.get(
-                (resource_count, assigned_count)
-            )
-            
-            estimated_throughput = (
-                analytical_throughput
-                if profiled_throughput is None
-                else profiled_throughput
-            )
-
-            plans.append(
-                ESTPlan(
-                    resource_type=self.resource_type,
-                    resource_count=resource_count,
-                    assigned_count=assigned_count,
-                    n_est=n_est,
-                    f_overload=f_overload,
-                    waste=waste,
-                    estimated_throughput=estimated_throughput,
-                )
-            )
-
-        return tuple(plans)
+        execution_layout = None
+        if hardware is not None:
+            execution_layout = tuple(zip(hardware, plan.est_counts))
+        profiled_throughput = self._profiled_throughputs.get(execution_layout)
+        f_overload = calculate_overload(plan.assigned_count, self.capability)
+        waste = calculate_waste(plan.assigned_count, self.capability, plan.n_est, self.max_p, f_overload)
+        estimated_throughput = calculate_throughput(resource_count, self.capability, waste) if profiled_throughput is None else profiled_throughput
+        return (replace(plan, f_overload=f_overload, waste=waste, estimated_throughput=estimated_throughput, execution_layout=execution_layout),)
 
     def select_plan(self, resource_count: int) -> ESTPlan:
-        plans = self.enumerate_plans(resource_count)
-
-        if not plans:
-            raise ValueError("resource_count cannot host max_p ESTs.")
-
-        return min(
-            plans,
-            key=lambda plan: (-plan.estimated_throughput, plan.assigned_count),
-        )
+        return self.enumerate_plans(resource_count)[0]
 
     def initial_plan(self, resource_count: int) -> ESTPlan:
-        assigned_count = math.ceil(self.max_p / resource_count)
+        if not 1 <= resource_count <= self.max_p:
+            raise ValueError("resource_count must be between 1 and max_p.")
+        per_worker, remainder = divmod(self.max_p, resource_count)
+        est_counts = tuple(per_worker + (rank < remainder) for rank in range(resource_count))
+        assigned_count = max(est_counts)
         n_est = calculate_est_count(resource_count, assigned_count)
         f_overload = calculate_overload(assigned_count, 1.0)
         waste = calculate_waste(assigned_count, 1.0, n_est, self.max_p, f_overload)
@@ -211,6 +216,7 @@ class PlanDatabase:
             f_overload=f_overload,
             waste=waste,
             estimated_throughput=estimated_throughput,
+            est_counts=est_counts,
         )
 
     def propose(self, current_plan: ESTPlan, max_resource_count: int) -> tuple[Proposal, ...]:
@@ -265,6 +271,19 @@ class PlanDatabase:
         self.previous_plan = self.current_plan
         self.current_plan = plan
 
+    def update_execution_layout(self, layout: ExecutionLayout) -> None:
+        counts = tuple(count for _, count in layout)
+        assigned_count = max(counts)
+        n_est = calculate_est_count(len(layout), assigned_count)
+        capability = 1.0 if self.capability is None else self.capability
+        overload = calculate_overload(assigned_count, capability)
+        waste = calculate_waste(assigned_count, capability, n_est, self.max_p, overload)
+        analytical = calculate_throughput(len(layout), capability, waste)
+        estimated = self._profiled_throughputs.get(layout, analytical)
+        # Binding an actual group must not replace the previous scale-out baseline.
+        self.current_plan = replace(self.current_plan, est_counts=counts, assigned_count=assigned_count, n_est=n_est, f_overload=overload, waste=waste, execution_layout=layout, estimated_throughput=estimated, measured_throughput=None)
+        self.update_capabilities((None,) * len(layout))
+
     def update_profile(self, plan: ESTPlan, measured_throughput: float) -> ESTPlan:
         if not math.isfinite(measured_throughput) or measured_throughput <= 0:
             raise ValueError("measured_throughput must be finite and > 0.")
@@ -272,9 +291,8 @@ class PlanDatabase:
         estimated = plan.estimated_throughput
         bias = math.inf if estimated == 0 else abs(measured_throughput - estimated) / estimated
         if bias > self.config.profile_bias_threshold:
-            self._profiled_throughputs[
-                (plan.resource_count, plan.assigned_count)
-            ] = measured_throughput
+            if plan.execution_layout is not None:
+                self._profiled_throughputs[plan.execution_layout] = measured_throughput
             estimated = measured_throughput
 
         updated = replace(
@@ -306,9 +324,13 @@ class PlanDatabase:
         if not scaled_out or measured_throughput >= previous_throughput:
             return None
         
-        self.current_plan = previous
-        self.previous_plan = current
-        return previous
+        if current.execution_layout is not None:
+            self._profiled_throughputs[current.execution_layout] = measured_throughput
+        if previous.execution_layout is not None:
+            self._profiled_throughputs[previous.execution_layout] = previous_throughput
+        self.current_plan = replace(previous, estimated_throughput=previous_throughput)
+        self.previous_plan = replace(current, estimated_throughput=measured_throughput)
+        return self.current_plan
 
 
 def assign_virtual_ranks(
@@ -324,17 +346,17 @@ def assign_virtual_ranks(
     if len(addresses) * assigned_count < max_p:
         raise ValueError("plan allocation does not have capacity for every EST.")
 
-    assigned: dict[str, list[int]] = {address: [] for address in addresses}
-    rank = 0
-    for address in addresses:
-        assigned[address].append(rank)
-        rank += 1
-    while rank < max_p:
-        for address in addresses:
-            if len(assigned[address]) < assigned_count:
-                assigned[address].append(rank)
-                rank += 1
-                if rank == max_p:
-                    break
-
-    return {address: tuple(values) for address, values in assigned.items()}
+    if isinstance(plan, ESTPlan):
+        counts = plan.est_counts
+        if len(counts) != len(addresses) or any(type(count) is not int or count < 1 or count > assigned_count for count in counts) or sum(counts) != max_p:
+            raise ValueError("plan EST counts must match the workers and cover every EST exactly once.")
+    else:
+        per_worker, remainder = divmod(max_p, len(addresses))
+        counts = tuple(per_worker + (rank < remainder) for rank in range(len(addresses)))
+        
+    assigned = {}
+    start = 0
+    for address, count in zip(addresses, counts):
+        assigned[address] = tuple(range(start, start + count))
+        start += count
+    return assigned

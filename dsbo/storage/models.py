@@ -78,6 +78,37 @@ class Intermediate(SQLModel, table=True):
     walltime: float = Field(sa_column=Column(Double))
 
 
+class EasyScaleGeneration(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("job_id", "generation", name="uq_easyscale_job_generation"),)
+
+    id:                  str          = Field(default_factory=_new_id, primary_key=True)
+    exec_id:             str          = Field(index=True)
+    job_id:              str          = Field(index=True)
+    model_tag:           str          = Field(index=True)
+    generation:          int
+
+    world_size:          int
+    virtual_world_size:  int
+    backend:             str
+    gradient_reduction:  str
+    config:              dict         = Field(default_factory=dict, sa_column=Column(JSON))
+
+    status:              JobStatus    = JobStatus.RUNNING
+    started:             float        = Field(sa_column=Column(Double))
+    finished:            float | None = Field(default=None, sa_column=Column(Double, nullable=True))
+    updated_at:          float        = Field(sa_column=Column(Double, index=True), default_factory=time.time)
+    completed_epoch:     int          = 0
+    target_epoch:        int
+    throughput:          float | None = None
+    action:              str | None   = None
+    error:               str | None   = None
+
+    scatter:             float        = 0.0
+    submission:          float        = 0.0
+    gather:              float        = 0.0
+    ranks:               list[dict]   = Field(default_factory=list, sa_column=Column(JSON))
+
+
 class Trial(SQLModel, table=True):
     id:         str     = Field(default_factory=_new_id, primary_key=True)
     step:       int

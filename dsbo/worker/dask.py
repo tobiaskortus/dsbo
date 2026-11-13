@@ -27,6 +27,7 @@ from typing import Any, Generator, Optional, Iterable, TYPE_CHECKING
 
 
 if TYPE_CHECKING:
+    from distributed.scheduler import TaskState, WorkerState
     from dsbo.worker.spec import WorkerSpec
     from dsbo.workflow import Workflow
     from dsbo.modules import Module
@@ -234,7 +235,58 @@ class WorkerContext:
 
 
 class EasyScaleIntegratedHeterogeneousScheduler(HeterogeneousScheduler):
-    def adaptive_target(self, worker_types=None, target_duration=None):
+    def valid_workers(self, ts: TaskState) -> set[WorkerState] | None:
+        valid = super().valid_workers(ts)
+        if not (ts.annotations or {}).get("dsbo_easyscale_sibling"):
+            return valid
+
+        candidates = self.running if valid is None else valid
+        return {worker for worker in candidates if not worker.long_running}
+
+    def _easyscale_protected(self) -> dict[str, set[str]]:
+        addresses: set[str] = set()
+        for ws in self.workers.values():
+            if ws.long_running or any(str(ts.key).startswith("dsbo-easyscale-") for ts in ws.processing):
+                addresses.add(ws.address)
+
+        names = {
+            str(ws.name)
+            for ws in self.workers.values()
+            if ws.address in addresses
+        }
+
+        return {"addresses": addresses, "names": names}
+
+    async def retire_workers(
+        self,
+        workers: list[str] | None = None,
+        *,
+        names: list[str] | None = None,
+        close_workers: bool = False,
+        remove: bool = True,
+        stimulus_id: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        protected = self._easyscale_protected()
+        if workers is not None:
+            workers = [w for w in workers if w not in protected["addresses"]]
+        if names is not None:
+            names = [n for n in names if str(n) not in protected["names"]]
+
+        return await super().retire_workers(
+            workers,
+            names=names,
+            close_workers=close_workers,
+            remove=remove,
+            stimulus_id=stimulus_id,
+            **kwargs,
+        )
+
+    def adaptive_target(
+        self,
+        worker_types: list[str] | None = None,
+        target_duration: float | None = None,
+    ) -> dict[str, int]:
         target = super().adaptive_target(
             worker_types=worker_types,
             target_duration=target_duration,

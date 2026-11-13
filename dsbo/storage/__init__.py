@@ -18,7 +18,7 @@ from dsbo.storage.artifact import Artifact, ArtifactRef
 
 if TYPE_CHECKING:
     from dsbo.utils.plugins import TaskStreamPlugin
-    from dsbo.storage.models import Batch, Execution, JobStatus, JobTrace, Workflow, Trial
+    from dsbo.storage.models import Batch, EasyScaleGeneration, Execution, JobStatus, JobTrace, Workflow, Trial
 
 
 class TransitionWriter(ABC):
@@ -138,6 +138,22 @@ class WorkflowStorageBase(ABC):
         pass
 
 
+class EasyScaleStorageBase(ABC):
+    def __init__(self, readonly: bool = False):
+        self._readonly = readonly
+
+    @abstractmethod
+    def open_generation(self, record: EasyScaleGeneration) -> None:
+        pass
+
+    @abstractmethod
+    def close_generation(self, record: EasyScaleGeneration) -> None:
+        pass
+
+    @abstractmethod
+    def get_generations(self, job_id: str | None = None, exec_id: str | None = None, updated_after: float | None = None) -> list[EasyScaleGeneration]:
+        pass
+
 class IntermediatesStorageBase(ABC):
     def __init__(self):
         pass
@@ -201,11 +217,12 @@ class TrialStorageBase(ABC):
 
 
 class StudyStorageBase:
-    def __init__(self, db_path: Path | str):
+    def __init__(self):
         self._trial_storage: Optional[TrialStorageBase] = None
         self._workflow_storage: Optional[WorkflowStorageBase] = None
         self._artifact_storage: Optional[ArtifactStorageBase] = None
         self._intermediates_storage: Optional[IntermediatesStorageBase] = None
+        self._easyscale_storage: Optional[EasyScaleStorageBase] = None
 
     @property
     def workflow(self) -> WorkflowStorageBase:
@@ -214,6 +231,10 @@ class StudyStorageBase:
     @property
     def intermediates(self) -> IntermediatesStorageBase:
         return self._intermediates_storage
+
+    @property
+    def easyscale(self) -> EasyScaleStorageBase:
+        return self._easyscale_storage
 
     @property
     def trials(self) -> TrialStorageBase:

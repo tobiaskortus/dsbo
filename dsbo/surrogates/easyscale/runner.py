@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import platform
 import socket
 import time
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from datetime import timedelta
-from pathlib import Path
 
 import cloudpickle
 import lightning as L
@@ -18,6 +18,7 @@ from lightning.pytorch.callbacks import EarlyStopping
 
 from dsbo.logger import WorkflowTaskLogger
 from dsbo.surrogates.easyscale.strategy import EasyScaleStrategy
+from dsbo.surrogates.easyscale.protocol import ExecutionLayout
 from dsbo.surrogates.easyscale.virtual_dataset import (
     VirtualDataLoader,
     build_virtual_dataloader,
@@ -39,6 +40,13 @@ from dsbo.surrogates.easyscale.random import (
     _restore_random_state,
     seed_everything,
 )
+
+
+def hardware_identity(device: torch.device) -> str:
+    if device.type == "cuda":
+        properties = torch.cuda.get_device_properties(device)
+        return f"cuda:{properties.name}:{properties.major}.{properties.minor}:{properties.multi_processor_count}:{properties.total_memory}"
+    return f"cpu:{socket.gethostname()}:{platform.machine()}:{platform.processor()}"
 
 
 def connect_dask():
@@ -85,6 +93,28 @@ def framework_state_preserved(device: torch.device):
         torch.backends.cudnn.deterministic = saved["cudnn_deterministic"]
 
 
+def wait_for_all_ranks_ready(
+    store: dist.TCPStore,
+    world_size: int,
+    ready_count: int,
+    timeout: float,
+    deadline: float,
+) -> None:
+    poll = 0.01
+    while ready_count < world_size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            ready_keys = [f"rank-{rank}-ready" for rank in range(world_size)]
+            missing = [key for key in ready_keys if not store.check([key])]
+            raise dist.DistStoreError(
+                f"EasyScale rank readiness timed out after {timeout:.1f}s; "
+                f"missing keys: {', '.join(missing)}"
+            )
+        time.sleep(min(poll, remaining))
+        poll = min(poll * 1.5, 0.1)
+        ready_count = int(store.get("ranks-ready-count").decode())
+
+
 @contextmanager
 def process_group(
     plan: GenerationPlan,
@@ -93,8 +123,16 @@ def process_group(
     timeout: float,
     rendezvous_store: dist.TCPStore | None = None,
 ):
-    timings = {}
+    timings = {"endpoint": 0.0, "process_group_teardown": 0.0}
     rendezvous_started = time.perf_counter()
+    rendezvous_deadline = time.monotonic() + timeout
+
+    def remaining_timeout() -> float:
+        remaining = rendezvous_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"EasyScale rendezvous exceeded its {timeout:.1f}s timeout.")
+        return remaining
+
     WorkflowTaskLogger.get_current().log(
         f"easyscale rendezvous start generation={plan.generation} "
         f"rank={plan.physical_rank} world={plan.physical_world_size} "
@@ -140,94 +178,46 @@ def process_group(
                 rendezvous_port or 0,
                 plan.physical_world_size,
                 True,
-                timedelta(seconds=timeout),
+                timedelta(seconds=remaining_timeout()),
                 wait_for_workers=False,
             )
             timings["store"] = time.perf_counter() - endpoint_started
             rendezvous_port = store.port
-            WorkflowTaskLogger.get_current().log(
-                f"easyscale rendezvous store-ready generation={plan.generation} "
-                f"rank={plan.physical_rank} host={rendezvous_host} "
-                f"port={rendezvous_port} elapsed={timings['store']:.3f}s"
-            )
             if rendezvous_variable is not None:
                 publish_started = time.perf_counter()
                 rendezvous_variable.set(
                     (rendezvous_host, rendezvous_port),
-                    timeout=timeout,
+                    timeout=remaining_timeout(),
                 )
                 timings["endpoint"] = time.perf_counter() - publish_started
-                WorkflowTaskLogger.get_current().log(
-                    f"easyscale rendezvous endpoint-published generation={plan.generation} "
-                    f"rank={plan.physical_rank} elapsed={timings['endpoint']:.3f}s"
-                )
         else:
             if rendezvous_host is None or rendezvous_port is None:
                 endpoint_started = time.perf_counter()
-                WorkflowTaskLogger.get_current().log(
-                    f"easyscale rendezvous endpoint-wait generation={plan.generation} "
-                    f"rank={plan.physical_rank}"
-                )
                 rendezvous_host, rendezvous_port = rendezvous_variable.get(
-                    timeout=timeout
+                    timeout=remaining_timeout()
                 )
                 timings["endpoint"] = time.perf_counter() - endpoint_started
-                WorkflowTaskLogger.get_current().log(
-                    f"easyscale rendezvous endpoint-ready generation={plan.generation} "
-                    f"rank={plan.physical_rank} host={rendezvous_host} "
-                    f"port={rendezvous_port} elapsed={timings['endpoint']:.3f}s"
-                )
             store_started = time.perf_counter()
             store = dist.TCPStore(
                 rendezvous_host,
                 int(rendezvous_port),
                 plan.physical_world_size,
                 False,
-                timedelta(seconds=timeout),
+                timedelta(seconds=remaining_timeout()),
             )
             timings["store"] = time.perf_counter() - store_started
-            WorkflowTaskLogger.get_current().log(
-                f"easyscale rendezvous store-ready generation={plan.generation} "
-                f"rank={plan.physical_rank} host={rendezvous_host} "
-                f"port={rendezvous_port} elapsed={timings['store']:.3f}s"
-            )
         rank_alignment_started = time.perf_counter()
         store.set(f"rank-{plan.physical_rank}-ready", "1")
-        WorkflowTaskLogger.get_current().log(
-            f"easyscale rendezvous rank-ready generation={plan.generation} "
-            f"rank={plan.physical_rank}"
-        )
+        ready_count = store.add("ranks-ready-count", 1)
         if plan.physical_rank == 0:
-            WorkflowTaskLogger.get_current().log(
-                f"easyscale rendezvous rank-alignment-wait generation={plan.generation} "
-                f"rank={plan.physical_rank} expected={plan.physical_world_size}"
-            )
-            store.wait(
-                [f"rank-{rank}-ready" for rank in range(plan.physical_world_size)],
-                timedelta(seconds=timeout),
-            )
+            wait_for_all_ranks_ready(store, plan.physical_world_size, ready_count, timeout, rendezvous_deadline)
             store.set("ranks-ready", "1")
-            WorkflowTaskLogger.get_current().log(
-                f"easyscale rendezvous ranks-aligned generation={plan.generation} "
-                f"rank={plan.physical_rank}"
-            )
         else:
-            WorkflowTaskLogger.get_current().log(
-                f"easyscale rendezvous rank-alignment-wait generation={plan.generation} "
-                f"rank={plan.physical_rank}"
-            )
-            store.wait(["ranks-ready"], timedelta(seconds=timeout))
+            store.wait(["ranks-ready"], timedelta(seconds=remaining_timeout()))
         timings["rank_alignment"] = time.perf_counter() - rank_alignment_started
-        WorkflowTaskLogger.get_current().log(
-            f"easyscale rendezvous rank-alignment-done generation={plan.generation} "
-            f"rank={plan.physical_rank} elapsed={timings['rank_alignment']:.3f}s"
-        )
         process_group_started = time.perf_counter()
-        WorkflowTaskLogger.get_current().log(
-            f"easyscale process-group-init start generation={plan.generation} "
-            f"rank={plan.physical_rank} world={plan.physical_world_size} "
-            f"backend={plan.backend}"
-        )
+        remaining_timeout()
+        # This timeout also governs all subsequent training collectives.
         dist.init_process_group(
             backend=plan.backend,
             store=store,
@@ -236,28 +226,15 @@ def process_group(
             timeout=timedelta(seconds=timeout),
         )
         timings["process_group_init"] = time.perf_counter() - process_group_started
-        timings["rendezvous"] = time.perf_counter() - rendezvous_started
-        WorkflowTaskLogger.get_current().log(
-            f"easyscale process-group-init done generation={plan.generation} "
-            f"rank={plan.physical_rank} elapsed={timings['process_group_init']:.3f}s "
-            f"rendezvous_total={timings['rendezvous']:.3f}s"
-        )
         started = True
+        timings["rendezvous"] = time.perf_counter() - rendezvous_started
         yield rendezvous_host, rendezvous_port, timings
     finally:
         try:
             if started and dist.is_initialized():
                 teardown_started = time.perf_counter()
-                WorkflowTaskLogger.get_current().log(
-                    f"easyscale process-group-teardown start "
-                    f"generation={plan.generation} rank={plan.physical_rank}"
-                )
                 dist.destroy_process_group()
-                WorkflowTaskLogger.get_current().log(
-                    f"easyscale process-group-teardown done "
-                    f"generation={plan.generation} rank={plan.physical_rank} "
-                    f"elapsed={time.perf_counter() - teardown_started:.3f}s"
-                )
+                timings["process_group_teardown"] = time.perf_counter() - teardown_started
         finally:
             if plan.physical_rank == 0 and rendezvous_variable is not None:
                 rendezvous_variable.delete()
@@ -277,6 +254,7 @@ def _run_generation_body(
     boundary_decision: Callable[[int, float | None, bool], GenerationAction] | None,
     boundary_retry: Callable[[], bool] | None,
     runtime_plugin=None,
+    capability_report: Callable[[tuple[float | None, ...]], None] | None = None,
 ) -> GenerationResult:
     body_started = time.perf_counter()
     seed = int(getattr(training_config, "seed", 0))
@@ -325,16 +303,12 @@ def _run_generation_body(
         virtual_loader.restore_workers()
     if runtime_plugin is not None and virtual_loader.persistent_workers:
         runtime_plugin.retain_dataloader(plan.job_id, virtual_loader)
-    WorkflowTaskLogger.get_current().log(
-        f"easyscale virtual-dataloader ready generation={plan.generation} "
-        f"rank={plan.physical_rank} ests={plan.assigned_ests} "
-        f"elapsed={time.perf_counter() - body_started:.3f}s"
-    )
     control_callback = EasyScaleControlCallback(
         strategy,
         boundary_decision,
         training_config.easyscale_scheduler.control_interval_steps,
         boundary_retry,
+        capability_report,
     )
     checkpoint_callback = EasyScaleCheckpointCallback(
         strategy,
@@ -366,22 +340,7 @@ def _run_generation_body(
         reload_dataloaders_every_n_epochs=1,
         precision="32-true",
     )
-    WorkflowTaskLogger.get_current().log(
-        f"easyscale trainer ready generation={plan.generation} "
-        f"rank={plan.physical_rank} elapsed={time.perf_counter() - body_started:.3f}s"
-    )
-    if state.checkpoint_path is not None:
-        checkpoint = Path(state.checkpoint_path)
-        checkpoint_size = checkpoint.stat().st_size
-        WorkflowTaskLogger.get_current().log(
-            f"easyscale checkpoint preflight generation={plan.generation} "
-            f"rank={plan.physical_rank} path={checkpoint} bytes={checkpoint_size}"
-        )
     fit_started = time.perf_counter()
-    WorkflowTaskLogger.get_current().log(
-        f"easyscale trainer-fit start generation={plan.generation} "
-        f"rank={plan.physical_rank} checkpoint={state.checkpoint_path or 'none'}"
-    )
     trainer.fit(
         model,
         train_dataloaders=virtual_loader,
@@ -424,16 +383,8 @@ def _run_generation_body(
         f"profile_mean_{name}": total / profile_steps
         for name, total in strategy.profile_totals.items()
         if profile_steps
-        and name not in {"est_count", "parameter_count"}
     }
-    control_events = control_callback.control_profile_events
-    if control_events:
-        profile_means.update(
-            {
-                f"profile_mean_{name}": total / control_events
-                for name, total in control_callback.control_profile_totals.items()
-            }
-        )
+    from dsbo.surrogates.trainer import PerfCallback
 
     return GenerationResult(
         job_id=plan.job_id,
@@ -444,12 +395,15 @@ def _run_generation_body(
         checkpoint_path=plan.checkpoint_path,
         target_epoch=control_callback.completed_epoch,
         throughput=control_callback.throughput,
+        capability=control_callback.capabilities[plan.physical_rank] if control_callback.capabilities else None,
         contexts=contexts,
         should_stop=bool(trainer.should_stop),
         action=control_callback.action,
         rendezvous_host=rendezvous_host,
         rendezvous_port=rendezvous_port,
         rank_zero_state=rank_zero_state,
+        gradient_bytes=sum(parameter.numel() * parameter.element_size() for parameter in model.parameters() if parameter.requires_grad),
+        performance=next((callback.easyscale_performance for callback in callbacks if isinstance(callback, PerfCallback)), {}),
         timings={
             "worker_setup": fit_started - body_started,
             "trainer_fit": fit_seconds,
@@ -489,6 +443,8 @@ def run_easyscale_generation(
     boundary_decision: Callable[[int, float | None, bool], GenerationAction] | None = None,
     boundary_retry: Callable[[], bool] | None = None,
     rendezvous_store: dist.TCPStore | None = None,
+    execution_ready: Callable[[ExecutionLayout], None] | None = None,
+    capability_report: Callable[[tuple[float | None, ...]], None] | None = None,
 ) -> GenerationResult:
     if isinstance(model, bytes):
         model = cloudpickle.loads(model)
@@ -518,13 +474,20 @@ def run_easyscale_generation(
         torch.cuda.set_device(device)
 
     with framework_state_preserved(device):
-        rendezvous_started = time.perf_counter()
         with process_group(plan, client, worker, timeout, rendezvous_store) as (
             rendezvous_host,
             rendezvous_port,
             rendezvous_timings,
         ):
-            rendezvous_seconds = time.perf_counter() - rendezvous_started
+            hardware = hardware_identity(device)
+            execution_layout = [(hardware, plan.assigned_ests)]
+            if plan.physical_world_size > 1:
+                execution_layout = [None] * plan.physical_world_size
+                dist.all_gather_object(execution_layout, (hardware, plan.assigned_ests))
+            if sorted(rank for _, ranks in execution_layout for rank in ranks) != list(range(training_config.virtual_world_size)):
+                raise ValueError("execution layout must contain every EST exactly once.")
+            if plan.physical_rank == 0 and execution_ready is not None:
+                execution_ready(tuple((identity, len(ranks)) for identity, ranks in execution_layout))
             WorkflowTaskLogger.get_current().log(
                 f"easyscale rendezvous complete generation={plan.generation} "
                 f"rank={plan.physical_rank} world={plan.physical_world_size} "
@@ -532,7 +495,7 @@ def run_easyscale_generation(
                 f"store={rendezvous_timings.get('store', 0.0):.3f}s "
                 f"rank_alignment={rendezvous_timings.get('rank_alignment', 0.0):.3f}s "
                 f"process_group_init={rendezvous_timings.get('process_group_init', 0.0):.3f}s "
-                f"total={rendezvous_seconds:.3f}s"
+                f"total={rendezvous_timings['rendezvous']:.3f}s"
             )
             try:
                 result = _run_generation_body(
@@ -549,21 +512,22 @@ def run_easyscale_generation(
                     boundary_decision,
                     boundary_retry,
                     runtime_plugin,
+                    capability_report,
                 )
             except Exception:
                 if runtime_plugin is not None:
                     runtime_plugin.close_job(plan.job_id)
                 raise
-        process_group_teardown = (
-            time.perf_counter() - rendezvous_started - rendezvous_seconds
-            - result.timings["generation_body"]
-        )
     return dataclasses.replace(
         result,
+        worker=str(getattr(worker, "name", "")) if worker is not None else "local",
+        worker_address=str(worker.address) if worker is not None else "",
+        device=torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        hardware=hardware,
         timings={
             **result.timings,
-            **rendezvous_timings,
-            "process_group_teardown": max(process_group_teardown, 0.0),
+            "rendezvous": rendezvous_timings["rendezvous"],
+            "process_group_teardown": rendezvous_timings["process_group_teardown"],
             "task_total": time.perf_counter() - task_started,
             "wall_started": wall_started,
             "wall_finished": time.time(),

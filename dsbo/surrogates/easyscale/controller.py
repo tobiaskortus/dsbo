@@ -4,34 +4,40 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import cloudpickle
+import dask
 import lightning as L
 import torch.distributed as dist
 from distributed import Client, get_worker, wait
+from distributed.client import FuturesCancelledError
 from torch.utils.data import DataLoader
 
-from dsbo.surrogates.easyscale.allocator import ClientResourceAllocator, Registration
+from dsbo.surrogates.easyscale.allocator import Capacity, ClientResourceAllocator, Registration
 from dsbo.surrogates.easyscale.generation import (
     GenerationAction,
     GenerationPlan,
     GenerationResult,
     GenerationState,
 )
-from dsbo.surrogates.easyscale.protocol import ESTPlan, PlanDatabase, assign_virtual_ranks
+from dsbo.surrogates.easyscale.protocol import ESTPlan, ExecutionLayout, PlanDatabase, assign_virtual_ranks
 from dsbo.surrogates.easyscale.random import VirtualRankContext, initial_context
 from dsbo.surrogates.easyscale.runner import (
     close_easyscale_dataloaders,
     run_easyscale_generation,
 )
-from dsbo.logger import WorkflowTaskLogger
 from dsbo.utils.io import Workdir
 from dsbo.worker.spec import WorkerSpec
+from dsbo.logger import WorkflowTaskLogger
+from dsbo.storage import EasyScaleStorageBase, get_current_storage
+from dsbo.storage.models import EasyScaleGeneration, JobStatus
+from dsbo.surrogates.easyscale.profile import profile_details
 
 if TYPE_CHECKING:
     from dsbo.surrogates.surrogate_model import SurrogateModel
@@ -68,6 +74,10 @@ class WorkerStateMachine:
         self.approved_worker_count = self.active_worker_count
         self.pending_round: int | None = None
         self.current_plan: ESTPlan | None = None
+        self._candidate_worker_count = self.active_worker_count
+        self._capacity_ready_since: float | None = None
+        self._capacity_changed_at = 0.0
+        self._generation_started_at: float | None = float("-inf")
 
     def select_active_plan(self) -> ESTPlan:
         plan = (
@@ -88,19 +98,32 @@ class WorkerStateMachine:
             or self.approved_worker_count != self.active_worker_count
         )
 
+    def update_execution_layout(self, layout: ExecutionLayout) -> None:
+        self.database.update_execution_layout(layout)
+        self.current_plan = self.database.current_plan
+
+    def update_capabilities(self, capabilities: Sequence[float | None]) -> None:
+        self.database.update_capabilities(capabilities)
+        self.current_plan = self.database.current_plan
+
     def decide(
         self,
         epoch: int,
         throughput: float | None,
         should_stop: bool,
     ) -> GenerationAction:
+        now = time.monotonic()
+        # Start the cooldown at the first completed boundary, excluding generation setup.
+        if self._generation_started_at is None:
+            self._generation_started_at = now
         self._poll_allocation()
 
-        if throughput is not None and self.database.capability is None:
-            self.database.set_capability(throughput / self.active_worker_count)
-            self.current_plan = self.database.select_plan(self.active_worker_count)
-            self.database.current_plan = self.current_plan
-        elif throughput is not None:
+        if throughput is not None:
+            self.database.worker_hardware = self.allocator.capacity(self.job_id).worker_hardware
+
+        if throughput is not None:
+            if self.database.current_plan is None:
+                self.select_active_plan()
             fallback = self.database.fallback_if_slowdown(throughput)
             self.current_plan = self.database.current_plan
             if fallback is not None:
@@ -112,6 +135,8 @@ class WorkerStateMachine:
                 self._apply_approved(decision.allocation, decision.allocation_revision)
                 self.active_worker_count = self.approved_worker_count
                 self.pending_round = None
+                self._generation_started_at = None
+                self._capacity_ready_since = None
                 return GenerationAction.RECONFIGURE
 
         if should_stop:
@@ -119,8 +144,8 @@ class WorkerStateMachine:
             return GenerationAction.STOP
 
         if throughput is not None and self.pending_round is None and not self.needs_retry():
-            plan = self.database.select_plan(self.approved_worker_count)
-            proposals = self.database.propose(plan, self.max_worker_count)
+            plan = self.database.current_plan
+            proposals = () if self.database.capability is None else self.database.propose(plan, self.max_worker_count)
             submission = self.allocator.submit_proposals(self.job_id, proposals)
             if submission.pending:
                 self.pending_round = submission.round_id
@@ -132,15 +157,65 @@ class WorkerStateMachine:
 
         if self.approved_worker_count != self.active_worker_count:
             capacity = self.allocator.capacity(self.job_id)
-            accepted = self._apply_approved(
-                capacity.approved_allocation,
-                capacity.allocation_revision,
-            )
-            if accepted and capacity.ready:
-                self.active_worker_count = self.approved_worker_count
-                self.select_active_plan()
-                return GenerationAction.RECONFIGURE
+            self.database.worker_hardware = capacity.worker_hardware
+            if self._apply_approved(capacity.approved_allocation, capacity.allocation_revision):
+                return self._adopt_ready_capacity_incrementally(capacity, now)
         return GenerationAction.CONTINUE
+
+    def _adopt_ready_capacity_incrementally(self, capacity: Capacity, now: float) -> GenerationAction:
+        worker_count = self._select_scale_out_worker_count(capacity)
+        if worker_count <= self.active_worker_count:
+            self._capacity_ready_since = None
+            return GenerationAction.CONTINUE
+        if not self._partial_scale_out_improves_throughput(worker_count):
+            self._capacity_ready_since = None
+            return GenerationAction.CONTINUE
+        self._track_scale_out_candidate(worker_count, now)
+        if not self._scale_out_candidate_can_be_adopted(worker_count, now):
+            return GenerationAction.CONTINUE
+        self.active_worker_count = worker_count
+        self.select_active_plan()
+        self._generation_started_at = None
+        self._capacity_ready_since = None
+        return GenerationAction.RECONFIGURE
+
+    def _select_scale_out_worker_count(self, capacity: Capacity) -> int:
+        ready_live = self._worker_count(capacity.ready_live)
+        approved_total = self._worker_count(capacity.approved_total)
+        # Preserve other jobs' approvals while adopting ready capacity incrementally.
+        reserved_by_others = approved_total - self.approved_worker_count
+        available = ready_live - reserved_by_others
+        if capacity.ready:
+            return self.approved_worker_count
+        target = max(self.active_worker_count, available)
+        return min(self.approved_worker_count, target)
+
+    def _partial_scale_out_improves_throughput(self, worker_count: int) -> bool:
+        if worker_count >= self.approved_worker_count:
+            return True
+        if self.database.capability is None:
+            return True
+        candidate = self.database.select_plan(worker_count)
+        active = self.database.current_plan
+        return candidate.estimated_throughput > active.estimated_throughput
+
+    def _track_scale_out_candidate(self, worker_count: int, now: float) -> None:
+        if self._capacity_ready_since is None:
+            self._capacity_ready_since = now
+            self._capacity_changed_at = now
+        if worker_count != self._candidate_worker_count:
+            self._candidate_worker_count = worker_count
+            self._capacity_changed_at = now
+
+    def _scale_out_candidate_can_be_adopted(self, worker_count: int, now: float) -> bool:
+        config = self.database.config
+        settled = (
+            worker_count == self.approved_worker_count
+            or now - self._capacity_changed_at >= config.scale_out_settle_seconds
+            or now - self._capacity_ready_since >= config.scale_out_max_wait_seconds
+        )
+        cooled_down = now - self._generation_started_at >= config.min_generation_seconds
+        return settled and cooled_down
 
     def _worker_count(self, allocation: Mapping[str, int]) -> int:
         return int(allocation.get(self.resource_type, 0))
@@ -204,6 +279,8 @@ class GenerationRunner:
         assignments: Mapping[str, Sequence[int]],
         boundary_decision,
         boundary_retry,
+        execution_ready: Callable[[ExecutionLayout], None] | None = None,
+        capability_report: Callable[[tuple[float | None, ...]], None] | None = None,
     ) -> tuple[list[GenerationResult], dict[str, Any]]:
         slots = sorted(assignments)
         store, host, port = self._rendezvous(len(slots))
@@ -246,27 +323,28 @@ class GenerationRunner:
                 )
                 scatter_seconds = time.perf_counter() - scatter_started
                 submitted_wall = time.time()
-                futures.extend(
-                    self.client.map(
-                        run_easyscale_generation,
-                        nonzero_rank_plans,
-                        state=state,
-                        model=model,
-                        train_loader=train_loader,
-                        val_loader=val_loader,
-                        training_config=self.config,
-                        model_tag=self.model_tag,
-                        external_callbacks=self.callbacks,
-                        key=[
-                            f"dsbo-easyscale-{job_id}-generation-{generation}"
-                            f"-rank-{plan.physical_rank}"
-                            for plan in nonzero_rank_plans
-                        ],
-                        resources={self.resource_type: 1},
-                        retries=0,
-                        pure=False,
+                with dask.annotate(dsbo_easyscale_sibling=True):
+                    futures.extend(
+                        self.client.map(
+                            run_easyscale_generation,
+                            nonzero_rank_plans,
+                            state=state,
+                            model=model,
+                            train_loader=train_loader,
+                            val_loader=val_loader,
+                            training_config=self.config,
+                            model_tag=self.model_tag,
+                            external_callbacks=self.callbacks,
+                            key=[
+                                f"dsbo-easyscale-{job_id}-generation-{generation}"
+                                f"-rank-{plan.physical_rank}"
+                                for plan in nonzero_rank_plans
+                            ],
+                            resources={self.resource_type: 1},
+                            retries=0,
+                            pure=False,
+                        )
                     )
-                )
                 task_logger = WorkflowTaskLogger.get_current()
                 for future, plan in zip(futures, nonzero_rank_plans):
                     if not hasattr(future, "add_done_callback"):
@@ -305,52 +383,41 @@ class GenerationRunner:
                     boundary_decision,
                     boundary_retry,
                     store,
+                    execution_ready,
+                    capability_report,
                 )
             ]
             gather_started = time.perf_counter()
             if futures:
                 results.extend(self.client.gather(futures))
-            profile_fields = (
-                ("est_data_transfer", "data_transfer"),
-                ("est_compute", "est_compute"),
-                ("gradient_pre_collective_wait", "gradient_wait"),
-                ("gradient_metadata_all_reduce", "gradient_metadata_all_reduce"),
-                ("gradient_rank_all_gather", "gradient_rank_all_gather"),
-                ("gradient_shard_exchange", "gradient_shard_exchange"),
-                ("gradient_result_wait", "gradient_result_wait"),
-                ("gradient_result_all_gather", "gradient_result_all_gather"),
-                ("gradient_collective_total", "gradient_collective"),
-                ("gradient_aggregation_total", "gradient_aggregation"),
-                ("metric_all_reduce", "metric_all_reduce"),
-                ("metric_aggregation_total", "metric_aggregation"),
-                ("gradient_assignment", "gradient_assignment"),
-                ("backward_total", "backward"),
-                ("step_total", "step_total"),
-                ("throughput_all_gather", "throughput_all_gather"),
-                ("action_broadcast", "action_broadcast"),
-            )
+            gather_seconds = time.perf_counter() - gather_started if futures else 0.0
             for result in sorted(results, key=lambda item: item.physical_rank):
                 timings = result.timings
                 steps = int(timings.get("profile_steps", 0.0))
                 if not steps:
                     continue
-                details = " ".join(
-                    f"{label}={timings.get(f'profile_mean_{name}', 0.0) * 1000.0:.2f}ms"
-                    for name, label in profile_fields
-                )
                 WorkflowTaskLogger.get_current().log(
                     f"easyscale generation profile generation={generation} "
                     f"rank={result.physical_rank} steps={steps} "
                     f"ests={result.assigned_ests} "
-                    f"gradient_mb={timings.get('profile_mean_gradient_elements', 0.0) * 4.0 / 1e6:.2f} "
-                    f"{details}"
+                    f"gradient_reduction=all_reduce "
+                    f"gradient_bytes={result.gradient_bytes} "
+                    f"{profile_details(timings)}"
                 )
-            gather_seconds = time.perf_counter() - gather_started
         except Exception:
-            if futures:
-                self.client.cancel(futures)
-                wait(futures)
-            self.allocator.fail_generation(job_id, generation)
+            try:
+                if futures:
+                    self.client.cancel(futures)
+                    with suppress(FuturesCancelledError):
+                        wait(futures)
+            except Exception as cleanup_error:
+                WorkflowTaskLogger.get_current().log(
+                    f"easyscale generation cleanup failed "
+                    f"generation={generation} error={cleanup_error!r}",
+                    logging.ERROR,
+                )
+            finally:
+                self.allocator.fail_generation(job_id, generation)
             raise
 
         return results, {
@@ -363,7 +430,15 @@ class GenerationRunner:
                 {
                     "rank": result.physical_rank,
                     "assigned_ests": result.assigned_ests,
-                    "queue": max(
+                    "worker": slots[result.physical_rank],
+                    "worker_name": result.worker,
+                    "worker_address": result.worker_address,
+                    "device": result.device,
+                    "hardware": result.hardware,
+                    "capability": result.capability,
+                    "gradient_mb": None if result.gradient_bytes is None else result.gradient_bytes / 1e6,
+                    "performance": result.performance,
+                    "queue": 0.0 if result.physical_rank == 0 else max(
                         result.timings.get("wall_started", submitted_wall)
                         - submitted_wall,
                         0.0,
@@ -394,7 +469,6 @@ class GenerationRunner:
 
 class EasyScaleController:
     """Coordinate one worker-local, multi-generation EasyScale fit."""
-
     def __init__(
         self,
         client: Client,
@@ -423,6 +497,7 @@ class EasyScaleController:
         owned_checkpoints: set[str] = set()
         succeeded = False
         registered = False
+        easyscale_storage = get_current_storage().easyscale
 
         try:
             registration = self.allocator.register_job(
@@ -473,7 +548,7 @@ class EasyScaleController:
                 if resume_state is None
                 else resume_state.contexts
             )
-            final_result: GenerationResult | None = None
+            result: GenerationResult | None = None
 
             while completed_epoch < training_config.max_epochs:
                 workers = tuple(
@@ -501,82 +576,175 @@ class EasyScaleController:
                         else None
                     ),
                 )
-                results, profile = runner.run(
-                    job_id,
-                    generation,
-                    training_config.max_epochs,
-                    next_checkpoint,
-                    state,
-                    assignments,
-                    allocation.decide,
-                    allocation.needs_retry,
-                )
-                self.generation_profiles.append(
-                    {"generation": generation, **profile}
-                )
-                rank_zero = [result for result in results if result.physical_rank == 0]
-                if len(rank_zero) != 1 or rank_zero[0].model_state is None:
-                    self.allocator.fail_generation(job_id, generation)
-                    raise RuntimeError(
-                        "EasyScale generation did not return exactly one rank-zero state."
-                    )
-                if not os.path.exists(next_checkpoint):
-                    self.allocator.fail_generation(job_id, generation)
-                    raise RuntimeError(
-                        "EasyScale generation did not commit its shared checkpoint."
-                    )
-                final_result = rank_zero[0]
-                self.allocator.complete_generation(
-                    job_id, generation, final_result.throughput
+                result = self._run_generation_with_telemetry(
+                    easyscale_storage, runner, allocation, resources,
+                    job_id, generation, next_checkpoint, state, assignments,
                 )
                 if checkpoint_path in owned_checkpoints and os.path.exists(checkpoint_path):
                     os.unlink(checkpoint_path)
                     owned_checkpoints.discard(checkpoint_path)
                 owned_checkpoints.add(next_checkpoint)
                 checkpoint_path = next_checkpoint
-                contexts = final_result.contexts
-                completed_epoch = final_result.target_epoch
+                contexts = result.contexts
+                completed_epoch = result.target_epoch
                 resume_state = GenerationState(
                     checkpoint_path=checkpoint_path,
                     completed_epoch=completed_epoch,
                     contexts=contexts,
                     rank_zero_state={
                         key: value
-                        for key, value in (final_result.rank_zero_state or {}).items()
+                        for key, value in (result.rank_zero_state or {}).items()
                         if key != "model_state"
                     },
                 )
+
                 generation += 1
-                if (
-                    completed_epoch >= training_config.max_epochs
-                    or final_result.action == GenerationAction.STOP
-                ):
+                if (completed_epoch >= training_config.max_epochs
+                    or result.action == GenerationAction.STOP):
                     break
 
-            if final_result is None:
+            if result is None:
                 raise RuntimeError("EasyScale fit completed without a generation result.")
-            model.load_state_dict(final_result.model_state, strict=True)
+            model.load_state_dict(result.model_state, strict=True)
             succeeded = True
         finally:
-            cleanup_failure = None
-            if registered and hasattr(self.client, "run"):
-                try:
-                    self.client.run(close_easyscale_dataloaders, job_id)
-                except Exception as exc:
-                    cleanup_failure = exc
-            try:
-                if registered:
-                    self.allocator.close_job(job_id)
-            except Exception:
-                if succeeded:
-                    raise
-            finally:
-                if succeeded:
-                    for path in owned_checkpoints:
-                        if os.path.exists(path):
-                            os.unlink(path)
-            if cleanup_failure is not None:
-                WorkflowTaskLogger.get_current().log(
-                    f"EasyScale loader cleanup failed: {cleanup_failure}",
-                    logging.ERROR,
+            self._cleanup(job_id, owned_checkpoints, succeeded, registered)
+
+    def _open_generation(
+        self,
+        easyscale_storage: EasyScaleStorageBase,
+        runner: GenerationRunner,
+        allocation: WorkerStateMachine,
+        resources: WorkerSpec,
+        job_id: str,
+        generation: int,
+        assignments: Mapping[str, Sequence[int]],
+        completed_epoch: int,
+    ) -> EasyScaleGeneration:
+        record = EasyScaleGeneration(
+            exec_id=str(Workdir.get_current_dir()), job_id=job_id, model_tag=runner.model_tag,
+            generation=generation, world_size=len(assignments),
+            virtual_world_size=runner.config.virtual_world_size,
+            backend=runner.backend, gradient_reduction="all_reduce",
+            started=time.time(), completed_epoch=completed_epoch,
+            target_epoch=runner.config.max_epochs,
+            config={
+                "training": asdict(runner.config),
+                "resources": {key: getattr(resources, key, None) for key in (
+                    "cores", "processes", "memory", "num_gpus",
+                    "min_worker", "max_worker", "walltime", "partition")},
+                "allocation_revision": allocation.allocation_revision,
+                "plan": asdict(allocation.current_plan),
+            },
+            ranks=[{"rank": rank, "worker": slot, "assigned_ests": list(assignments[slot])}
+                   for rank, slot in enumerate(sorted(assignments))],
+        )
+        easyscale_storage.open_generation(record)
+        return record
+
+    def _run_generation(
+        self,
+        runner: GenerationRunner,
+        allocation: WorkerStateMachine,
+        job_id: str,
+        generation: int,
+        checkpoint_path: str,
+        state: GenerationState,
+        assignments: Mapping[str, Sequence[int]],
+    ) -> tuple[GenerationResult, dict[str, Any]]:
+        results, profile = runner.run(
+            job_id, generation, runner.config.max_epochs, checkpoint_path,
+            state, assignments, allocation.decide, allocation.needs_retry,
+            allocation.update_execution_layout, allocation.update_capabilities,
+        )
+        self.generation_profiles.append({"generation": generation, **profile})
+        final_result = next(result for result in results if result.physical_rank == 0)
+        self.allocator.complete_generation(job_id, generation, final_result.throughput)
+        return final_result, profile
+
+    def _close_generation(
+        self,
+        record: EasyScaleGeneration,
+        easyscale_storage: EasyScaleStorageBase,
+        profile: dict[str, Any] | None,
+        generation_error: BaseException | None,
+        final_result: GenerationResult | None,
+    ) -> None:
+        record.finished = time.time()
+        if profile is not None:
+            record.sqlmodel_update({key: profile[key] for key in ("scatter", "submission", "gather", "ranks")})
+        if generation_error is None:
+            record.sqlmodel_update({"completed_epoch": final_result.target_epoch, 
+                                    "throughput": final_result.throughput, 
+                                    "action": final_result.action.name, 
+                                    "status": JobStatus.SUCCESS})
+        else:
+            record.sqlmodel_update({"status": JobStatus.FAILED, 
+                                    "error": f"{type(generation_error).__name__}: {generation_error}", 
+                                    "action": GenerationAction.FAIL.name})
+        easyscale_storage.close_generation(record)
+
+    def _run_generation_with_telemetry(
+        self,
+        easyscale_storage: EasyScaleStorageBase | None,
+        runner: GenerationRunner,
+        allocation: WorkerStateMachine,
+        resources: WorkerSpec,
+        job_id: str,
+        generation: int,
+        checkpoint_path: str,
+        state: GenerationState,
+        assignments: Mapping[str, Sequence[int]],
+    ) -> GenerationResult:
+        record = None if easyscale_storage is None else self._open_generation(
+            easyscale_storage, runner, allocation, resources,
+            job_id, generation, assignments, state.completed_epoch,
+        )
+        profile = result = generation_error = None
+        try:
+            result, profile = self._run_generation(
+                runner, allocation, job_id, generation,
+                checkpoint_path, state, assignments,
+            )
+        except BaseException as exc:
+            generation_error = exc
+            raise
+        finally:
+            if record is not None:
+                self._close_generation(
+                    record, easyscale_storage, 
+                    profile, generation_error, 
+                    result
                 )
+        return result
+
+    def _cleanup(
+        self,
+        job_id: str,
+        owned_checkpoints: set[str],
+        succeeded: bool,
+        registered: bool,
+    ) -> None:
+        cleanup_failure = None
+        if registered and hasattr(self.client, "run"):
+            try:
+                self.client.run(close_easyscale_dataloaders, job_id)
+            except Exception as exc:
+                cleanup_failure = exc
+        try:
+            if registered:
+                self.allocator.close_job(job_id)
+        except Exception:
+            if succeeded:
+                raise
+        finally:
+            if succeeded:
+                for path in owned_checkpoints:
+                    if os.path.exists(path):
+                        os.unlink(path)
+        if cleanup_failure is not None:
+            WorkflowTaskLogger.get_current().log(
+                f"EasyScale loader cleanup failed: {cleanup_failure}",
+                logging.ERROR,
+            )
+

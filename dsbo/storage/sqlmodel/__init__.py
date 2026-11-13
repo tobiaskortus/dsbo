@@ -12,13 +12,13 @@ from pathlib import Path
 from typing import List, Mapping, Optional
 
 import networkx as nx
-from sqlalchemy import Engine, event as sa_event, func, inspect
+from sqlalchemy import Engine, event as sa_event, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from dsbo.storage import IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase, ArtifactStorageBase, Artifact
-from dsbo.storage.models import Batch, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow, ArtifactEntry
+from dsbo.storage import EasyScaleStorageBase, IntermediatesStorageBase, StudyStorageBase, TransitionWriter, TrialStorageBase, WorkflowStorageBase, ArtifactStorageBase, Artifact
+from dsbo.storage.models import Batch, EasyScaleGeneration, Execution, Intermediate, JobStatus, JobTrace, Trial, Workflow, ArtifactEntry
 from dsbo.utils.io.workdir import Workdir
 
 
@@ -276,6 +276,45 @@ class WorkflowStorage(WorkflowStorageBase):
             
             return session.exec(query.order_by(JobTrace.id)).all()
 
+
+class EasyScaleStorage(EasyScaleStorageBase):
+    def __init__(self, engine: Engine, readonly: bool = False):
+        super().__init__(readonly=readonly)
+        self._engine = engine
+
+    def open_generation(self, record: EasyScaleGeneration) -> None:
+        record.status = JobStatus.RUNNING
+        self._upsert(record)
+
+    def close_generation(self, record: EasyScaleGeneration) -> None:
+        self._upsert(record)
+
+    def _upsert(self, record: EasyScaleGeneration) -> None:
+        if self._readonly:
+            raise RuntimeError("Cannot write to readonly StudyStorage.")
+        
+        with Session(self._engine) as session:
+            existing = session.exec(select(EasyScaleGeneration).where(
+                EasyScaleGeneration.job_id == record.job_id,
+                EasyScaleGeneration.generation == record.generation,
+            )).one_or_none()
+            values = record.model_dump(exclude={"id", "updated_at"})
+            existing = existing or EasyScaleGeneration(**values)
+            existing.sqlmodel_update(values)
+            existing.updated_at = time.time()
+            session.add(existing)
+            session.commit()
+
+    def get_generations(self, job_id: str | None = None, exec_id: str | None = None, updated_after: float | None = None) -> list[EasyScaleGeneration]:
+        with Session(self._engine) as session:
+            query = select(EasyScaleGeneration)
+            if job_id is not None:
+                query = query.where(EasyScaleGeneration.job_id == job_id)
+            if exec_id is not None:
+                query = query.where(EasyScaleGeneration.exec_id == exec_id)
+            if updated_after is not None:
+                query = query.where(EasyScaleGeneration.updated_at > updated_after)
+            return list(session.exec(query.order_by(EasyScaleGeneration.job_id, EasyScaleGeneration.generation)).all())
 
 class IntermediatesStorage(IntermediatesStorageBase):
     def __init__(self, engine: Engine, readonly: bool = False):
@@ -568,18 +607,17 @@ class ArtifactStorage(ArtifactStorageBase):
 class StudyStorage(StudyStorageBase):
 
     def __init__(self, engine: Engine, *, readonly: bool = False, vector_dim: int | None = None):
-        super().__init__(db_path="")
+        super().__init__()
         self._engine = engine
         self._readonly = readonly
         self._vector_dim = vector_dim
-        inspector = inspect(engine)
-        if not inspector.get_table_names():  # DB is empty
-            SQLModel.metadata.create_all(engine)
+        SQLModel.metadata.create_all(engine)
 
         self._trial_storage = TrialStorage(engine, readonly, vector_dim=vector_dim)
         self._workflow_storage = WorkflowStorage(engine, readonly)
         self._intermediates_storage = IntermediatesStorage(engine, readonly)
         self._artifact_storage = ArtifactStorage("artifacts", engine)
+        self._easyscale_storage = EasyScaleStorage(engine, readonly)
 
     def __getstate__(self) -> dict:
         url = self._engine.url.render_as_string(hide_password=False)
@@ -615,9 +653,7 @@ class StudyStorage(StudyStorageBase):
                 "StudyStorage.open(...) to access the existing study."
             )
         
-        engine = create_engine(
-            f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
-        )
+        engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
         if vector_dim is not None:
             _configure_sqlite_vec(engine, vector_dim)
         return cls(engine, readonly=readonly, vector_dim=vector_dim)
@@ -627,9 +663,7 @@ class StudyStorage(StudyStorageBase):
         db_path = Path(db_path).resolve()
         if not db_path.is_file():
             raise FileNotFoundError(f"Study storage '{db_path}' does not exist.")
-        engine = create_engine(
-            f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
-        )
+        engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
         if vector_dim is not None:
             _configure_sqlite_vec(engine, vector_dim)
         return cls(engine, readonly=True, vector_dim=vector_dim)
