@@ -3,7 +3,6 @@
 #include "../types.hpp"
 #include "core.hpp"
 #include <algorithm>
-#include <complex>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -28,9 +27,6 @@ inline DType promote(DType left, DType right) {
     left.little_endian = right.little_endian = native_little_endian();
     if (left.kind == Kind::boolean) return right;
     if (right.kind == Kind::boolean) return left;
-    const bool complex = left.kind == Kind::complex || right.kind == Kind::complex;
-    if (left.kind == Kind::complex) { left.kind = Kind::floating; left.size /= 2; }
-    if (right.kind == Kind::complex) { right.kind = Kind::floating; right.size /= 2; }
     DType result;
     if (left.kind == Kind::floating || right.kind == Kind::floating) {
         const auto float_size = [](DType type) {
@@ -46,7 +42,6 @@ inline DType promote(DType left, DType right) {
         else if (unsign < 8) result = {Kind::signed_integer, unsign * 2};
         else result = {Kind::floating, 8};
     }
-    if (complex) { result.kind = Kind::complex; result.size *= 2; }
     return result;
 }
 
@@ -59,26 +54,10 @@ inline Array cast(ArrayView value, DType target) {
         return cast(normalized.view(), target);
     }
     if (target.kind == Kind::boolean) {
-        const bool complex = value.type.kind == Kind::complex;
-        const auto components = complex ? ArrayView{{Kind::floating, value.type.size / 2, value.type.little_endian},
-                                                    {static_cast<hsize_t>(value.size() * 2)}, value.data} : value;
-        const auto numbers = cast(components, dtype<long double>()).values<long double>();
+        const auto numbers = cast(value, dtype<long double>()).values<long double>();
         Array result(target, value.shape);
         for (std::size_t i = 0; i < value.size(); ++i)
-            result.storage[i] = complex ? numbers[2 * i] != 0 || numbers[2 * i + 1] != 0 : numbers[i] != 0;
-        return result;
-    }
-    if (value.type.kind == Kind::complex || target.kind == Kind::complex) {
-        if (target.kind != Kind::complex) throw TypeError("Cannot discard an array's imaginary component.");
-        const DType source_component{value.type.kind == Kind::complex ? Kind::floating : value.type.kind,
-                                      value.type.kind == Kind::complex ? value.type.size / 2 : value.type.size,
-                                      value.type.little_endian};
-        ArrayView components{source_component, {static_cast<hsize_t>(value.size() * (value.type.kind == Kind::complex ? 2 : 1))}, value.data};
-        auto converted = cast(components, {Kind::floating, target.size / 2, target.little_endian});
-        Array result(target, value.shape);
-        if (value.type.kind == Kind::complex) result.storage = std::move(converted.storage);
-        else for (std::size_t i = 0; i < value.size(); ++i)
-            std::memcpy(result.storage.data() + i * target.size, converted.storage.data() + i * target.size / 2, target.size / 2);
+            result.storage[i] = numbers[i] != 0;
         return result;
     }
     auto source_type = datatype(value.type, false);
@@ -175,10 +154,6 @@ inline Array add(ArrayView left, ArrayView right) {
             case 8: add_values<std::uint64_t>(result, other); break;
             default: throw TypeError("Unsupported integer width.");
         }
-    } else if (type.kind == Kind::complex) {
-        if (type.size == 8) add_values<std::complex<float>>(result, other);
-        else if (type.size == 16) add_values<std::complex<double>>(result, other);
-        else add_values<std::complex<long double>>(result, other);
     } else if (type.size == 2) {
         auto a = cast(result.view(), dtype<float>()), b = cast(other.view(), dtype<float>());
         add_values<float>(a, b);

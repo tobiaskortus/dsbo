@@ -22,25 +22,23 @@ from dsbo.utils.io.storage import HDF5Writer as W
 from dsbo.utils.io.storage import _hdf5
 
 
-DTYPES = ["bool", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float16", "float32", "float64", "complex64", "complex128", ">i4", ">f8", ">c16"]
+DTYPES = ["bool", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float16", "float32", "float64", ">i4", ">f8"]
 INCLUDE_DIRECTORY = Path(__file__).resolve().parents[1] / "cpp/include"
 LICENSE_DIRECTORY = Path(__file__).resolve().parents[1] / "LICENSES"
 
 
 # Cover every dtype on a matrix, then exercise other shapes with representative
-# half, real, and complex types rather than repeating the full Cartesian product.
+# half and real types rather than repeating the full Cartesian product.
 @pytest.mark.parametrize(
     "dtype,shape",
     [(dtype, (2, 3)) for dtype in DTYPES] + [
         (dtype, shape)
-        for dtype in ["float16", "float64", "complex128"]
+        for dtype in ["float16", "float64"]
         for shape in [(), (4,), (2, 1, 3), (0, 2), (2, 0)]
     ],
 )
 def test_numeric_roundtrip_and_independent_file_reader(tmp_path, dtype, shape):
     values = np.arange(np.prod(shape, dtype=int)).reshape(shape).astype(dtype)
-    if np.dtype(dtype).kind == "c":
-        values += (values * 1j).astype(dtype)
     path = tmp_path / "numeric.h5"
     W.write_primal(path, values)
     loaded = W.open_primal(path)
@@ -530,7 +528,7 @@ def test_null_dataset_reduction_preserves_destination(tmp_path):
 
 
 @pytest.mark.parametrize("left,right", [((), (3,)), ((2, 1), (1, 3)), ((1, 2), (0, 2))])
-@pytest.mark.parametrize("dtype", ["float16", "float32", "int64", "complex64"])
+@pytest.mark.parametrize("dtype", ["float16", "float32", "int64"])
 def test_gradient_broadcasting_matches_numpy(tmp_path, left, right, dtype):
     a = np.ones(left, dtype=dtype)
     b = np.ones(right, dtype=dtype)
@@ -538,22 +536,6 @@ def test_gradient_broadcasting_matches_numpy(tmp_path, left, right, dtype):
     W.write_gradient(tmp_path / "b.h5", b)
     W.aggregate_gradients([tmp_path / "a.h5", tmp_path / "b.h5"], tmp_path / "sum.h5")
     np.testing.assert_array_equal(W.load_gradient(tmp_path / "sum.h5"), a + b)
-
-
-def test_hdf5_2_native_complex_input(tmp_path):
-    path = tmp_path / "native-complex.h5"
-    values = (np.arange(6).reshape(2, 3) * (1 + 2j)).astype(np.complex128)
-    with h5py.File(path, "w", libver="latest") as file:
-        file.attrs[W.STORE_ATTRIBUTE] = "flat"
-        dataset = file.create_dataset("primal", values.shape, dtype=h5py.h5t.COMPLEX_IEEE_F64LE)
-        dataset[:] = values
-    np.testing.assert_array_equal(W.open_primal(path), values)
-    with W.open_dataset(path) as view:
-        np.testing.assert_array_equal(view.read("primal", slice(None)), values)
-        np.testing.assert_array_equal(
-            view.read_indices(["primal"], [1, 0, 1])["primal"].numpy(),
-            values[[1, 0, 1]],
-        )
 
 
 @pytest.mark.parametrize("columns", [None, ["second", "first"]])

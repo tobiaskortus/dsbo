@@ -48,9 +48,9 @@ inline void validate_statistics(const Statistics& value) {
 } // namespace internal
 
 // Summarizes real numeric 1-D/2-D arrays along axis 0 using float64 values.
-// Returns nullopt for other ranks, complex input, or an empty sample axis.
+// Returns nullopt for other ranks or an empty sample axis.
 inline std::optional<Statistics> statistics(ArrayView value) {
-    if ((value.shape.size() != 1 && value.shape.size() != 2) || value.shape[0] == 0 || value.type.kind == Kind::complex)
+    if ((value.shape.size() != 1 && value.shape.size() != 2) || value.shape[0] == 0)
         return std::nullopt;
     if (value.size() && !value.data) throw std::invalid_argument("Non-empty array has no data buffer.");
     std::optional<Array> converted;

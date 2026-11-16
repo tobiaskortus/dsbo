@@ -5,7 +5,6 @@
 #error "DSBO requires HDF5 >= 2.0"
 #endif
 
-#include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -40,7 +39,7 @@ inline std::size_t elements(const Shape& shape) {
     return count;
 }
 
-enum class Kind { boolean, signed_integer, unsigned_integer, floating, complex };
+enum class Kind { boolean, signed_integer, unsigned_integer, floating };
 
 inline bool native_little_endian() {
     const std::uint16_t value = 1;
@@ -62,8 +61,6 @@ template<class T> inline DType dtype() {
     else if constexpr (std::is_integral_v<T>)
         return {std::is_signed_v<T> ? Kind::signed_integer : Kind::unsigned_integer, sizeof(T)};
     else if constexpr (std::is_floating_point_v<T>) return {Kind::floating, sizeof(T)};
-    else if constexpr (std::is_same_v<T, std::complex<float>> || std::is_same_v<T, std::complex<double>> ||
-                       std::is_same_v<T, std::complex<long double>>) return {Kind::complex, sizeof(T)};
     else static_assert(!sizeof(T), "Unsupported native array element type");
 }
 

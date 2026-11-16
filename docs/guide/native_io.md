@@ -199,8 +199,8 @@ The main APIs in `dsbo::io` are:
 | Combine files or gradient contributions | `HDF5Storage::reduce`, `aggregate_gradients` |
 | Inspect or partially read datasets | `Reader::shape`, `type`, `statistics`, `read`, `read_indices`, `close` |
 
-Arrays support booleans, signed/unsigned 8/16/32/64-bit integers, float16/32/64,
-platform long double, and supported complex types. Scalar and empty shapes are
+Arrays support booleans, signed/unsigned 8/16/32/64-bit integers, and
+float16/32/64, plus platform long double. Scalar and empty shapes are
 supported. Strings, objects, ragged arrays, references, and arbitrary compound
 dtypes are unsupported and raise `dsbo::io::TypeError`.
 

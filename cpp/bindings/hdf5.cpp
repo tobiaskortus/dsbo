@@ -20,16 +20,21 @@ io::DType numpy_type(const py::dtype& type) {
         case 'i': kind = io::Kind::signed_integer; break;
         case 'u': kind = io::Kind::unsigned_integer; break;
         case 'f': kind = io::Kind::floating; break;
-        case 'c': kind = io::Kind::complex; break;
-        default: throw py::type_error("DSBO arrays require boolean, integer, floating-point, or complex numeric values.");
+        default: throw py::type_error("DSBO arrays require boolean, integer, or floating-point numeric values.");
     }
     const char order = type.byteorder();
     return {kind, static_cast<std::size_t>(type.itemsize()), order == '<' || (order != '>' && io::native_little_endian())};
 }
 
 py::dtype numpy_type(io::DType type) {
-    const char kind = type.kind == io::Kind::boolean ? 'b' : type.kind == io::Kind::signed_integer ? 'i' :
-                      type.kind == io::Kind::unsigned_integer ? 'u' : type.kind == io::Kind::floating ? 'f' : 'c';
+    char kind;
+    switch (type.kind) {
+        case io::Kind::boolean: kind = 'b'; break;
+        case io::Kind::signed_integer: kind = 'i'; break;
+        case io::Kind::unsigned_integer: kind = 'u'; break;
+        case io::Kind::floating: kind = 'f'; break;
+        default: throw py::type_error("Unsupported DSBO dtype.");
+    }
     return py::dtype(std::string(type.size == 1 ? "|" : type.little_endian ? "<" : ">") + kind + std::to_string(type.size));
 }
 

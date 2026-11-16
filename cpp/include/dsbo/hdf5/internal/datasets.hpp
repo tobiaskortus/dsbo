@@ -97,18 +97,9 @@ inline void create_dsbo_dataset(hid_t parent, const std::string& name, ArrayView
     output.close_checked();
 }
 
-inline Handle read_datatype(hid_t value, DType type) {
-    Handle stored(H5Dget_type(value), H5Tclose);
-    // HDF5 2.0 native complex datasets already have interleaved components.
-    // Read their own type rather than requesting an unsupported conversion to
-    // the compound representation we retain for DSBO's output schema.
-    if (H5Tget_class(stored) == H5T_COMPLEX) return stored;
-    return datatype(type);
-}
-
 inline Array read_dataset(hid_t value) {
     Array result(dataset_dtype(value), dataset_shape(value));
-    auto type = read_datatype(value, result.type);
+    auto type = datatype(result.type);
     if (result.size()) check(H5Dread(value, type, H5S_ALL, H5S_ALL, H5P_DEFAULT, result.storage.data()), "Cannot read HDF5 dataset.");
     return result;
 }

@@ -90,7 +90,7 @@ class AutogradFileInterface:
             gradient_io.claim_gradient_reader(fpath)
 
             for key, value in x.items():
-                if not (value.is_floating_point() or value.is_complex()):
+                if not value.is_floating_point():
                     continue
 
                 value.requires_grad_(True)

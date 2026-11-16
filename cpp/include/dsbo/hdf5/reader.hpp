@@ -56,7 +56,7 @@ class Reader {
         stride[0] = static_cast<hsize_t>(selection.step > 0 ? selection.step : -selection.step);
         count[0] = selection.count;
         internal::check(H5Sselect_hyperslab(source, H5S_SELECT_SET, start.data(), stride.data(), count.data(), nullptr), "Cannot select HDF5 rows.");
-        auto memory = internal::dataspace(output), type = internal::read_datatype(value, result.type);
+        auto memory = internal::dataspace(output), type = internal::datatype(result.type);
         internal::check(H5Dread(value, type, memory, source, H5P_DEFAULT, result.storage.data()), "Cannot read selected HDF5 rows.");
         if (selection.step < 0) {
             const auto row_bytes = result.storage.size() / selection.count;
@@ -150,7 +150,7 @@ public:
                 start[0] = index;
                 internal::check(H5Sselect_hyperslab(source, H5S_SELECT_OR, start.data(), nullptr, count.data(), nullptr), "Cannot select indexed rows.");
             }
-            auto memory = internal::dataspace(selected_shape), type = internal::read_datatype(value, selected.type);
+            auto memory = internal::dataspace(selected_shape), type = internal::datatype(selected.type);
             internal::check(H5Dread(value, type, memory, source, H5P_DEFAULT, selected.storage.data()), "Cannot read indexed HDF5 rows.");
         }
         const auto row_bytes = selected.storage.size() / unique.size();

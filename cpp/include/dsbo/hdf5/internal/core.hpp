@@ -154,15 +154,6 @@ inline Handle datatype(DType type, bool boolean_enum = true) {
     check_environment();
     hid_t base = -1;
     const bool little = type.little_endian;
-    if (type.kind == Kind::complex) {
-        if (type.size != 8 && type.size != 16 && type.size != 2 * sizeof(long double))
-            throw TypeError("Unsupported complex dtype.");
-        auto component = datatype({Kind::floating, type.size / 2, little});
-        Handle compound(H5Tcreate(H5T_COMPOUND, type.size), H5Tclose);
-        check(H5Tinsert(compound, "r", 0, component), "Cannot create complex real field.");
-        check(H5Tinsert(compound, "i", type.size / 2, component), "Cannot create complex imaginary field.");
-        return compound;
-    }
     if (type.kind == Kind::floating) {
         if (type.size == 2) base = little ? H5T_IEEE_F16LE : H5T_IEEE_F16BE;
         else if (type.size == 4) base = little ? H5T_IEEE_F32LE : H5T_IEEE_F32BE;
@@ -204,23 +195,7 @@ inline DType dtype_from_hdf5(hid_t type) {
         Handle super(H5Tget_super(type), H5Tclose);
         return dtype_from_hdf5(super);
     }
-    if (kind == H5T_COMPOUND && H5Tget_nmembers(type) == 2) {
-        char* real = H5Tget_member_name(type, 0);
-        char* imag = H5Tget_member_name(type, 1);
-        const bool names = real && imag && std::string(real) == "r" && std::string(imag) == "i";
-        if (real) H5free_memory(real);
-        if (imag) H5free_memory(imag);
-        Handle component(H5Tget_member_type(type, 0), H5Tclose);
-        Handle second(H5Tget_member_type(type, 1), H5Tclose);
-        if (names && H5Tequal(component, second) > 0 && H5Tget_class(component) == H5T_FLOAT &&
-            H5Tget_member_offset(type, 0) == 0 && H5Tget_member_offset(type, 1) == size / 2 && H5Tget_size(component) * 2 == size)
-            return {Kind::complex, size, H5Tget_order(component) != H5T_ORDER_BE};
-    }
-    if (kind == H5T_COMPLEX) {
-        Handle component(H5Tget_super(type), H5Tclose);
-        return {Kind::complex, size, H5Tget_order(component) != H5T_ORDER_BE};
-    }
-    throw TypeError("DSBO arrays require boolean, integer, floating-point, or complex numeric values.");
+    throw TypeError("DSBO arrays require boolean, integer, or floating-point numeric values.");
 }
 
 inline DType dataset_dtype(hid_t value) {
