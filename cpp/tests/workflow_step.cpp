@@ -35,17 +35,25 @@ static std::vector<std::string> scenario_names(const std::string& scenario) {
 static void setup(const fs::path& root, const std::string& scenario) {
     const auto path = [&](const std::string& name) { return (root / name).string(); };
     const auto names = scenario_names(scenario);
-    const io::Columns columns = names.empty() ? std::nullopt : io::Columns(names);
 
     fs::create_directories(root);
     const auto primal = io::Array::from<float>({1, 2, 3, 4}, {2, 2});
-    const io::Columns primal_columns = io::Columns(std::vector<std::string>{"a", "b"});
-    // The adjacent primal and _gradient suffix trigger implicit column alignment.
-    io::HDF5Storage::write_primal(path("input.h5"), primal.view(), primal_columns);
     const auto gradient = scenario == "partial" ? io::Array::from<float>({7, 11}, {1, 2}) :
         scenario == "reordered" ? io::Array::from<float>({7, 11, 3, 5}, {2, 2}) :
         io::Array::from<float>({3, 5, 7, 11}, {2, 2});
-    io::HDF5Storage::write_gradient(path("input_gradient.h5"), gradient.view(), columns);
+    // Keep an adjacent primal to detect accidental alignment of incoming gradient keys.
+    if (names.empty()) {
+        io::HDF5Storage::write_primal(path("input.h5"), primal.view());
+        io::HDF5Storage::write_gradient(path("input_gradient.h5"), gradient.view());
+    } else {
+        const io::NamedArrays primal_values{{"a", primal.view().column(0)}, {"b", primal.view().column(1)}};
+        io::HDF5Storage::write_primal(path("input.h5"), primal_values);
+        io::NamedArrays gradient_values;
+        if (scenario == "partial") gradient_values = {{"b", gradient.view().column(0)}};
+        else if (scenario == "reordered") gradient_values = {{"b", gradient.view().column(0)}, {"a", gradient.view().column(1)}};
+        else gradient_values = {{"a", gradient.view().column(0)}, {"b", gradient.view().column(1)}};
+        io::HDF5Storage::write_gradient(path("input_gradient.h5"), gradient_values);
+    }
 }
 
 static void verify(const fs::path& root, const std::string& scenario) {

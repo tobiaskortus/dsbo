@@ -24,7 +24,7 @@ candidate = Candidate.from_values(space, {"gain": 0.3, "bias": -1.5}, requires_g
 
 Two modules make up the workflow. **ModuleA** computes the response from the parameters and writes it to a declared `Output` file. Its `backward()` reads the resolved file gradient and propagates it through the local expression, following the pattern in [Differentiable Workflows](autograd.md#implementing-a-backward-pass).
 
-**ModuleB** represents the objective stage: it reads the response through a declared `Input`, compares it against the target, and returns the loss as a result. Its `backward()` follows the automatic hook pattern — it re-opens the input file under `torch.enable_grad()`, and the `post_accumulate_grad_hook` installed by `open()` records the input's gradient contribution.
+**ModuleB** represents the objective stage: it reads the response through a declared `Input`, compares it against the target, and returns the loss as a result. Its `backward()` reopens the input under `torch.enable_grad()`, recomputes the loss, and calls `backward()` to make the input gradient available to ModuleA.
 
 ```python
 from dsbo.modules import Module, Input, Output
@@ -69,7 +69,7 @@ class ModuleB(Module):
 
     def backward(self, design, grad_output=None):
         with torch.enable_grad():
-            response = HDF5File.open(self.inp(), "cpu")  # registers the gradient hook
+            response = HDF5File.open(self.inp(), "cpu")
             loss = (response - TARGET) ** 2
         loss.backward(grad_output["loss"])
 ```
@@ -78,7 +78,7 @@ ModuleB receives ModuleA's registered path and wraps it in `Input`. The task dep
 
 ## Workflow
 
-Composing the two modules with `>>` adds the dependency edge between them. During execution, tasks run in topological order in the forward pass and in reverse topological order in the backward pass:
+Composing the two modules with `>>` makes ModuleB depend on ModuleA. The forward pass runs ModuleA before ModuleB, and the backward pass applies their derivatives in the opposite order:
 
 ```python
 a = ModuleA()
@@ -88,7 +88,7 @@ wf = Workflow(a >> b)
 
 ## Optimization Loop
 
-The optimization loop is a standard PyTorch training loop; the workflow serves as the differentiable function. `wf.run(candidate)` executes the forward pass through the file channel and returns result tensors that carry a `grad_fn` into the file graph. Consequently, `loss.backward()` triggers the file-mediated reverse pass — consumers before producers — and accumulates the result into `candidate.tensor.grad` through the parameter channel:
+The optimization loop is a standard PyTorch training loop; the workflow serves as the differentiable function. `wf.run(candidate)` evaluates the workflow and returns its results. Calling `loss.backward()` computes the design gradients in `candidate.tensor.grad`, which the optimizer uses to update the candidate:
 
 ```python
 optimizer = torch.optim.Adam([candidate.tensor], lr=0.05)

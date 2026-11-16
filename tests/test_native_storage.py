@@ -16,6 +16,7 @@ import h5py
 import numpy as np
 import pytest
 import torch
+from tensordict import TensorDict
 
 from dsbo.utils.io.storage import HDF5Writer as W
 from dsbo.utils.io.storage import _hdf5
@@ -325,24 +326,10 @@ def test_combined_statistics_match_concatenated_data(tmp_path, shape):
     assert W._combine_statistics([combined, None]) is None
 
 
-@pytest.mark.parametrize("columns", [[""], ["a/a"], ["."], ["a\x00b"], ["same", "same"], [12]])
-def test_column_validation(tmp_path, columns):
-    with pytest.raises(ValueError, match="Column names"):
-        W.write_primal(tmp_path / "bad.h5", np.zeros((len(columns), 2)), columns)
-
-
-def test_unicode_names_metadata_and_column_view_axes(tmp_path):
-    path = tmp_path / "数値.h5"
-    values = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
-    W.write_primal(path, values, ["β", 'quote"\\name'])
-    with h5py.File(path) as file:
-        assert list(file["primal"]) == ["β", 'quote"\\name']
-        assert json.loads(file["primal"].attrs[W.COLUMNS_ATTRIBUTE]) == ["β", 'quote"\\name']
-    np.testing.assert_array_equal(W.open_primal(path, ['quote"\\name', "β"]), values[[1, 0]])
-    with W.open_dataset(path) as view:
-        assert view.shape("primal") == (3, 4, 2)
-        np.testing.assert_array_equal(view.read("primal", slice(None)), np.moveaxis(values, 0, -1))
-        np.testing.assert_array_equal(view.read_indices(["primal"], [2, 0, 2])[:, 0], np.moveaxis(values, 0, -1)[[2, 0, 2]])
+@pytest.mark.parametrize("key", ["", "a/a", "."])
+def test_key_validation(tmp_path, key):
+    with pytest.raises(ValueError, match="TensorDict keys"):
+        W.write_primal(tmp_path / "bad.h5", {key: np.zeros(2)})
 
 
 @pytest.mark.parametrize("store", ["flat", "row", "column"])
@@ -351,47 +338,45 @@ def test_lazy_slices_indices_and_close(tmp_path, store):
     values = np.arange(24, dtype=np.float64).reshape(6, 4)
     if store == "flat":
         W.write_primal(path, values)
-        key, expected, keys = "primal", values, ["primal"]
+        keys = ["primal"]
+        expected = {"primal": values}
     elif store == "column":
-        W.write_primal(path, values.T, ["d", "c", "b", "a"])
-        key, expected, keys = "primal", values, ["primal"]
+        W.write_primal(path, {"d": values[:, 0], "c": values[:, 1], "b": values[:, 2], "a": values[:, 3]})
+        keys = ["d", "c", "b", "a"]
+        expected = {"d": values[:, 0], "c": values[:, 1], "b": values[:, 2], "a": values[:, 3]}
     else:
         W.write_row_store(path, {"x": values[:, 0], "y": values[:, 1]})
-        key, expected, keys = "x", values[:, 0], ["x", "y"]
+        keys = ["x", "y"]
+        expected = {"x": values[:, 0], "y": values[:, 1]}
     view = W.open_dataset(path)
     for index in (0, -1, slice(None), slice(1, 5, 2), slice(None, None, -1), slice(3, 1), slice(None, None, -2)):
-        np.testing.assert_array_equal(view.read(key, index), expected[index])
+        if store == "row":
+            np.testing.assert_array_equal(view.read_many(keys, index), values[index][:2] if isinstance(index, int) else values[index][:, :2])
+        else:
+            for key in keys:
+                np.testing.assert_array_equal(view.read(key, index), expected[key][index])
     for indices in ([4, 1, 4, -1], [], [0, 2, 5]):
         actual = view.read_indices(keys, indices)
-        expected_many = values[indices, :2] if store == "row" else values[indices, None, :]
-        np.testing.assert_array_equal(actual, expected_many)
+        if store == "row":
+            np.testing.assert_array_equal(actual.numpy(), values[indices, :2])
+        else:
+            for key in keys:
+                np.testing.assert_array_equal(actual[key].numpy(), expected[key][indices])
     with pytest.raises(IndexError):
-        view.read(key, 6)
+        view.read(keys[0], 6)
     with pytest.raises(IndexError):
         view.read_indices(keys, [-7])
     view.close()
     view.close()
     with pytest.raises(RuntimeError, match="closed"):
-        view.read(key, 0)
-
-
-def test_named_dataset_append_and_nested_unicode(tmp_path):
-    path = tmp_path / "named.h5"
-    W.write_named_datasets(path, {"nested/β": np.array([1., 2.])})
-    W.write_named_datasets(path, {"other": np.array([3., 4.])})
-    W.write_named_datasets(path, {"nested/β": np.array([5., 6.])})
-    with W.open_dataset(path) as view:
-        assert view.keys == ("nested/β", "other")
-        np.testing.assert_array_equal(view.read("nested/β", slice(None)), [5, 6])
-    with h5py.File(path) as file:
-        assert list(file["nested"]) == ["β"]
+        view.read(keys[0], 0)
 
 
 def test_dataset_discovery_handles_cycles(tmp_path):
     path = tmp_path / "links.h5"
     with h5py.File(path, "w") as file:
         file.attrs[W.STORE_ATTRIBUTE] = "flat"
-        file.create_dataset("nested/β", data=np.arange(4.) + 10)
+        file.create_dataset("nested/value", data=np.arange(4.) + 10)
         file.create_dataset("primal", data=np.arange(4.))
         file["cycle"] = file["/"]
         expected = {}
@@ -452,13 +437,19 @@ def test_gradient_numeric_promotion(tmp_path, left, right):
 
 def test_sparse_gradient_aggregation_and_merge(tmp_path):
     primal, first, second, total = [tmp_path / f"{name}.h5" for name in ("primal", "first", "second", "total")]
-    W.write_primal(primal, np.ones((3, 2)), ["c", "b", "a"])
-    W.write_gradient(first, np.array([[1., 2.]], dtype=np.float32), ["a"])
-    W.write_gradient(second, np.array([[3., 4.], [5., 6.]], dtype=np.float64), ["b", "a"])
+    W.write_primal(primal, {"c": np.ones(2), "b": np.ones(2), "a": np.ones(2)})
+    W.write_gradient(first, {"a": np.array([1., 2.], dtype=np.float32)})
+    W.write_gradient(second, {"b": np.array([3., 4.], dtype=np.float64), "a": np.array([5., 6.], dtype=np.float64)})
     W.aggregate_gradients([first, second], total)
-    np.testing.assert_array_equal(W.load_backward_gradient(primal, total), [[0, 0], [3, 4], [6, 8]])
-    W.write_gradient(total, np.array([[9., 10.]]), ["c"], merge=True)
-    np.testing.assert_array_equal(W.load_backward_gradient(primal, total), [[9, 10], [3, 4], [6, 8]])
+    backward = W.load_backward_gradient(primal, total)
+    assert isinstance(backward, TensorDict)
+    assert set(backward.keys()) == {"a", "b"}
+    np.testing.assert_array_equal(backward["a"].numpy(), [6., 8.])
+    np.testing.assert_array_equal(backward["b"].numpy(), [3., 4.])
+    W.write_gradient(total, {"c": np.array([9., 10.])}, merge=True)
+    backward = W.load_backward_gradient(primal, total)
+    assert set(backward.keys()) == {"a", "b", "c"}
+    np.testing.assert_array_equal(backward["c"].numpy(), [9., 10.])
     assert not list(tmp_path.glob("*.partial"))
 
 
@@ -467,9 +458,8 @@ def test_null_named_gradients_rejected_before_shape_validation(tmp_path, null_ta
     # Flat-layout combinations are covered by the native suite.
     primal, gradient = tmp_path / "primal.h5", tmp_path / "gradient.h5"
     values = np.array([3.5])
-    columns = ["value"]
-    W.write_primal(primal, values, columns)
-    W.write_gradient(gradient, values, columns)
+    W.write_primal(primal, {"value": values})
+    W.write_gradient(gradient, {"value": values})
     for path, root in ((primal, "primal"), (gradient, "gradient")):
         if null_target != root:
             continue
@@ -487,11 +477,14 @@ def test_null_named_gradients_rejected_before_shape_validation(tmp_path, null_ta
             W.load_gradient(gradient)
 
 
-def test_sparse_scalar_gradients_do_not_treat_null_columns_as_missing(tmp_path):
+def test_sparse_scalar_gradients_do_not_treat_null_keys_as_missing(tmp_path):
     primal, gradient = tmp_path / "primal.h5", tmp_path / "gradient.h5"
-    W.write_primal(primal, np.array([1., 2., 3.]), ["missing", "valid", "null"])
-    W.write_gradient(gradient, np.array([4., 5.]), ["valid", "null"])
-    np.testing.assert_array_equal(W.load_backward_gradient(primal, gradient), [0., 4., 5.])
+    W.write_primal(primal, {"missing": np.array(1.), "valid": np.array(2.), "null": np.array(3.)})
+    W.write_gradient(gradient, {"valid": np.array(4.), "null": np.array(5.)})
+    backward = W.load_backward_gradient(primal, gradient)
+    assert set(backward.keys()) == {"valid", "null"}
+    np.testing.assert_array_equal(backward["valid"].numpy(), 4.)
+    np.testing.assert_array_equal(backward["null"].numpy(), 5.)
     with h5py.File(gradient, "r+") as file:
         del file["gradient/null"]
         file.create_dataset("gradient/null", data=h5py.Empty("f8"))
@@ -501,20 +494,27 @@ def test_sparse_scalar_gradients_do_not_treat_null_columns_as_missing(tmp_path):
         list(W.gradient_file_contributions(primal, gradient))
 
 
-@pytest.mark.parametrize("named", [False, True], ids=["flat", "column"])
+@pytest.mark.parametrize("named", [False, True], ids=["flat", "dict"])
 @pytest.mark.parametrize("shape", [(), (0,), (0, 2), (2, 0)])
 def test_scalar_and_empty_gradients_remain_supported(tmp_path, named, shape):
     primal, gradient = tmp_path / "primal.h5", tmp_path / "gradient.h5"
     values = np.full(shape, 3.5)
     if named:
         values = np.expand_dims(values, 0)
-    columns = ["value"] if named else None
-    W.write_primal(primal, values, columns)
-    W.write_gradient(gradient, values, columns)
-    assert list(W.gradient_file_contributions(primal, gradient)) == [(str(primal), str(gradient), columns)]
-    loaded = W.load_backward_gradient(primal, gradient)
-    assert loaded.shape == values.shape
-    np.testing.assert_array_equal(loaded, values)
+        W.write_primal(primal, {"value": values})
+        W.write_gradient(gradient, {"value": values})
+        assert list(W.gradient_file_contributions(primal, gradient)) == [(str(primal), str(gradient), ["value"])]
+        loaded = W.load_backward_gradient(primal, gradient)
+        assert isinstance(loaded, TensorDict)
+        assert loaded["value"].shape == values.shape
+        np.testing.assert_array_equal(loaded["value"].numpy(), values)
+    else:
+        W.write_primal(primal, values)
+        W.write_gradient(gradient, values)
+        assert list(W.gradient_file_contributions(primal, gradient)) == [(str(primal), str(gradient), None)]
+        loaded = W.load_backward_gradient(primal, gradient)
+        assert loaded.shape == values.shape
+        np.testing.assert_array_equal(loaded, values)
 
 
 def test_null_dataset_reduction_preserves_destination(tmp_path):
@@ -550,30 +550,57 @@ def test_hdf5_2_native_complex_input(tmp_path):
     np.testing.assert_array_equal(W.open_primal(path), values)
     with W.open_dataset(path) as view:
         np.testing.assert_array_equal(view.read("primal", slice(None)), values)
-        np.testing.assert_array_equal(view.read_indices(["primal"], [1, 0, 1])[:, 0], values[[1, 0, 1]])
+        np.testing.assert_array_equal(
+            view.read_indices(["primal"], [1, 0, 1])["primal"].numpy(),
+            values[[1, 0, 1]],
+        )
 
 
 @pytest.mark.parametrize("columns", [None, ["second", "first"]])
 def test_nested_repeated_vds_gradient_transpose(tmp_path, columns):
     a, b, inner, outer, grad = [tmp_path / f"{name}.h5" for name in ("a", "b", "inner", "outer", "adjoint")]
-    first = np.arange(4, dtype=np.float32).reshape(2, 2) if columns else np.arange(2, dtype=np.float32)
-    second = np.arange(2, dtype=np.float32).reshape(2, 1) if columns else np.arange(1, dtype=np.float32)
-    W.write_primal(a, first, columns)
-    W.write_primal(b, second, columns)
+    if columns:
+        first = np.arange(4, dtype=np.float32).reshape(2, 2)
+        second = np.arange(2, dtype=np.float32).reshape(2, 1)
+        W.write_primal(a, {"second": first[0], "first": first[1]})
+        W.write_primal(b, {"second": second[0], "first": second[1]})
+    else:
+        first = np.arange(2, dtype=np.float32)
+        second = np.arange(1, dtype=np.float32)
+        W.write_primal(a, first)
+        W.write_primal(b, second)
     W.reduce([a, b], inner)
     W.reduce([inner, a, inner], outer)
-    primal = W.open_primal(outer)
-    gradient = np.arange(primal.size, dtype=np.float32).reshape(primal.shape)
-    W.write_gradient(grad, gradient, columns)
-    contributions = list(W.gradient_file_contributions(outer, grad))
-    assert [Path(path).name for path, _, _ in contributions] == ["a.h5", "b.h5", "a.h5", "a.h5", "b.h5"]
-    offset = 0
-    for path, value, selected in contributions:
-        count = W.open_primal(path).shape[-1]
-        expected = gradient[:, offset:offset + count] if columns else gradient[offset:offset + count]
-        np.testing.assert_array_equal(value, expected)
-        assert selected == columns
-        offset += count
+    contributions = None
+    if columns:
+        primal = W.open_primal(outer)
+        gradient = {
+            "second": np.arange(primal["second"].numel(), dtype=np.float32),
+            "first": np.arange(primal["first"].numel(), dtype=np.float32),
+        }
+        W.write_gradient(grad, gradient)
+        contributions = list(W.gradient_file_contributions(outer, grad))
+        assert [Path(path).name for path, _, _ in contributions] == ["a.h5", "b.h5", "a.h5", "a.h5", "b.h5"]
+        offsets = {key: 0 for key in gradient}
+        for path, value, selected in contributions:
+            assert isinstance(value, TensorDict)
+            assert selected == ["second", "first"]
+            for key in selected:
+                count = value[key].numel()
+                np.testing.assert_array_equal(value[key].numpy(), gradient[key][offsets[key]:offsets[key] + count])
+                offsets[key] += count
+    else:
+        primal = W.open_primal(outer)
+        gradient = np.arange(primal.size, dtype=np.float32).reshape(primal.shape)
+        W.write_gradient(grad, gradient)
+        contributions = list(W.gradient_file_contributions(outer, grad))
+        assert [Path(path).name for path, _, _ in contributions] == ["a.h5", "b.h5", "a.h5", "a.h5", "b.h5"]
+        offset = 0
+        for path, value, selected in contributions:
+            count = W.open_primal(path).size
+            np.testing.assert_array_equal(value, gradient[offset:offset + count])
+            assert selected is None
+            offset += count
     with h5py.File(outer) as file:
         dataset = file["primal/second"] if columns else file["primal"]
         assert dataset.is_virtual
@@ -591,6 +618,44 @@ def test_scalar_and_empty_virtual_concatenations(tmp_path, shape):
     with h5py.File(output) as file:
         assert file["primal"].is_virtual
         assert json.loads(file["primal"].attrs[W.PARTITION_SIZES_ATTRIBUTE]) == [1 if not shape else shape[0]] * 2
+
+
+def test_scalar_dict_virtual_concatenation_and_adjoint(tmp_path):
+    a, b, output, gradient = [tmp_path / f"{name}.h5" for name in ("a", "b", "output", "gradient")]
+    W.write_primal(a, {"loss": np.array(1.5, dtype=np.float32), "score": np.array(2.0, dtype=np.float32)})
+    W.write_primal(b, {"loss": np.array(2.5, dtype=np.float32), "score": np.array(3.0, dtype=np.float32)})
+    W.reduce([a, b], output)
+    primal = W.open_primal(output)
+    assert isinstance(primal, TensorDict)
+    assert tuple(primal.batch_size) == (2,)
+    np.testing.assert_array_equal(primal["loss"].numpy(), np.array([1.5, 2.5], dtype=np.float32))
+    np.testing.assert_array_equal(primal["score"].numpy(), np.array([2.0, 3.0], dtype=np.float32))
+    W.write_gradient(gradient, {
+        "loss": np.array([10.0, 20.0], dtype=np.float32),
+        "score": np.array([30.0, 40.0], dtype=np.float32),
+    })
+    contributions = list(W.gradient_file_contributions(output, gradient))
+    assert [Path(path).name for path, _, _ in contributions] == ["a.h5", "b.h5"]
+    expected = [{"loss": 10.0, "score": 30.0}, {"loss": 20.0, "score": 40.0}]
+    for (_, value, selected), values in zip(contributions, expected):
+        assert isinstance(value, TensorDict)
+        assert tuple(value.batch_size) == ()
+        assert selected == ["loss", "score"]
+        for key, expected_value in values.items():
+            np.testing.assert_array_equal(value[key].numpy(), np.array(expected_value, dtype=np.float32))
+    with h5py.File(output) as file:
+        for key in ("loss", "score"):
+            dataset = file[f"primal/{key}"]
+            assert dataset.is_virtual
+            assert json.loads(dataset.attrs[W.PARTITION_SIZES_ATTRIBUTE]) == [1, 1]
+
+
+def test_mixed_scalar_dict_reduction_is_rejected(tmp_path):
+    source, output = tmp_path / "source.h5", tmp_path / "output.h5"
+    W.write_primal(source, {"scalar": np.array(1.5), "vector": np.array([1.0, 2.0])})
+    with pytest.raises(ValueError, match="mix scalar and non-scalar"):
+        W.reduce([source], output)
+    assert not output.exists()
 
 
 def test_vds_relocation_and_missing_sources(tmp_path):
@@ -646,8 +711,8 @@ def test_failures_and_gradient_atomicity(tmp_path):
     gradient = tmp_path / "gradient.h5"
     W.write_gradient(gradient, np.array([2.]))
     before = gradient.read_bytes()
-    with pytest.raises(ValueError):
-        W.write_gradient(gradient, np.ones((2, 1)), ["one"])
+    with pytest.raises(ValueError, match="TensorDict keys"):
+        W.write_gradient(gradient, {"a/a": np.ones(2)})
     assert gradient.read_bytes() == before
     assert not list(tmp_path.glob("*.partial"))
 
@@ -678,6 +743,8 @@ def test_python_extension_keeps_dependency_symbols_private():
 
 @pytest.mark.parametrize("first", ["h5py", "dsbo"])
 def test_bundled_hdf5_coexists_with_h5py(tmp_path, first):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH", "")
     subprocess.run([
         sys.executable, "-c", f"import {first}\n" + '''
 import h5py
@@ -692,7 +759,7 @@ W.write_primal("native.h5", values)
 with h5py.File("native.h5") as file:
     np.testing.assert_array_equal(file["primal"][:], values)
 ''',
-    ], cwd=tmp_path, check=True)
+    ], cwd=tmp_path, check=True, env=env)
 
 
 def test_bundled_source_notices_match_upstream():

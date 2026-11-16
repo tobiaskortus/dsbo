@@ -82,7 +82,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_); require_open();
         if (internal::object_type(file_, name) == H5O_TYPE_DATASET) return {};
         auto parent = internal::group(file_, name);
-        return internal::stored_columns(parent);
+        return internal::stored_keys(parent);
     }
     std::vector<std::string> row_keys() const {
         std::lock_guard<std::mutex> lock(mutex_); require_open();

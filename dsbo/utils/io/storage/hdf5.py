@@ -1,10 +1,10 @@
 import os
 from collections.abc import Iterator
+from typing import TypeAlias
 
 import numpy as np
+from tensordict import TensorDict
 
-from dsbo.utils.io.storage import _hdf5
-from dsbo.utils.io.storage.autograd import AutogradFileInterface
 from dsbo.utils.io.datasets.views import (
     STORE_COLUMN,
     STORE_FLAT,
@@ -14,6 +14,12 @@ from dsbo.utils.io.datasets.views import (
     HDF5DatasetView,
     HDF5RowStoreDatasetView,
 )
+from dsbo.utils.io.storage import _hdf5
+from dsbo.utils.io.storage.autograd import AutogradFileInterface
+from dsbo.utils.io.storage.utils import to_dict, to_tensordict
+
+ArrayValues: TypeAlias = np.ndarray | TensorDict
+GradientSource: TypeAlias = str | np.ndarray | TensorDict
 
 
 class HDF5Statistics:
@@ -43,20 +49,32 @@ class HDF5Writer(HDF5Statistics):
         return frozenset({".h5", ".hdf5"})
 
     @classmethod
-    def open_primal(cls, fpath: str, columns: list[str] | None = None) -> np.ndarray:
-        return _hdf5.open_primal(os.fsdecode(fpath), columns)
+    def open_primal(cls, fpath: str, columns: list[str] | None = None) -> ArrayValues:
+        value = _hdf5.open_primal(os.fsdecode(fpath), columns)
+        return to_tensordict(value) if isinstance(value, dict) else value
 
     @classmethod
-    def open_primal_tangent(cls, fpath: str, columns: list[str] | None = None) -> tuple[np.ndarray, np.ndarray | None]:
-        return _hdf5.open_primal_tangent(os.fsdecode(fpath), columns)
+    def open_primal_tangent(cls, fpath: str, columns: list[str] | None = None) -> tuple[ArrayValues, ArrayValues | None]:
+        primal, tangent = _hdf5.open_primal_tangent(os.fsdecode(fpath), columns)
+        if isinstance(primal, dict):
+            primal = to_tensordict(primal)
+        if isinstance(tangent, dict):
+            tangent = to_tensordict(tangent)
+        return primal, tangent
 
     @classmethod
-    def write_primal(cls, fpath: str, primal: np.ndarray, columns: list[str] | None = None):
-        _hdf5.write_primal(os.fsdecode(fpath), primal, columns)
+    def write_primal(cls, fpath: str, primal: ArrayValues):
+        if isinstance(primal, TensorDict):
+            primal = to_dict(primal, numpy=True)
+        _hdf5.write_primal(os.fsdecode(fpath), primal)
 
     @classmethod
-    def write_primal_tangent(cls, fpath: str, primal: np.ndarray, tangent: np.ndarray, columns: list[str] | None = None):
-        _hdf5.write_primal_tangent(os.fsdecode(fpath), primal, tangent, columns)
+    def write_primal_tangent(cls, fpath: str, primal: ArrayValues, tangent: ArrayValues) -> None:
+        if isinstance(primal, TensorDict):
+            primal = to_dict(primal, numpy=True)
+        if isinstance(tangent, TensorDict):
+            tangent = to_dict(tangent, numpy=True)
+        _hdf5.write_primal_tangent(os.fsdecode(fpath), primal, tangent)
 
     @classmethod
     def write_named_datasets(cls, fpath: str, datasets: dict[str, np.ndarray]) -> None:
@@ -89,32 +107,38 @@ class HDF5Writer(HDF5Statistics):
         return _hdf5.columns(os.fsdecode(fpath))
 
     @classmethod
-    def shape_from_path(cls, path: str) -> tuple[int, ...]:
-        return tuple(_hdf5.shape_from_path(os.fsdecode(path)))
+    def shape_from_path(cls, path: str) -> tuple[int, ...] | dict[str, tuple[int, ...]]:
+        value = _hdf5.shape_from_path(os.fsdecode(path))
+        if isinstance(value, dict):
+            return {key: tuple(shape) for key, shape in value.items()}
+        return tuple(value)
 
     @classmethod
-    def load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> np.ndarray:
-        return _hdf5.load_gradient(os.fsdecode(grad_path), columns)
+    def load_gradient(cls, grad_path: str, columns: list[str] | None = None) -> ArrayValues:
+        value = _hdf5.load_gradient(os.fsdecode(grad_path), columns)
+        return to_tensordict(value) if isinstance(value, dict) else value
 
     @classmethod
-    def load_backward_gradient(cls, fpath: str, grad_path: str) -> np.ndarray:
-        return _hdf5.load_backward_gradient(os.fsdecode(fpath), os.fsdecode(grad_path))
+    def load_backward_gradient(cls, fpath: str, grad_path: str) -> ArrayValues:
+        value = _hdf5.load_backward_gradient(os.fsdecode(fpath), os.fsdecode(grad_path))
+        return to_tensordict(value) if isinstance(value, dict) else value
 
     @classmethod
-    def write_gradient(cls, fpath: str, gradient: np.ndarray, columns: list[str] | None = None, *, merge: bool = False) -> None:
-        _hdf5.write_gradient(os.fsdecode(fpath), gradient, columns, merge=merge)
+    def write_gradient(cls, fpath: str, gradient: ArrayValues, *, merge: bool = False) -> None:
+        if isinstance(gradient, TensorDict):
+            gradient = to_dict(gradient, numpy=True)
+        _hdf5.write_gradient(os.fsdecode(fpath), gradient, merge=merge)
 
     @classmethod
     def aggregate_gradients(cls, sources: list[str], destination: str) -> None:
         _hdf5.aggregate_gradients([os.fsdecode(source) for source in sources], os.fsdecode(destination))
 
     @classmethod
-    def gradient_file_contributions(cls, fpath: str, gradient_path: str) -> Iterator[tuple[str, str | np.ndarray, list[str] | None]]:
-        yield from _hdf5.gradient_file_contributions(os.fsdecode(fpath), os.fsdecode(gradient_path))
-
-    @classmethod
-    def _gradient_contributions(cls, fpath: str, gradient: np.ndarray, columns: list[str] | None = None):
-        yield from _hdf5.gradient_contributions(os.fsdecode(fpath), gradient, columns)
+    def gradient_file_contributions(cls, fpath: str, gradient_path: str) -> Iterator[tuple[str, GradientSource, list[str] | None]]:
+        for target, source, keys in _hdf5.gradient_file_contributions(os.fsdecode(fpath), os.fsdecode(gradient_path)):
+            if isinstance(source, dict):
+                source = to_tensordict(source)
+            yield target, source, keys or None
 
     @classmethod
     def reduce(cls, sources: list[str], destination: str) -> None:

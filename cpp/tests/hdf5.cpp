@@ -455,6 +455,216 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "convert/boolean-truth") {
           std::vector<bool>({true, false, true}));
 }
 
+TEST_CASE_FIXTURE(Hdf5Fixture, "dict/per-key-shapes-dtypes-and-order") {
+    TestDirectory directory;
+    const auto path = directory("mixed.h5");
+    const auto ints = io::Array::from<std::int32_t>({1, 2, 3, 4}, {2, 2});
+    const auto floats = io::Array::from<double>({0.5, 1.5, 2.5}, {3});
+    io::HDF5Storage::write_primal(path, io::NamedArrays{{"ints", ints.view()}, {"floats", floats.view()}});
+    const auto loaded = io::HDF5Storage::open_dict(path);
+    REQUIRE(loaded.size() == 2);
+    CHECK(loaded[0].first == "ints");
+    CHECK(loaded[1].first == "floats");
+    CHECK(loaded[0].second.type == ints.type);
+    CHECK(loaded[0].second.shape == ints.shape);
+    CHECK(loaded[0].second.storage == ints.storage);
+    CHECK(loaded[1].second.type == floats.type);
+    CHECK(loaded[1].second.shape == floats.shape);
+    CHECK(loaded[1].second.storage == floats.storage);
+    const auto subset = io::HDF5Storage::open_dict(path, std::vector<std::string>{"floats"});
+    REQUIRE(subset.size() == 1);
+    CHECK(subset[0].first == "floats");
+    CHECK(subset[0].second.storage == floats.storage);
+    const auto shapes = io::HDF5Storage::dict_shape_from_path(path);
+    REQUIRE(shapes.size() == 2);
+    CHECK(shapes[0].second == ints.shape);
+    CHECK(shapes[1].second == floats.shape);
+    CHECK_THROWS_AS(io::HDF5Storage::open_dict(path, std::vector<std::string>{"missing"}), io::KeyError);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "dict/tangents-preserve-key-subsets") {
+    TestDirectory directory;
+    const auto path = directory("mixed_tangent.h5");
+    const auto ints = io::Array::from<std::int32_t>({1, 2, 3, 4}, {2, 2});
+    const auto floats = io::Array::from<double>({0.5, 1.5, 2.5}, {3});
+    const io::NamedArrays primal_values{{"ints", ints.view()}, {"floats", floats.view()}};
+    io::HDF5Storage::write_primal_tangent(path, primal_values, io::NamedArrays{{"ints", ints.view()}});
+    const auto [primal, tangent] = io::HDF5Storage::open_dict_tangent(path);
+    CHECK(primal.size() == 2);
+    REQUIRE(tangent.has_value());
+    REQUIRE(tangent->size() == 1);
+    CHECK((*tangent)[0].first == "ints");
+    CHECK((*tangent)[0].second.storage == ints.storage);
+    const auto subset = io::HDF5Storage::open_dict_tangent(path, std::vector<std::string>{"floats"});
+    REQUIRE(subset.first.size() == 1);
+    CHECK(subset.first[0].first == "floats");
+    CHECK(!subset.second);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/dict-preserves-zero-values-and-dtype") {
+    TestDirectory directory;
+    const auto primal_path = directory("mixed.h5");
+    const auto gradient_path = directory("mixed_gradient.h5");
+    const auto ints = io::Array::from<std::int32_t>({1, 2, 3, 4}, {2, 2});
+    const auto floats = io::Array::from<double>({0.5, 1.5, 2.5}, {3});
+    io::HDF5Storage::write_primal(primal_path, io::NamedArrays{{"ints", ints.view()}, {"floats", floats.view()}});
+    const auto zero = io::Array::from<float>({0, 0, 0, 0}, {2, 2});
+    io::HDF5Storage::write_gradient(gradient_path, io::NamedArrays{{"ints", zero.view()}});
+    const auto gradient = io::HDF5Storage::load_dict_gradient(gradient_path);
+    REQUIRE(gradient.size() == 1);
+    CHECK(gradient[0].second.type == io::dtype<float>());
+    const auto backward = io::HDF5Storage::load_backward_dict_gradient(primal_path, gradient_path);
+    REQUIRE(backward.size() == 1);
+    CHECK(backward[0].first == "ints");
+    CHECK(backward[0].second.values<float>() == std::vector<float>({0, 0, 0, 0}));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/dict-rejects-incompatible-shapes-and-unknown-keys") {
+    TestDirectory directory;
+    const auto primal_path = directory("mixed.h5");
+    const auto ints = io::Array::from<std::int32_t>({1, 2, 3, 4}, {2, 2});
+    io::HDF5Storage::write_primal(primal_path, io::NamedArrays{{"ints", ints.view()}});
+    const auto wrong_shape = io::Array::from<float>({1, 2}, {2});
+    const auto wrong_path = directory("wrong_shape.h5");
+    io::HDF5Storage::write_gradient(wrong_path, io::NamedArrays{{"ints", wrong_shape.view()}});
+    CHECK_THROWS_AS(io::HDF5Storage::load_backward_dict_gradient(primal_path, wrong_path), std::invalid_argument);
+    const auto unknown_path = directory("unknown_key.h5");
+    io::HDF5Storage::write_gradient(unknown_path, io::NamedArrays{{"missing", ints.view()}});
+    CHECK_THROWS_AS(io::HDF5Storage::load_backward_dict_gradient(primal_path, unknown_path), std::invalid_argument);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/dict-aggregation-and-key-replacement") {
+    TestDirectory directory;
+    const auto first_path = directory("dict_grad_a.h5");
+    const auto second_path = directory("dict_grad_b.h5");
+    const auto sum_path = directory("dict_sum.h5");
+    const auto a = io::Array::from<float>({1, 2}, {2});
+    const auto other_a = io::Array::from<double>({1, 1}, {2});
+    const auto b = io::Array::from<std::int32_t>({3, 4, 5}, {3});
+    io::HDF5Storage::write_gradient(first_path, io::NamedArrays{{"a", a.view()}});
+    io::HDF5Storage::write_gradient(second_path, io::NamedArrays{{"a", other_a.view()}, {"b", b.view()}});
+    io::HDF5Storage::aggregate_gradients({first_path, second_path}, sum_path);
+    const auto sum = io::HDF5Storage::load_dict_gradient(sum_path);
+    REQUIRE(sum.size() == 2);
+    CHECK(sum[0].first == "a");
+    CHECK(sum[1].first == "b");
+    CHECK(sum[0].second.type == io::dtype<double>());
+    CHECK(sum[0].second.values<double>() == std::vector<double>({2, 3}));
+    CHECK(sum[1].second.type == io::dtype<std::int32_t>());
+    CHECK(sum[1].second.values<std::int32_t>() == std::vector<std::int32_t>({3, 4, 5}));
+    const auto replacement = io::Array::from<float>({9, 10}, {2});
+    io::HDF5Storage::write_gradient(sum_path, io::NamedArrays{{"a", replacement.view()}}, true);
+    const auto merged = io::HDF5Storage::load_dict_gradient(sum_path);
+    REQUIRE(merged.size() == 2);
+    CHECK(merged[0].first == "a");
+    CHECK(merged[0].second.type == io::dtype<float>());
+    CHECK(merged[0].second.values<float>() == std::vector<float>({9, 10}));
+    CHECK(merged[1].first == "b");
+    CHECK(merged[1].second.values<std::int32_t>() == std::vector<std::int32_t>({3, 4, 5}));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/dict-concatenates-each-key-independently") {
+    TestDirectory directory;
+    const auto first_path = directory("mix_a.h5");
+    const auto second_path = directory("mix_b.h5");
+    const auto target = directory("mix_vds.h5");
+    const auto a = io::Array::from<float>({1, 2}, {2});
+    const auto other_a = io::Array::from<float>({3}, {1});
+    const auto b = io::Array::from<std::int32_t>({10, 20, 30}, {3});
+    const auto other_b = io::Array::from<std::int32_t>({40, 50}, {2});
+    io::HDF5Storage::write_primal(first_path, io::NamedArrays{{"a", a.view()}, {"b", b.view()}});
+    io::HDF5Storage::write_primal(second_path, io::NamedArrays{{"a", other_a.view()}, {"b", other_b.view()}});
+    io::HDF5Storage::reduce({first_path, second_path}, target);
+    const auto loaded = io::HDF5Storage::open_dict(target);
+    REQUIRE(loaded.size() == 2);
+    CHECK(loaded[0].first == "a");
+    CHECK(loaded[0].second.values<float>() == std::vector<float>({1, 2, 3}));
+    CHECK(loaded[1].first == "b");
+    CHECK(loaded[1].second.values<std::int32_t>() == std::vector<std::int32_t>({10, 20, 30, 40, 50}));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/dict-rejects-incompatible-dtypes") {
+    TestDirectory directory;
+    const auto first_path = directory("first.h5");
+    const auto second_path = directory("second.h5");
+    const auto target = directory("incompatible.h5");
+    const auto first = io::Array::from<float>({1, 2}, {2});
+    const auto second = io::Array::from<double>({4}, {1});
+    io::HDF5Storage::write_primal(first_path, io::NamedArrays{{"a", first.view()}});
+    io::HDF5Storage::write_primal(second_path, io::NamedArrays{{"a", second.view()}});
+    CHECK_THROWS_AS(io::HDF5Storage::reduce({first_path, second_path}, target), std::invalid_argument);
+    CHECK(!fs::exists(target));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/scalar-dict-vds-and-adjoint") {
+    TestDirectory directory;
+    const auto source = directory("scalar_key.h5");
+    const auto target = directory("scalar_key_vds.h5");
+    const auto gradient_path = directory("scalar_key_gradient.h5");
+    const auto scalar = io::Array::from<double>({1.5}, {});
+    io::HDF5Storage::write_primal(source, io::NamedArrays{{"value", scalar.view()}});
+    io::HDF5Storage::reduce({source, source}, target);
+    const auto loaded = io::HDF5Storage::open_dict(target);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].first == "value");
+    CHECK(loaded[0].second.shape == io::Shape({2}));
+    CHECK(loaded[0].second.values<double>() == std::vector<double>({1.5, 1.5}));
+    const auto gradient = io::Array::from<double>({2, 3}, {2});
+    io::HDF5Storage::write_gradient(gradient_path, io::NamedArrays{{"value", gradient.view()}});
+    const auto contributions = io::HDF5Storage::gradient_file_contributions(target, gradient_path);
+    REQUIRE(contributions.size() == 2);
+    for (std::size_t i = 0; i < contributions.size(); ++i) {
+        REQUIRE(std::holds_alternative<io::NamedArrayValues>(contributions[i].source));
+        const auto& values = std::get<io::NamedArrayValues>(contributions[i].source);
+        REQUIRE(values.size() == 1);
+        CHECK(values[0].second.shape.empty());
+        CHECK(values[0].second.values<double>() == std::vector<double>({2.0 + i}));
+    }
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/dict-rejects-mixed-scalar-and-non-scalar-fields") {
+    TestDirectory directory;
+    const auto source = directory("scalar_mix.h5");
+    const auto target = directory("scalar_mix_vds.h5");
+    const auto scalar = io::Array::from<double>({2.5}, {});
+    const auto vector = io::Array::from<double>({1, 2}, {2});
+    io::HDF5Storage::write_primal(source, io::NamedArrays{{"scalar", scalar.view()}, {"vector", vector.view()}});
+    CHECK_THROWS_WITH_AS(io::HDF5Storage::reduce({source}, target),
+                         doctest::Contains("mix scalar and non-scalar"), std::invalid_argument);
+    CHECK(!fs::exists(target));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/rejects-mixed-flat-and-dict-stores") {
+    TestDirectory directory;
+    const auto dict_path = directory("dict.h5");
+    const auto flat_path = directory("flat.h5");
+    const auto target = directory("mixed_store.h5");
+    const auto values = io::Array::from<float>({1, 2}, {2});
+    io::HDF5Storage::write_primal(dict_path, io::NamedArrays{{"a", values.view()}});
+    io::HDF5Storage::write_primal(flat_path, values.view());
+    CHECK_THROWS_AS(io::HDF5Storage::reduce({dict_path, flat_path}, target), std::invalid_argument);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "dict/legacy-column-group-without-metadata") {
+    TestDirectory directory;
+    const auto path = directory("legacy.h5");
+    const auto a = io::Array::from<float>({1, 2}, {2});
+    const auto b = io::Array::from<std::int32_t>({10, 20, 30}, {3});
+    {
+        auto file = io::internal::open_file(path, true);
+        io::internal::set_string(file, io::store_attribute, "column");
+        auto parent = io::internal::require_group(file, "primal");
+        io::internal::create_dsbo_dataset(parent, "a", a.view());
+        io::internal::create_dsbo_dataset(parent, "b", b.view());
+        parent.close_checked();
+        io::internal::finish_file(file);
+    }
+    const auto legacy = io::HDF5Storage::open_dict(path);
+    REQUIRE(legacy.size() == 2);
+    CHECK(legacy[0].first == "a");
+    CHECK(legacy[1].first == "b");
+}
+
 TEST_CASE_FIXTURE(Hdf5Fixture, "io/extended-float-byte-order") {
     TestDirectory directory;
     const auto path = directory("extended.h5");
@@ -549,24 +759,26 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/vds-contributions") {
     CHECK(std::get<io::Array>(contributions[0].source).shape == io::Shape({3, 2}));
 }
 
-TEST_CASE_FIXTURE(Hdf5Fixture, "columns/utf8-order") {
+TEST_CASE_FIXTURE(Hdf5Fixture, "dict/utf8-key-order") {
     TestDirectory directory;
     const auto path = directory("named.h5");
     const auto named = io::Array::from<double>({1, 2, 3, 4, 5, 6}, {2, 3});
-    io::HDF5Storage::write_primal(path, named.view(), std::vector<std::string>{"β", "first"});
+    io::HDF5Storage::write_primal(path, io::NamedArrays{{"β", named.view().column(0)}, {"first", named.view().column(1)}});
     CHECK(io::HDF5Storage::columns(path) == std::vector<std::string>({"β", "first"}));
 }
 
-TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/missing-columns-zero-filled") {
+TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/missing-keys-omitted") {
     TestDirectory directory;
     const auto primal_path = directory("named.h5");
     const auto gradient_path = directory("named_gradient.h5");
     const auto named = io::Array::from<double>({1, 2, 3, 4, 5, 6}, {2, 3});
     const auto selected = io::Array::from<float>({7, 8, 9}, {1, 3});
-    io::HDF5Storage::write_primal(primal_path, named.view(), std::vector<std::string>{"β", "first"});
-    io::HDF5Storage::write_gradient(gradient_path, selected.view(), std::vector<std::string>{"first"});
-    const auto backward = io::HDF5Storage::load_backward_gradient(primal_path, gradient_path);
-    CHECK(backward.values<float>() == std::vector<float>({0, 0, 0, 7, 8, 9}));
+    io::HDF5Storage::write_primal(primal_path, io::NamedArrays{{"β", named.view().column(0)}, {"first", named.view().column(1)}});
+    io::HDF5Storage::write_gradient(gradient_path, io::NamedArrays{{"first", selected.view().column(0)}});
+    const auto backward = io::HDF5Storage::load_backward_dict_gradient(primal_path, gradient_path);
+    REQUIRE(backward.size() == 1);
+    CHECK(backward[0].first == "first");
+    CHECK(backward[0].second.values<float>() == std::vector<float>({7, 8, 9}));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/physical-source-contribution-is-a-file-path") {
@@ -575,8 +787,8 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/physical-source-contribution-is-a-file-
     const auto gradient_path = directory("named_gradient.h5");
     const auto named = io::Array::from<double>({1, 2, 3, 4, 5, 6}, {2, 3});
     const auto selected = io::Array::from<float>({7, 8, 9}, {1, 3});
-    io::HDF5Storage::write_primal(primal_path, named.view(), std::vector<std::string>{"β", "first"});
-    io::HDF5Storage::write_gradient(gradient_path, selected.view(), std::vector<std::string>{"first"});
+    io::HDF5Storage::write_primal(primal_path, io::NamedArrays{{"β", named.view().column(0)}, {"first", named.view().column(1)}});
+    io::HDF5Storage::write_gradient(gradient_path, io::NamedArrays{{"first", selected.view().column(0)}});
     const auto contributions = io::HDF5Storage::gradient_file_contributions(primal_path, gradient_path);
     REQUIRE(!contributions.empty());
     CHECK(std::holds_alternative<std::string>(contributions[0].source));

@@ -36,19 +36,19 @@ template<class T> inline std::optional<T> json_attribute(hid_t parent, const cha
     catch (const Json::exception& error) { throw std::invalid_argument(std::string("Invalid HDF5 metadata '") + name + "': " + error.what()); }
 }
 
-inline void validate_columns(const std::vector<std::string>& columns, const ArrayView* value = nullptr) {
+inline void validate_keys(const std::vector<std::string>& keys, const ArrayView* value = nullptr) {
     std::set<std::string> unique;
-    for (const auto& column : columns) {
-        if (column.empty() || column == "." || column.find('/') != std::string::npos || column.find('\0') != std::string::npos)
-            throw std::invalid_argument("Column names must be valid, non-empty HDF5 names without '/'.");
-        if (!unique.insert(column).second) throw std::invalid_argument("Column names must be unique.");
+    for (const auto& key : keys) {
+        if (key.empty() || key == "." || key.find('/') != std::string::npos || key.find('\0') != std::string::npos)
+            throw std::invalid_argument("TensorDict keys must be non-empty strings without '/', '.', or NUL characters.");
+        if (!unique.insert(key).second) throw std::invalid_argument("TensorDict keys must be unique.");
     }
-    if (value && (value->shape.empty() || value->shape[0] != columns.size()))
-        throw std::invalid_argument("Received " + std::to_string(columns.size()) + " columns for an array with size " +
+    if (value && (value->shape.empty() || value->shape[0] != keys.size()))
+        throw std::invalid_argument("Received " + std::to_string(keys.size()) + " keys for an array with size " +
                                     std::to_string(value->shape.empty() ? 0 : value->shape[0]) + " along dimension 0.");
 }
 
-inline std::vector<std::string> stored_columns(hid_t parent) {
+inline std::vector<std::string> stored_keys(hid_t parent) {
     return json_attribute<std::vector<std::string>>(parent, columns_attribute).value_or(children(parent, true));
 }
 
@@ -111,26 +111,6 @@ inline Array read_dataset(hid_t value) {
     auto type = read_datatype(value, result.type);
     if (result.size()) check(H5Dread(value, type, H5S_ALL, H5S_ALL, H5P_DEFAULT, result.storage.data()), "Cannot read HDF5 dataset.");
     return result;
-}
-
-inline Array read_named(hid_t file, const std::string& name, Columns columns = std::nullopt) {
-    if (object_type(file, name) == H5O_TYPE_DATASET) {
-        if (columns) throw std::invalid_argument("HDF5 dataset '" + name + "' was not written with named columns.");
-        auto value = dataset(file, name);
-        return read_dataset(value);
-    }
-    auto parent = group(file, name);
-    const auto selected = columns.value_or(stored_columns(parent));
-    validate_columns(selected);
-    std::vector<Array> values;
-    for (const auto& column : selected) {
-        if (!exists(parent, column)) throw KeyError("HDF5 dataset '" + name + "' has no column '" + column + "'.");
-        auto value = dataset(parent, column);
-        values.push_back(read_dataset(value));
-    }
-    std::vector<ArrayView> views;
-    for (const auto& value : values) views.push_back(value.view());
-    return stack(views);
 }
 
 // Virtual-concatenation partitions.

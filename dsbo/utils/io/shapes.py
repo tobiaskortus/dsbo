@@ -10,7 +10,8 @@ class LazyShape(tuple):
     until the module's training batch writes its output files, so they are
     deferred here: the value behaves like a tuple but only resolves the file's
     shape on first access, and can also be pinned explicitly via :meth:`set`
-    (e.g. when restoring from a saved model state).
+    (e.g. when restoring from a saved model state). Only flat, single-dataset
+    layouts are supported; TensorDict stores raise :class:`ValueError`.
     """
     _fpath: AbstractFilePath
     _resolved: tuple[int, ...] | None
@@ -24,7 +25,13 @@ class LazyShape(tuple):
     def resolve(self, path: str):
         if self._resolved is None:
             from dsbo.config import get_active_file_backend
-            self._resolved = get_active_file_backend().shape_from_path(path)[1:]
+            shape = get_active_file_backend().shape_from_path(path)
+            if isinstance(shape, dict):
+                raise ValueError(
+                    f"Cannot resolve shape for '{self._fpath.filename}': "
+                    "TensorDict HDF5 layouts are not supported yet."
+                )
+            self._resolved = shape[1:]
 
     def set(self, shape: tuple[int, ...]):
         self._resolved = tuple(shape)

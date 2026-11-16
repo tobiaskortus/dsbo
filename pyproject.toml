@@ -27,6 +27,7 @@ dependencies = [
     "sqlalchemy==2.0.51",
     "sqlmodel==0.0.39",
     "sqlite-vec==0.1.9",
+    "tensordict==0.15.6",
     "torch==2.15.0",
     "tqdm==4.67.3",
 ]

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import numpy as np
 from typing import TYPE_CHECKING
 
-import numpy as np
+import torch
+from tensordict import TensorDict
 
 if TYPE_CHECKING:
     from dsbo.utils.io.storage import _hdf5
@@ -37,10 +39,17 @@ class HDF5DatasetView(DatasetView):
 
     def read(self, key: str, index: int | slice):
         value = self._file.read(key, index)
-        return value[()] if not isinstance(index, slice) and value.ndim == 0 else value
+        if not isinstance(index, slice) and value.ndim == 0:
+            return torch.as_tensor(value[()])
+        return torch.from_numpy(value)
 
-    def read_indices(self, keys: list[str], indices: list[int]) -> np.ndarray:
-        return np.stack([self._file.read_indices(key, indices) for key in keys], axis=1)
+    def read_many(self, keys: list[str], index: int | slice) -> TensorDict:
+        from dsbo.utils.io.storage.utils import to_tensordict
+        return to_tensordict({key: self.read(key, index) for key in keys})
+
+    def read_indices(self, keys: list[str], indices: list[int]) -> TensorDict:
+        from dsbo.utils.io.storage.utils import to_tensordict
+        return to_tensordict({key: torch.from_numpy(self._file.read_indices(key, indices)) for key in keys})
 
     def partition_sizes(self, key: str) -> tuple[int, ...]:
         return tuple(self._file.partition_sizes(key))
@@ -65,13 +74,13 @@ class HDF5RowStoreDatasetView(RowStoreDatasetView):
             self._file.close()
             raise
 
-    def read_many(self, keys: list[str], index: int | slice) -> np.ndarray:
+    def read_many(self, keys: list[str], index: int | slice) -> torch.Tensor:
         columns = self._columns(keys)
-        return self._file.read(self._dataset_name, index)[..., columns]
+        return torch.from_numpy(self._file.read(self._dataset_name, index)[..., columns])
 
-    def read_indices(self, keys: list[str], indices: list[int]) -> np.ndarray:
+    def read_indices(self, keys: list[str], indices: list[int]) -> torch.Tensor:
         columns = self._columns(keys)
-        return self._file.read_indices(self._dataset_name, indices)[..., columns]
+        return torch.from_numpy(self._file.read_indices(self._dataset_name, indices)[..., columns])
 
     def partition_sizes(self, key: str) -> tuple[int, ...]:
         self._columns([key])
@@ -93,32 +102,39 @@ class HDF5ColumnStoreDatasetView(ColumnStoreDatasetView):
     def __init__(self, fpath: str, group_name: str = "primal", file: _hdf5.Reader | None = None):
         self._file = _reader(fpath, file)
         try:
-            columns = tuple(self._file.columns(group_name))
-            if not columns:
-                raise ValueError(f"HDF5 group '{group_name}' contains no columns.")
-            first = f"{group_name}/{columns[0]}"
-            shape = tuple(self._file.shape(first))
-            super().__init__(
-                group_name=group_name,
-                sample_shape=shape[1:] if shape else (),
-                partitions=tuple(self._file.partition_sizes(first)),
-            )
-            self.columns = columns
+            keys = tuple(self._file.columns(group_name))
+            if not keys:
+                raise ValueError(f"HDF5 group '{group_name}' contains no keys.")
+            super().__init__(group_name=group_name, keys=keys)
         except Exception:
             self._file.close()
             raise
 
-    def _read_column(self, column: str, index: int | slice):
-        return self._file.read(f"{self._group_name}/{column}", index)
+    def shape(self, key: str) -> tuple[int, ...]:
+        return tuple(self._file.shape(f"{self._group_name}/{key}"))
 
-    def read_indices(self, keys: list[str], indices: list[int]) -> np.ndarray:
-        # Match DatasetView's placement of the key axis (axis 1), even when a
-        # sample itself has additional dimensions.
-        values = np.stack(
-            [self._file.read_indices(f"{self._group_name}/{column}", indices) for column in self.columns],
-            axis=-1,
-        )
-        return np.stack([values for _ in keys], axis=1)
+    def read(self, key: str, index: int | slice):
+        value = self._file.read(f"{self._group_name}/{key}", index)
+        if not isinstance(index, slice) and value.ndim == 0:
+            return torch.as_tensor(value[()])
+        return torch.from_numpy(value)
+
+    def read_many(self, keys: list[str], index: int | slice) -> TensorDict:
+        from dsbo.utils.io.storage.utils import to_tensordict
+        return to_tensordict({key: self.read(key, index) for key in keys})
+
+    def read_indices(self, keys: list[str], indices: list[int]) -> TensorDict:
+        from dsbo.utils.io.storage.utils import to_tensordict
+        return to_tensordict({key: torch.from_numpy(self._read_indices(key, indices)) for key in keys})
+
+    def _read_indices(self, key: str, indices: list[int]) -> np.ndarray:
+        return self._file.read_indices(f"{self._group_name}/{key}", indices)
+
+    def _statistics(self, key: str) -> tuple[int, np.ndarray, np.ndarray] | None:
+        return self._file.statistics(f"{self._group_name}/{key}")
+
+    def partition_sizes(self, key: str) -> tuple[int, ...]:
+        return tuple(self._file.partition_sizes(f"{self._group_name}/{key}"))
 
     def close(self) -> None:
         self._file.close()

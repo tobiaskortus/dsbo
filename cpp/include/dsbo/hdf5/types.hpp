@@ -121,6 +121,7 @@ struct Array {
 };
 
 using NamedArrays = std::vector<std::pair<std::string, ArrayView>>;
+using NamedArrayValues = std::vector<std::pair<std::string, Array>>;
 
 // Axis-0 sample count and float64 summaries. For 1-D input the summaries are
 // scalars; for 2-D input they have shape {input.shape[1]}. squared_deviation is
@@ -144,9 +145,9 @@ struct Selection {
 struct GradientContribution {
     std::string primal_path;
     // A gradient-file path for a physical input, or owned gradient values
-    // after splitting a virtual input. columns gives their named-column order.
-    std::variant<std::string, Array> source;
-    Columns columns;
+    // after splitting a virtual input. keys gives their TensorDict key order.
+    std::variant<std::string, Array, NamedArrayValues> source;
+    std::vector<std::string> keys;
 };
 
 } // namespace dsbo::io

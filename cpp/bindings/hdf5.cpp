@@ -51,7 +51,7 @@ io::Columns selected_columns(py::handle object) {
         if (!py::isinstance<py::str>(column)) throw py::value_error("Column names must be valid, non-empty HDF5 names without '/'.");
         result.push_back(py::cast<std::string>(column));
     }
-    io::internal::validate_columns(result);
+    io::internal::validate_keys(result);
     return result;
 }
 
@@ -66,6 +66,50 @@ py::array array(io::Array value) {
     return py::array(type, shape, strides, pointer->storage.data(), lifetime);
 }
 
+py::dict arrays(io::NamedArrayValues values) {
+    py::dict result;
+    for (auto& [key, value] : values) result[py::str(key)] = array(std::move(value));
+    return result;
+}
+
+py::object to_python(io::Array value) { return array(std::move(value)); }
+py::object to_python(io::NamedArrayValues value) { return arrays(std::move(value)); }
+py::object to_python(io::Shape value) { return py::cast(std::move(value)); }
+py::dict to_python(std::vector<std::pair<std::string, io::Shape>> values) {
+    py::dict result;
+    for (auto& [key, shape] : values) result[py::str(key)] = py::cast(shape);
+    return result;
+}
+
+template<class Function> py::object materialize(Function&& function) {
+    return to_python(native(std::forward<Function>(function)));
+}
+
+template<class DictFunction, class ArrayFunction>
+py::object read_value(bool dictionary, DictFunction&& dict_function, ArrayFunction&& array_function) {
+    if (dictionary) return materialize(std::forward<DictFunction>(dict_function));
+    return materialize(std::forward<ArrayFunction>(array_function));
+}
+
+template<class Function> py::object tangent_result(Function&& function) {
+    auto result = native(std::forward<Function>(function));
+    py::object tangent = result.second ? to_python(std::move(*result.second)) : py::object(py::none());
+    return py::make_tuple(to_python(std::move(result.first)), tangent);
+}
+
+bool is_dict_store(const std::string& path) {
+    return !native([&] { return io::HDF5Storage::columns(path); }).empty();
+}
+
+bool is_dict_gradient(const std::string& path) {
+    return native([&] {
+        io::Reader reader(path);
+        const bool result = !reader.columns("gradient").empty();
+        reader.close();
+        return result;
+    });
+}
+
 py::object statistics(std::optional<io::Statistics> value) {
     if (!value) return py::none();
     return py::make_tuple(value->count, array(std::move(value->mean)), array(std::move(value->squared_deviation)));
@@ -76,8 +120,9 @@ py::list contributions(std::vector<io::GradientContribution> values) {
     for (auto& value : values) {
         py::object source;
         if (std::holds_alternative<std::string>(value.source)) source = py::str(std::get<std::string>(value.source));
-        else source = array(std::move(std::get<io::Array>(value.source)));
-        result.append(py::make_tuple(value.primal_path, source, py::cast(value.columns)));
+        else if (std::holds_alternative<io::Array>(value.source)) source = array(std::move(std::get<io::Array>(value.source)));
+        else source = arrays(std::move(std::get<io::NamedArrayValues>(value.source)));
+        result.append(py::make_tuple(value.primal_path, source, py::cast(value.keys)));
     }
     return result;
 }
@@ -98,17 +143,62 @@ io::Selection selection(py::handle index, hsize_t length) {
     return {value, 1, 1, true};
 }
 
-template<class Function> void named_write(const std::string& path, py::dict objects, Function&& function) {
-    std::vector<Input> inputs;
+io::NamedArrays named_values(py::dict objects, std::vector<Input>& owners) {
     io::NamedArrays values;
-    inputs.reserve(objects.size());
+    owners.reserve(objects.size());
+    values.reserve(objects.size());
     for (const auto& item : objects) {
-        if (!py::isinstance<py::str>(item.first)) throw py::value_error("Feature keys must be non-empty strings without NUL characters.");
-        inputs.emplace_back(item.second);
-        values.emplace_back(py::cast<std::string>(item.first), inputs.back().view);
+        owners.emplace_back(item.second);
+        values.emplace_back(py::cast<std::string>(item.first), owners.back().view);
     }
+    return values;
+}
+
+template<class Function> void named_write(const std::string& path, py::dict objects, Function&& function) {
+    std::vector<Input> owners;
+    const auto values = named_values(objects, owners);
     native([&] { function(path, values); });
 }
+
+template<class Function> void named_pair_write(const std::string& path, py::dict primal, py::dict tangent, Function&& function) {
+    std::vector<Input> primal_owners, tangent_owners;
+    const auto primal_values = named_values(primal, primal_owners);
+    const auto tangent_values = named_values(tangent, tangent_owners);
+    native([&] { function(path, primal_values, tangent_values); });
+}
+
+using DictWriter = void (*)(const std::string&, const io::NamedArrays&);
+using DictTangentWriter = void (*)(const std::string&, const io::NamedArrays&, const io::NamedArrays&);
+
+template<class DictFunction, class ArrayFunction>
+void write_value(const std::string& path, py::handle value, DictFunction&& dict_writer, ArrayFunction&& array_writer) {
+    if (py::isinstance<py::dict>(value)) {
+        named_write(path, py::reinterpret_borrow<py::dict>(value), std::forward<DictFunction>(dict_writer));
+        return;
+    }
+    Input input(value);
+    native([&] { array_writer(path, input.view); });
+}
+
+template<class DictFunction, class ArrayFunction>
+void write_tangent(const std::string& path, py::handle primal, py::handle tangent, DictFunction&& dict_writer, ArrayFunction&& array_writer) {
+    const bool primal_dict = py::isinstance<py::dict>(primal), tangent_dict = py::isinstance<py::dict>(tangent);
+    if (primal_dict != tangent_dict) throw py::type_error("Primal and tangent must both be arrays or both be dicts.");
+    if (primal_dict) {
+        named_pair_write(path, py::reinterpret_borrow<py::dict>(primal), py::reinterpret_borrow<py::dict>(tangent),
+                         std::forward<DictFunction>(dict_writer));
+        return;
+    }
+    Input p(primal), t(tangent);
+    native([&] { array_writer(path, p.view, t.view); });
+}
+
+struct GradientWriter {
+    bool merge;
+    void operator()(const std::string& path, const io::NamedArrays& values) const {
+        io::HDF5Storage::write_gradient(path, values, merge);
+    }
+};
 } // namespace
 
 PYBIND11_MODULE(_hdf5, module) {
@@ -144,60 +234,89 @@ PYBIND11_MODULE(_hdf5, module) {
         return py::dict("version"_a=py::make_tuple(major, minor, patch), "threadsafe"_a=threadsafe);
     });
 
-    module.def("open_primal", [](const std::string& path, py::object columns) {
+    module.def("open_primal", [](const std::string& path, py::object columns) -> py::object {
         const auto selected = selected_columns(columns);
-        return array(native([&] { return io::HDF5Storage::open_primal(path, selected); }));
+        if (is_dict_store(path)) return arrays(native([&] { return io::HDF5Storage::open_dict(path, selected); }));
+        if (selected) throw py::value_error("Flat HDF5 arrays do not support column selection.");
+        return array(native([&] { return io::HDF5Storage::open_primal(path); }));
     }, py::arg("path"), py::arg("columns") = py::none());
+
     module.def("open_primal_tangent", [](const std::string& path, py::object columns) {
         const auto selected = selected_columns(columns);
-        auto result = native([&] { return io::HDF5Storage::open_primal_tangent(path, selected); });
-        py::object tangent = result.second ? py::object(array(std::move(*result.second))) : py::object(py::none());
-        return py::make_tuple(array(std::move(result.first)), tangent);
+        if (is_dict_store(path)) return tangent_result([&] { return io::HDF5Storage::open_dict_tangent(path, selected); });
+        if (selected) throw py::value_error("Flat HDF5 arrays do not support column selection.");
+        return tangent_result([&] { return io::HDF5Storage::open_primal_tangent(path); });
     }, py::arg("path"), py::arg("columns") = py::none());
-    module.def("write_primal", [](const std::string& path, py::handle primal, py::object columns) {
-        Input input(primal);
-        const auto selected = selected_columns(columns);
-        native([&] { io::HDF5Storage::write_primal(path, input.view, selected); });
-    }, py::arg("path"), py::arg("primal"), py::arg("columns") = py::none());
-    module.def("write_primal_tangent", [](const std::string& path, py::handle primal, py::handle tangent, py::object columns) {
-        Input p(primal), t(tangent);
-        const auto selected = selected_columns(columns);
-        native([&] { io::HDF5Storage::write_primal_tangent(path, p.view, t.view, selected); });
-    }, py::arg("path"), py::arg("primal"), py::arg("tangent"), py::arg("columns") = py::none());
+
+    module.def("write_primal", [](const std::string& path, py::handle primal) {
+        write_value(path, primal,
+            static_cast<DictWriter>(&io::HDF5Storage::write_primal),
+            [](const std::string& p, io::ArrayView view) { io::HDF5Storage::write_primal(p, view); });
+    }, py::arg("path"), py::arg("primal"));
+
+    module.def("write_primal_tangent", [](const std::string& path, py::handle primal, py::handle tangent) {
+        write_tangent(path, primal, tangent,
+            static_cast<DictTangentWriter>(&io::HDF5Storage::write_primal_tangent),
+            [](const std::string& p, io::ArrayView primal_view, io::ArrayView tangent_view) {
+                io::HDF5Storage::write_primal_tangent(p, primal_view, tangent_view);
+            });
+    }, py::arg("path"), py::arg("primal"), py::arg("tangent"));
+
     module.def("write_named_datasets", [](const std::string& path, py::dict values) {
         named_write(path, values, io::HDF5Storage::write_named_datasets);
     });
+
     module.def("write_row_store", [](const std::string& path, py::dict values) {
         named_write(path, values, io::HDF5Storage::write_row_store);
     });
+    
     module.def("columns", [](const std::string& path) { return native([&] { return io::HDF5Storage::columns(path); }); });
-    module.def("shape_from_path", [](const std::string& path) { return native([&] { return io::HDF5Storage::shape_from_path(path); }); });
-    module.def("load_gradient", [](const std::string& path, py::object columns) {
-        const auto selected = selected_columns(columns);
-        return array(native([&] { return io::HDF5Storage::load_gradient(path, selected); }));
-    }, py::arg("path"), py::arg("columns") = py::none());
-    module.def("load_backward_gradient", [](const std::string& primal, const std::string& gradient) {
-        return array(native([&] { return io::HDF5Storage::load_backward_gradient(primal, gradient); }));
+
+    module.def("shape_from_path", [](const std::string& path) {
+        return read_value(is_dict_store(path),
+            [&] { return io::HDF5Storage::dict_shape_from_path(path); },
+            [&] { return io::HDF5Storage::shape_from_path(path); });
     });
-    module.def("write_gradient", [](const std::string& path, py::handle gradient, py::object columns, bool merge) {
-        Input input(gradient);
+
+    module.def("load_gradient", [](const std::string& path, py::object columns) -> py::object {
         const auto selected = selected_columns(columns);
-        native([&] { io::HDF5Storage::write_gradient(path, input.view, selected, merge); });
-    }, py::arg("path"), py::arg("gradient"), py::arg("columns") = py::none(), py::kw_only(), py::arg("merge") = false);
+        if (is_dict_gradient(path)) return arrays(native([&] { return io::HDF5Storage::load_dict_gradient(path, selected); }));
+        if (selected) throw py::value_error("Flat HDF5 gradients do not support column selection.");
+        return array(native([&] { return io::HDF5Storage::load_gradient(path); }));
+    }, py::arg("path"), py::arg("columns") = py::none());
+
+    module.def("load_backward_gradient", [](const std::string& primal, const std::string& gradient) {
+        return read_value(is_dict_store(primal),
+            [&] { return io::HDF5Storage::load_backward_dict_gradient(primal, gradient); },
+            [&] { return io::HDF5Storage::load_backward_gradient(primal, gradient); });
+    });
+
+    module.def("write_gradient", [](const std::string& path, py::handle gradient, bool merge) {
+        write_value(path, gradient,
+            GradientWriter{merge},
+            [merge](const std::string& p, io::ArrayView view) {
+                io::HDF5Storage::write_gradient(p, view, merge);
+            });
+    }, py::arg("path"), py::arg("gradient"), py::kw_only(), py::arg("merge") = false);
+
     module.def("aggregate_gradients", [](const std::vector<std::string>& paths, const std::string& destination) {
         native([&] { io::HDF5Storage::aggregate_gradients(paths, destination); });
     });
+
     module.def("reduce", [](const std::vector<std::string>& paths, const std::string& destination) {
         native([&] { io::HDF5Storage::reduce(paths, destination); });
     });
+
     module.def("gradient_file_contributions", [](const std::string& path, const std::string& gradient) {
         return contributions(native([&] { return io::HDF5Storage::gradient_file_contributions(path, gradient); }));
     });
+
     module.def("gradient_contributions", [](const std::string& path, py::handle gradient, py::object columns) {
         Input input(gradient);
         const auto selected = selected_columns(columns);
         return contributions(native([&] { return io::HDF5Storage::gradient_contributions(path, input.view, selected); }));
     }, py::arg("path"), py::arg("gradient"), py::arg("columns") = py::none());
+
     module.def("statistics", [](py::handle value) -> py::object {
         auto owner = py::array::ensure(value);
         if (!owner) throw py::type_error("Expected an array.");
@@ -205,6 +324,7 @@ PYBIND11_MODULE(_hdf5, module) {
         Input input(owner);
         return statistics(native([&] { return io::statistics(input.view); }));
     });
+    
     module.def("combine_statistics", [](py::list values) {
         std::vector<std::optional<io::Statistics>> inputs;
         for (const auto& item : values) {
