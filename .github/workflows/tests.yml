@@ -22,14 +22,9 @@ jobs:
           cache: pip
 
       - name: Install package and test dependencies
-        env:
-          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
-          test -n "$PRIVATE_REPO_TOKEN" || { echo "PRIVATE_REPO_TOKEN is not configured"; exit 1; }
-          git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
-          pip install "torch==2.15.0" --index-url https://download.pytorch.org/whl/cpu --no-cache-dir
-          python -m pip install --no-cache-dir ".[dev]"
-          git config --global --unset-all url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf
+          pip install "torch==2.15.0" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install ".[dev]"
 
       - name: Run unit tests
         run: python -m pytest tests
