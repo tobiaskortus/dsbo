@@ -12,6 +12,7 @@ from dsbo.worker.spec import LocalWorkerSpec, SLURMWorkerSpec
 
 from dsbo.container import (
     ContainerConfig,
+    ContainerDefinition,
     ContainerType,
     ContainerWrapperBase,
     DockerContainerRuntime,
@@ -30,6 +31,7 @@ from dsbo.container import (
     _normalize_path_tag,
     get_runtime_for_type,
     select_compatible_environment,
+    select_image_source,
     discover_container_environments,
     warm_container_dependencies,
 
@@ -411,6 +413,40 @@ class TestSingularityImageProvider:
         )
 
 
+class TestImageProviderTupleSelection:
+    @patch("shutil.which", return_value="/usr/bin/docker")
+    def test_docker_provider_selects_dockerfile(self, mock_which):
+        dockerfile = DefinitionFile(path="/path/to/Dockerfile")
+        singularity_def = DefinitionFile(path="/path/to/container.def")
+        provider = DockerImageProvider()
+        with patch.object(DockerImageProvider, "build", return_value="built-image") as mock_build:
+            result = provider.prepare_image((singularity_def, dockerfile))
+        assert result == "built-image"
+        mock_build.assert_called_once_with(dockerfile, "")
+
+    @patch("shutil.which", return_value="/usr/bin/apptainer")
+    def test_singularity_provider_selects_def(self, mock_which):
+        dockerfile = DefinitionFile(path="/path/to/Dockerfile")
+        singularity_def = DefinitionFile(path="/path/to/container.def")
+        provider = SingularityImageProvider(image_dir="/path/to/images")
+        with patch.object(SingularityImageProvider, "build", return_value="/images/container.sif") as mock_build:
+            result = provider.prepare_image((dockerfile, singularity_def), "/path/to/images")
+        assert result == "/images/container.sif"
+        mock_build.assert_called_once_with(singularity_def, "/path/to/images")
+
+    @pytest.mark.parametrize(
+        ("provider_cls", "definition"),
+        [
+            (DockerImageProvider, DefinitionFile(path="/path/to/container.def")),
+            (SingularityImageProvider, DefinitionFile(path="/path/to/Dockerfile")),
+        ],
+    )
+    def test_provider_rejects_incompatible_tuple(self, provider_cls, definition):
+        provider = provider_cls() if provider_cls is DockerImageProvider else provider_cls(image_dir="/path/to/images")
+        with pytest.raises(RuntimeError, match="No provided image definition"):
+            provider.prepare_image((definition,))
+
+
 class MockImageProvider(ImageProvider):
     def __init__(self):
         self._executable = None
@@ -432,7 +468,7 @@ class MockImageProvider(ImageProvider):
     def resolve_path(self, image: str) -> str:
         return image
 
-    def prepare_image(self, image_def: ImageRef | ImageFile | DefinitionFile,
+    def prepare_image(self, image_def: ContainerDefinition,
                       output_dir: str = "") -> str:
         if isinstance(image_def, ImageRef):
             return image_def.uri
@@ -628,6 +664,31 @@ class TestContainerWrapperBase:
             ImageRef(uri="ubuntu:22.04"), container_type=ContainerType.SINGULARITY,
         )
         assert wrapper._detected_type == ContainerType.SINGULARITY
+
+    @pytest.mark.parametrize(
+        ("available", "expected_type", "expected_kind"),
+        [
+            ({"docker": True, "apptainer": True, "singularity": False}, ContainerType.APPTAINER, "singularity"),
+            ({"docker": True, "apptainer": False, "singularity": False}, ContainerType.DOCKER, "docker"),
+        ],
+    )
+    @patch("dsbo.container.discover_container_environments")
+    def test_tuple_source_selects_runtime(self, mock_discover, available, expected_type, expected_kind):
+        mock_discover.return_value = available
+        dockerfile = DefinitionFile(path="/path/to/Dockerfile")
+        singularity_def = DefinitionFile(path="/path/to/container.def")
+        wrapper = ContainerWrapperBase((dockerfile, singularity_def))
+        provider = MagicMock()
+        provider.prepare_image.return_value = "prepared-image"
+        wrapper._make_provider = MagicMock(return_value=provider)
+        wrapper._get_runtime_for_type = MagicMock(return_value=MagicMock())
+
+        wrapper._ensure_runtime()
+
+        assert wrapper._detected_type == expected_type
+        provider.prepare_image.assert_called_once()
+        expected_definition = singularity_def if expected_kind == "singularity" else dockerfile
+        assert provider.prepare_image.call_args.args[0] is expected_definition
 
     def test_config_from_kwargs(self):
         wrapper = ContainerWrapperBase(
@@ -1027,6 +1088,123 @@ class TestCheckMismatchWithDef:
         check_mismatch(DefinitionFile(path="/path/to/container.def"), ContainerType.SINGULARITY)
 
 
+class TestImageTypeRequiredWithTuple:
+    @pytest.mark.parametrize(
+        ("definitions", "expected"),
+        [
+            (
+                (DefinitionFile(path="/path/to/Dockerfile"), DefinitionFile(path="/path/to/container.def")),
+                ImageRequirement.EITHER,
+            ),
+            ((DefinitionFile(path="/path/to/Dockerfile"),), ImageRequirement.DOCKER_ONLY),
+            ((DefinitionFile(path="/path/to/container.def"),), ImageRequirement.SINGULARITY_ONLY),
+            ((ImageRef(uri="ubuntu:22.04"),), ImageRequirement.EITHER),
+        ],
+    )
+    def test_tuple_requirement(self, definitions, expected):
+        assert image_type_required(definitions) == expected
+
+    def test_empty_tuple_raises(self):
+        with pytest.raises(ValueError, match="At least one image definition"):
+            image_type_required(())
+
+
+class TestSelectImageSourceWithTuple:
+    @pytest.mark.parametrize(
+        ("available", "expected_kind", "expected_env"),
+        [
+            ({"docker": True, "apptainer": True, "singularity": True}, "singularity", ContainerType.APPTAINER),
+            ({"docker": True, "apptainer": False, "singularity": True}, "singularity", ContainerType.SINGULARITY),
+            ({"docker": True, "apptainer": False, "singularity": False}, "docker", ContainerType.DOCKER),
+        ],
+    )
+    def test_selects_definition_for_available_runtime(self, available, expected_kind, expected_env):
+        dockerfile = DefinitionFile(path="/path/to/Dockerfile")
+        singularity_def = DefinitionFile(path="/path/to/container.def")
+
+        selected, env = select_image_source((dockerfile, singularity_def), available)
+
+        assert selected is (singularity_def if expected_kind == "singularity" else dockerfile)
+        assert env == expected_env
+
+    @pytest.mark.parametrize(
+        ("available", "expected_kind", "expected_env"),
+        [
+            ({"docker": True, "apptainer": True, "singularity": False}, "image_ref", ContainerType.APPTAINER),
+            ({"docker": True, "apptainer": False, "singularity": False}, "dockerfile", ContainerType.DOCKER),
+        ],
+    )
+    def test_image_ref_definition_supports_any_runtime(self, available, expected_kind, expected_env):
+        image_ref = ImageRef(uri="ubuntu:22.04")
+        dockerfile = DefinitionFile(path="/path/to/Dockerfile")
+
+        selected, env = select_image_source((dockerfile, image_ref), available)
+
+        assert selected is (image_ref if expected_kind == "image_ref" else dockerfile)
+        assert env == expected_env
+
+    @pytest.mark.parametrize(
+        ("available", "expected_kind", "expected_env"),
+        [
+            ({"docker": False, "apptainer": True, "singularity": False}, "image_file", ContainerType.APPTAINER),
+            ({"docker": True, "apptainer": False, "singularity": False}, "dockerfile", ContainerType.DOCKER),
+        ],
+    )
+    def test_image_file_selects_singularity_or_dockerfile(self, available, expected_kind, expected_env):
+        image_file = ImageFile(path="/path/to/image.sif")
+        dockerfile = DefinitionFile(path="/path/to/Dockerfile")
+
+        selected, env = select_image_source((image_file, dockerfile), available)
+
+        assert selected is (image_file if expected_kind == "image_file" else dockerfile)
+        assert env == expected_env
+
+    def test_selects_first_compatible_definition_for_runtime(self):
+        first = DefinitionFile(path="/path/to/first.def")
+        second = DefinitionFile(path="/path/to/second.def")
+        available = {"docker": False, "apptainer": True, "singularity": False}
+
+        selected, env = select_image_source((first, second), available)
+
+        assert selected is first
+        assert env == ContainerType.APPTAINER
+
+    def test_no_compatible_runtime_raises(self):
+        definitions = (DefinitionFile(path="/path/to/container.def"),)
+        available = {"docker": True, "apptainer": False, "singularity": False}
+
+        with pytest.raises(Exception, match="No installed container runtime"):
+            select_image_source(definitions, available)
+
+    def test_empty_tuple_raises(self):
+        with pytest.raises(ValueError, match="At least one image definition"):
+            select_image_source((), {"docker": True})
+
+    def test_plain_definition_keeps_existing_selection(self):
+        ref = ImageRef(uri="ubuntu:22.04")
+        available = {"docker": True, "apptainer": True, "singularity": False}
+
+        selected, env = select_image_source(ref, available)
+
+        assert selected is ref
+        assert env == ContainerType.APPTAINER
+
+
+class TestCheckMismatchWithTuple:
+    def test_uses_compatible_definition(self):
+        definitions = (
+            DefinitionFile(path="/path/to/Dockerfile"),
+            DefinitionFile(path="/path/to/container.def"),
+        )
+        check_mismatch(definitions, ContainerType.DOCKER)
+        check_mismatch(definitions, ContainerType.SINGULARITY)
+
+    def test_no_compatible_definition_raises(self):
+        definitions = (DefinitionFile(path="/path/to/container.def"),)
+        with pytest.raises(RuntimeError, match="No provided image definition"):
+            check_mismatch(definitions, ContainerType.DOCKER)
+
+
 
 
 
@@ -1092,6 +1270,39 @@ class TestWarmContainerDependencies:
                           side_effect=RuntimeError("pull failed")):
             with pytest.raises(RuntimeError, match="pull failed"):
                 warm_container_dependencies(wf, verbose=False)
+
+    @pytest.mark.parametrize(
+        ("available", "provider_cls", "expected_kind", "prepared"),
+        [
+            (
+                {"docker": True, "apptainer": True, "singularity": False},
+                SingularityImageProvider,
+                "singularity",
+                "/images/container.sif",
+            ),
+            (
+                {"docker": True, "apptainer": False, "singularity": False},
+                DockerImageProvider,
+                "docker",
+                "hepemshow-native:latest",
+            ),
+        ],
+    )
+    def test_warms_tuple_source(self, available, provider_cls, expected_kind, prepared):
+        dockerfile = DefinitionFile(path="/path/to/Dockerfile")
+        singularity_def = DefinitionFile(path="/path/to/container.def")
+        source = (dockerfile, singularity_def)
+        module = make_container_module(source)
+        wf = Workflow(module)
+
+        with patch("dsbo.container.discover_container_environments", return_value=available), \
+             patch.object(provider_cls, "prepare_image", return_value=prepared) as mock_prep:
+            result = warm_container_dependencies(wf, verbose=False)
+
+        assert result == {source: prepared}
+        mock_prep.assert_called_once()
+        expected_definition = singularity_def if expected_kind == "singularity" else dockerfile
+        assert mock_prep.call_args.args[0] is expected_definition
 
     def test_warms_mixed_image_types(self):
         img_ref = ImageRef(uri="ubuntu:22.04")

@@ -9,7 +9,7 @@ from pathlib import Path
 from enum import Enum
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Type, Union, TYPE_CHECKING
+from typing import Dict, List, Optional, Type, TypeAlias, Union, TYPE_CHECKING
 
 from dsbo.config import config
 from dsbo.logger import WorkflowTaskLogger
@@ -87,6 +87,10 @@ class DefinitionFile:
         return "docker"
 
 
+ImageDefinition: TypeAlias = Union[ImageRef, ImageFile, DefinitionFile]
+ContainerDefinition: TypeAlias = Union[ImageDefinition, tuple[ImageDefinition, ...]]
+
+
 def discover_container_environments() -> Dict[str, bool]:
     return {
         "docker": shutil.which("docker") is not None,
@@ -107,7 +111,18 @@ class ContainerType(Enum):
     DOCKER = "docker"
 
 
-def image_type_required(image_def: ImageRef | ImageFile | DefinitionFile) -> ImageRequirement:
+def image_type_required(image_def: ContainerDefinition) -> ImageRequirement:
+    if isinstance(image_def, tuple):
+        if not image_def:
+            raise ValueError("At least one image definition must be provided.")
+        requirements = [image_type_required(d) for d in image_def]
+        supports_docker = any(r in (ImageRequirement.EITHER, ImageRequirement.DOCKER_ONLY) for r in requirements)
+        supports_singularity = any(r in (ImageRequirement.EITHER, ImageRequirement.SINGULARITY_ONLY) for r in requirements)
+        if supports_docker and supports_singularity:
+            return ImageRequirement.EITHER
+        if supports_docker:
+            return ImageRequirement.DOCKER_ONLY
+        return ImageRequirement.SINGULARITY_ONLY
     if isinstance(image_def, ImageFile):
         return ImageRequirement.SINGULARITY_ONLY
     if isinstance(image_def, ImageRef):
@@ -118,6 +133,24 @@ def image_type_required(image_def: ImageRef | ImageFile | DefinitionFile) -> Ima
             return ImageRequirement.SINGULARITY_ONLY
         return ImageRequirement.DOCKER_ONLY
     raise Exception("Invalid image definition provided.")
+
+
+def definition_supports(image_def: ImageDefinition, container_type: ContainerType) -> bool:
+    required = image_type_required(image_def)
+    if required == ImageRequirement.EITHER:
+        return True
+    if required == ImageRequirement.SINGULARITY_ONLY:
+        return container_type != ContainerType.DOCKER
+    return container_type == ContainerType.DOCKER
+
+
+def select_definition_for(image_defs: tuple[ImageDefinition, ...], container_type: ContainerType) -> ImageDefinition:
+    if not image_defs:
+        raise ValueError("At least one image definition must be provided.")
+    for image_def in image_defs:
+        if definition_supports(image_def, container_type):
+            return image_def
+    raise RuntimeError(f"No provided image definition is compatible with {container_type.value}.")
 
 
 def select_compatible_environment(required: ImageRequirement, available: Dict[str, bool]) -> Optional[ContainerType]:
@@ -132,7 +165,33 @@ def select_compatible_environment(required: ImageRequirement, available: Dict[st
     raise Exception(f"The provided image definition reuires {required}")
 
 
-def check_mismatch(image_def: Union[ImageRef, ImageFile, DefinitionFile], selected_env: ContainerType) -> None:
+def select_image_source(image_def: ContainerDefinition, available: Dict[str, bool]) -> tuple[ImageDefinition, ContainerType]:
+    if isinstance(image_def, tuple):
+        if not image_def:
+            raise ValueError("At least one image definition must be provided.")
+        for ct in (ContainerType.APPTAINER, ContainerType.SINGULARITY, ContainerType.DOCKER):
+            if not available.get(ct.value):
+                continue
+            for definition in image_def:
+                if definition_supports(definition, ct):
+                    return definition, ct
+        raise Exception("No installed container runtime can run any of the provided image definitions.")
+    
+    env = select_compatible_environment(image_type_required(image_def), available)
+    return image_def, env
+
+
+def check_mismatch(image_def: ContainerDefinition, selected_env: ContainerType) -> None:
+    if isinstance(image_def, tuple):
+        if not image_def:
+            raise ValueError("At least one image definition must be provided.")
+        for definition in image_def:
+            if definition_supports(definition, selected_env):
+                check_mismatch(definition, selected_env)
+                return
+        raise RuntimeError(
+            f"No provided image definition is compatible with {selected_env.value}."
+        )
     if isinstance(image_def, ImageFile) and selected_env == ContainerType.DOCKER:
         raise RuntimeError(
             "ImageFile (.sif) used with Docker environment — "
@@ -172,7 +231,7 @@ class ImageProvider(ABC):
         pass
 
     @abstractmethod
-    def prepare_image(self, image_def: ImageRef | ImageFile | DefinitionFile,
+    def prepare_image(self, image_def: ContainerDefinition,
                       output_dir: str = "") -> str:
         """Ensure the image is available locally, returning the resolved image reference."""
         pass
@@ -232,8 +291,10 @@ class DockerImageProvider(ImageProvider):
             )
         return tag
 
-    def prepare_image(self, image_def: ImageRef | ImageFile | DefinitionFile,
+    def prepare_image(self, image_def: ContainerDefinition,
                       output_dir: str = "") -> str:
+        if isinstance(image_def, tuple):
+            image_def = select_definition_for(image_def, ContainerType.DOCKER)
         if isinstance(image_def, ImageRef):
             if not self.exists(image_def.uri):
                 self.pull(image_def.uri)
@@ -310,8 +371,10 @@ class SingularityImageProvider(ImageProvider):
             )
         return str(output_sif)
 
-    def prepare_image(self, image_def: ImageRef | ImageFile | DefinitionFile,
+    def prepare_image(self, image_def: ContainerDefinition,
                       output_dir: str = "") -> str:
+        if isinstance(image_def, tuple):
+            image_def = select_definition_for(image_def, ContainerType.SINGULARITY)
         if isinstance(image_def, ImageRef):
             return self._pull_ref_to_sif(image_def, output_dir)
         if isinstance(image_def, ImageFile):
@@ -548,7 +611,7 @@ def get_runtime_for_type(container_type: ContainerType, image: str,
 
 
 
-def warm_container_dependencies(workflow: "Workflow", verbose: bool = True) -> dict[ImageRef | ImageFile | DefinitionFile, str]:
+def warm_container_dependencies(workflow: "Workflow", verbose: bool = True) -> dict[ContainerDefinition, str]:
     from tqdm.auto import tqdm
     from dsbo.modules.fused import inner_module
 
@@ -557,11 +620,12 @@ def warm_container_dependencies(workflow: "Workflow", verbose: bool = True) -> d
         if isinstance(inner_module(node), ContainerWrapperBase)
     )
 
+    available = discover_container_environments()
     for d in tqdm(result, desc="Warming containers", unit="container", disable=not verbose):
-        env = select_compatible_environment(image_type_required(d), discover_container_environments())
-        check_mismatch(d, env)
+        selected_def, env = select_image_source(d, available)
+        check_mismatch(selected_def, env)
         img_dir = config.get("container.path", os.getcwd()) if env != ContainerType.DOCKER else None
-        result[d] = make_provider(env, img_dir).prepare_image(d, img_dir or "")
+        result[d] = make_provider(env, img_dir).prepare_image(selected_def, img_dir or "")
 
     return result
 
@@ -582,7 +646,7 @@ class ContainerWrapperBase:
 
         cls.__init__ = wrapped_init
 
-    def __init__(self, container_path: ImageRef | ImageFile | DefinitionFile,
+    def __init__(self, container_path: ContainerDefinition,
                  container_extra_flags: Optional[str] = None,
                  config: Optional[ContainerConfig] = None,
                  cuda_enabled: bool = False,
@@ -625,16 +689,15 @@ class ContainerWrapperBase:
             return self._runtime
 
         available = discover_container_environments()
-        required = image_type_required(self._image_def)
-        selected_env = select_compatible_environment(required, available)
-        check_mismatch(self._image_def, selected_env)
+        selected_def, selected_env = select_image_source(self._image_def, available)
+        check_mismatch(selected_def, selected_env)
 
         self._detected_type = selected_env
 
         image_dir = config.get("container.path", os.getcwd()) if selected_env != ContainerType.DOCKER else None
         provider = self._make_provider(selected_env, image_dir)
 
-        image_ref = provider.prepare_image(self._image_def, image_dir or "")
+        image_ref = provider.prepare_image(selected_def, image_dir or "")
 
         runtime_config = self._config
         if runtime_config.cuda_enabled and not self._worker_has_gpu():

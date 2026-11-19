@@ -6,7 +6,7 @@ from typing import List, Optional, Union
 from dask.distributed import Client, LocalCluster
 
 from dsbo.modules import Module
-from dsbo.container import ContainerWrapperBase
+from dsbo.container import ContainerDefinition, ContainerWrapperBase
 from dsbo.utils.io import Workdir, get_file_suffix, get_subdir, get_workdir, with_remote_workdir
 
 
@@ -23,7 +23,7 @@ class SimulationBase(Module):
 
 
 class SimulationContainerWrapperBase(SimulationBase, ContainerWrapperBase):
-    def __init__(self, container_path: str, container_extra_flags: Optional[str] = ""):
+    def __init__(self, container_path: ContainerDefinition, container_extra_flags: Optional[str] = ""):
         SimulationBase.__init__(self)
         ContainerWrapperBase.__init__(self, container_path, container_extra_flags)
 
