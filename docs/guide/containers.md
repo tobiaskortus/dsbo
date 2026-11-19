@@ -19,6 +19,7 @@ A typed image definition from `dsbo.container` is passed to the wrapper construc
 | `DefinitionFile` | Apptainer/Singularity `.def` | Apptainer or Singularity | Builds a `.sif` under `container.path` (or the current directory); reuses an existing output file. |
 | `ImageRef` | Registry reference | Docker, Apptainer, or Singularity | Docker uses a local image or pulls it; Apptainer/Singularity reuses an existing `.sif` or pulls it to one under `container.path` (or the current directory). |
 | `ImageFile` | Local `.sif` | Apptainer or Singularity | Resolves relative paths under `container.path` (or the current directory); absolute paths are used as given. Does not build or pull. Docker rejects this format. |
+| Tuple of definitions | e.g. Dockerfile and `.def` | Whichever is installed | Selects the first definition compatible with the preferred available runtime: Apptainer, then Singularity, then Docker. |
 
 ```python
 from dsbo.container import DefinitionFile, ImageFile, ImageRef
@@ -27,13 +28,16 @@ dockerfile = DefinitionFile("./Dockerfile", container_name="simulation:latest")
 apptainer_def = DefinitionFile("./simulation.def", container_name="simulation")
 registry_image = ImageRef("python:3.11-slim")
 local_image = ImageFile("./simulation.sif")
+
+# Provide both sources; dsbo picks the one matching the installed runtime.
+image_sources = (dockerfile, apptainer_def)
 ```
 
-`DefinitionFile` treats paths containing `Dockerfile` as Docker builds and paths ending in `.def` as Apptainer/Singularity builds; all other paths default to Docker. `container_name` sets the Docker tag or the `.sif` base name, and `build_flags` adds build arguments. Backend selection prefers Apptainer, then Singularity, then Docker among compatible installations. Any definition can be passed to a wrapper constructor, such as `ContainerSimulation(dockerfile, workspace)` below.
+`DefinitionFile` treats paths containing `Dockerfile` as Docker builds and paths ending in `.def` as Apptainer/Singularity builds; all other paths default to Docker. `container_name` sets the Docker tag or the `.sif` base name, and `build_flags` adds build arguments. Backend selection prefers Apptainer, then Singularity, then Docker among compatible installations. Any definition, or a tuple of definitions, can be passed to a wrapper constructor, such as `ContainerSimulation(image_sources, workspace)` below. With a tuple, the first definition compatible with the selected runtime is used.
 
 !!! warning "Image and installation compatibility"
 
-    Docker cannot run `ImageFile` (`.sif`). Dockerfiles are built only by Docker, and `.def` files are built only by Apptainer/Singularity. Incompatible combinations raise an error.
+    Docker cannot run `ImageFile` (`.sif`). Dockerfiles are built only by Docker, and `.def` files are built only by Apptainer/Singularity. Incompatible combinations raise an error. In a tuple, definitions incompatible with the selected runtime are skipped.
 
 !!! note "Image preparation"
 
@@ -95,12 +99,12 @@ super().__init__(image, container_extra_flags="--rm")
 ```python
 import json
 
-from dsbo.container import DefinitionFile, ImageFile, ImageRef
+from dsbo.container import ContainerDefinition, DefinitionFile, ImageFile, ImageRef
 from dsbo.modules.simulation import SimulationContainerWrapperBase
 from dsbo.utils.io import Output, Workdir
 
 class ContainerSimulation(SimulationContainerWrapperBase):
-    def __init__(self, image: ImageRef | ImageFile | DefinitionFile):
+    def __init__(self, image: ContainerDefinition):
         super().__init__(image)
         self.output = Output(
             Workdir.register_file("simulation", "output.h5")
@@ -137,11 +141,11 @@ class ContainerSimulation(SimulationContainerWrapperBase):
 For a lifecycle that does not fit the simulation or reconstruction templates, `Module` is combined with `ContainerWrapperBase`:
 
 ```python
-from dsbo.container import ContainerWrapperBase, DefinitionFile, ImageFile, ImageRef
+from dsbo.container import ContainerDefinition, ContainerWrapperBase, DefinitionFile, ImageFile, ImageRef
 from dsbo.modules import Module
 
 class MyContainerModule(Module, ContainerWrapperBase):
-    def __init__(self, image: ImageRef | ImageFile | DefinitionFile):
+    def __init__(self, image: ContainerDefinition):
         Module.__init__(self)
         ContainerWrapperBase.__init__(self, image)
 ```
