@@ -322,13 +322,13 @@ PYBIND11_MODULE(_hdf5, module) {
         return contributions(native([&] { return io::HDF5Storage::gradient_contributions(path, input.view, selected); }));
     }, py::arg("path"), py::arg("gradient"), py::arg("columns") = py::none());
 
-    module.def("statistics", [](py::handle value) -> py::object {
+    module.def("statistics", [](py::handle value, std::size_t workers) -> py::object {
         auto owner = py::array::ensure(value);
         if (!owner) throw py::type_error("Expected an array.");
         if (std::string("biuf").find(owner.dtype().kind()) == std::string::npos) return py::none();
         Input input(owner);
-        return statistics(native([&] { return io::statistics(input.view); }));
-    });
+        return statistics(native([&] { return io::statistics(input.view, {workers}); }));
+    }, py::arg("value"), py::arg("workers") = 0);
     
     module.def("combine_statistics", [](py::list values) {
         std::vector<std::optional<io::Statistics>> inputs;

@@ -437,6 +437,215 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/accuracy/non-finite") {
     check_statistics({1e200, -1e200}, 0, infinity, directory("overflow.h5"));
 }
 
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/float32-unaligned-input-accuracy") {
+    const auto values = io::Array::from<float>({1e8f, -1e8f, 1, -1, -1e8f, 1e8f}, {3, 2});
+    std::vector<unsigned char> bytes(values.storage.size() + 1);
+    std::memcpy(bytes.data() + 1, values.storage.data(), values.storage.size());
+    const auto original = bytes;
+    const auto stats = io::statistics({values.type, values.shape, bytes.data() + 1});
+    REQUIRE(stats.has_value());
+    CHECK(stats->count == 3);
+    CHECK(stats->mean.shape == io::Shape{2});
+    const auto means = stats->mean.values<double>();
+    const auto deviations = stats->squared_deviation.values<double>();
+    CHECK(close_enough(means[0], 1.0 / 3));
+    CHECK(close_enough(means[1], -1.0 / 3));
+    CHECK(close_enough(deviations[0], 2e16));
+    CHECK(close_enough(deviations[1], 2e16));
+    CHECK(bytes == original);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/chunked-conversion-preserves-sample-order") {
+    std::vector<std::int32_t> values(50001 * 3);
+    for (std::size_t i = 0; i < values.size(); ++i) values[i] = static_cast<int>(i % 101) - 50;
+    const auto array = io::Array::from(values, {50001, 3});
+    const auto converted = io::convert(array.view(), io::dtype<double>());
+    const auto expected = io::statistics(converted.view());
+    const auto actual = io::statistics(array.view());
+    REQUIRE(expected.has_value());
+    REQUIRE(actual.has_value());
+    CHECK(actual->count == expected->count);
+    CHECK(actual->mean.shape == expected->mean.shape);
+    CHECK(actual->mean.storage == expected->mean.storage);
+    CHECK(actual->squared_deviation.storage == expected->squared_deviation.storage);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/basic-mean-and-squared-deviation") {
+    TestDirectory directory;
+    check_statistics({1, 2, 3, 4}, 2.5, 5, directory("welford.h5"));
+    check_statistics({7}, 7, 0, directory("singleton.h5"));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/finite-overflow-and-nan-propagation") {
+    TestDirectory directory;
+    const double largest = std::numeric_limits<double>::max();
+    const double infinity = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    check_statistics(std::vector<double>(9, largest), largest, 0, directory("constant-overflow.h5"));
+    check_statistics({largest, -largest, 1, -1}, 0, infinity, directory("finite-overflow.h5"));
+    check_statistics({1e200, -1e200, nan}, nan, nan, directory("overflow-nan.h5"));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/partition-sum-overflow-cancels") {
+    const auto array = io::Array::from<double>({-1e308, 0, 1e308, 1e308, -1e308, 0}, {6});
+    for (std::size_t workers : {1, 2, 3, 4}) {
+        const auto stats = io::statistics(array.view(), {workers});
+        REQUIRE(stats.has_value());
+        CHECK(stats->mean.values<double>()[0] == 0);
+        CHECK(stats->squared_deviation.values<double>()[0] == std::numeric_limits<double>::infinity());
+    }
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/partitions-with-uneven-sizes") {
+    for (const auto& shape : {io::Shape{23, 67}, io::Shape{257}, io::Shape{257, 13}}) {
+        const std::size_t width = shape.size() == 1 ? 1 : shape[1];
+        CAPTURE(width);
+        std::vector<double> samples(io::elements(shape));
+        for (std::size_t i = 0; i < samples.size(); ++i)
+            samples[i] = 16 + (static_cast<int>((i * 17 + i / width) % 101) - 50) / 8.0;
+        const auto array = io::Array::from(samples, shape);
+        const auto original = array.storage;
+        for (const std::size_t workers : {4, 7}) {
+            CAPTURE(workers);
+            const auto serial = io::statistics(array.view(), {1});
+            const auto parallel = io::statistics(array.view(), {workers});
+            REQUIRE(serial.has_value());
+            REQUIRE(parallel.has_value());
+            CHECK(parallel->count == shape[0]);
+            CHECK(parallel->mean.shape == serial->mean.shape);
+            CHECK(parallel->squared_deviation.shape == serial->squared_deviation.shape);
+            const auto means = parallel->mean.values<double>(), expected_means = serial->mean.values<double>();
+            const auto moments = parallel->squared_deviation.values<double>();
+            const auto expected_moments = serial->squared_deviation.values<double>();
+            for (std::size_t column = 0; column < width; ++column) {
+                CHECK(std::abs(means[column] - expected_means[column]) <= 8e-15 * std::abs(expected_means[column]));
+                CHECK(std::abs(moments[column] - expected_moments[column]) <= 8e-15 * expected_moments[column]);
+            }
+            const auto repeated = io::statistics(array.view(), {workers});
+            REQUIRE(repeated.has_value());
+            CHECK(repeated->mean.storage == parallel->mean.storage);
+            CHECK(repeated->squared_deviation.storage == parallel->squared_deviation.storage);
+            CHECK(array.storage == original);
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/conversion-and-unaligned-input") {
+    std::vector<double> samples(257 * 13);
+    for (std::size_t i = 0; i < samples.size(); ++i) samples[i] = static_cast<double>(i % 97);
+    const auto source = io::Array::from(samples, {257, 13});
+    auto swapped = io::dtype<double>();
+    swapped.little_endian = !swapped.little_endian;
+    for (const auto type : {io::dtype<float>(), io::dtype<double>(), io::dtype<std::int16_t>(),
+                            io::dtype<std::uint64_t>(), io::dtype<bool>(),
+                            io::DType{io::Kind::floating, 2}, swapped}) {
+        CAPTURE(type.size);
+        CAPTURE(type.little_endian);
+        auto array = io::convert(source.view(), type);
+        if (type.kind == io::Kind::boolean)
+            for (std::size_t i = 0; i < array.storage.size(); ++i)
+                array.storage[i] = i % 3 ? 255 : 0;
+        const auto converted = io::convert(array.view(), io::dtype<double>());
+        std::vector<unsigned char> bytes(array.storage.size() + 1);
+        std::memcpy(bytes.data() + 1, array.storage.data(), array.storage.size());
+        const auto original = bytes;
+        for (const std::size_t workers : {4, 7}) {
+            const auto expected = io::statistics(converted.view(), {workers});
+            const auto actual = io::statistics({type, array.shape, bytes.data() + 1}, {workers});
+            REQUIRE(expected.has_value());
+            REQUIRE(actual.has_value());
+            CHECK(actual->count == expected->count);
+            CHECK(actual->mean.shape == expected->mean.shape);
+            CHECK(actual->mean.storage == expected->mean.storage);
+            CHECK(actual->squared_deviation.storage == expected->squared_deviation.storage);
+            CHECK(bytes == original);
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/numerical-edge-cases") {
+    const double offset = 1e12 + 0.1;
+    const double infinity = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double largest = std::numeric_limits<double>::max();
+    const double step = std::nextafter(offset, infinity) - offset;
+    const auto verify = [&](const std::vector<double>& samples, double mean, double moment) {
+        for (const std::size_t width : {1, 5, 17}) {
+            CAPTURE(width);
+            std::vector<double> data;
+            for (const double sample : samples)
+                for (std::size_t column = 0; column < width; ++column)
+                    data.push_back(column % 2 ? -sample : sample);
+            const auto array = io::Array::from(data, {samples.size(), width});
+            const auto stats = io::statistics(array.view(), {4});
+            REQUIRE(stats.has_value());
+            CHECK(stats->count == samples.size());
+            const auto means = stats->mean.values<double>();
+            const auto moments = stats->squared_deviation.values<double>();
+            for (std::size_t column = 0; column < width; ++column) {
+                const double expected_mean = column % 2 ? -mean : mean;
+                CHECK(close_enough(means[column], expected_mean));
+                CHECK(close_enough(moments[column], moment));
+            }
+        }
+    };
+    verify({1e16, 1, -1e16}, 1.0 / 3, 2e32);
+    std::vector<double> cancellation(259, 1);
+    cancellation.front() = 1e16;
+    cancellation.back() = -1e16;
+    verify(cancellation, 257.0 / 259, 2e32);
+    verify(std::vector<double>(9, offset), offset, 0);
+    verify({offset, offset, offset + step}, offset, step * step * (2.0 / 3));
+    verify({offset - 0.25, offset, offset + 0.25}, offset, 0.125);
+    verify(std::vector<double>(9, largest), largest, 0);
+    verify({largest, -largest, 1, -1}, 0, infinity);
+    verify({1e200, -1e200}, 0, infinity);
+    verify({1e200, -1e200, nan}, nan, nan);
+    verify({infinity, 1, 0}, infinity, nan);
+    verify({infinity, -infinity, 0}, nan, nan);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/empty-singleton-and-null-data-validation") {
+    const io::StatisticsOptions defaults;
+    CHECK(defaults.workers == 0);
+    const io::StatisticsOptions options{8};
+    for (const auto& shape : {io::Shape{}, io::Shape{0}, io::Shape{0, 2}, io::Shape{2, 2, 2}}) {
+        const io::Array array(io::dtype<double>(), shape);
+        CHECK_FALSE(io::statistics(array.view(), options).has_value());
+    }
+    const io::Array zero_width(io::dtype<double>(), {7, 0});
+    const auto empty = io::statistics(zero_width.view(), options);
+    REQUIRE(empty.has_value());
+    CHECK(empty->count == 7);
+    CHECK(empty->mean.shape == io::Shape{0});
+    CHECK(empty->squared_deviation.shape == io::Shape{0});
+    CHECK(empty->mean.storage.empty());
+    CHECK(empty->squared_deviation.storage.empty());
+    for (const auto& shape : {io::Shape{1}, io::Shape{1, 1}}) {
+        const auto array = io::Array::from<double>({7}, shape);
+        const auto stats = io::statistics(array.view(), options);
+        REQUIRE(stats.has_value());
+        CHECK(stats->count == 1);
+        CHECK(stats->mean.shape == (shape.size() == 1 ? io::Shape{} : io::Shape{1}));
+        CHECK(stats->mean.values<double>() == std::vector<double>{7});
+        CHECK(stats->squared_deviation.values<double>() == std::vector<double>{0});
+    }
+    const auto array = io::Array::from<double>({1, 2, 3}, {3});
+    CHECK_THROWS_AS(io::statistics({io::dtype<double>(), {7, 2}, nullptr}, options), std::invalid_argument);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/unsupported-dtype-error-and-recovery") {
+    const io::Array unsupported({io::Kind::signed_integer, 3}, {65, 13});
+    CHECK_THROWS_WITH_AS(io::statistics(unsupported.view(), {4}),
+                         doctest::Contains("Unsupported numeric dtype"), io::TypeError);
+    // A failed parallel request must not poison subsequent calls.
+    const auto valid = io::Array::from<double>({1, 2, 3, 4}, {4});
+    const auto stats = io::statistics(valid.view(), {4});
+    REQUIRE(stats.has_value());
+    CHECK(stats->mean.values<double>() == std::vector<double>{2.5});
+    CHECK(stats->squared_deviation.values<double>() == std::vector<double>{5});
+}
+
 TEST_CASE_FIXTURE(Hdf5Fixture, "environment/bundled-deflate-filter") {
     unsigned filter_info = 0;
     CHECK(H5Zfilter_avail(H5Z_FILTER_DEFLATE) > 0);

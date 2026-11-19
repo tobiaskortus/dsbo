@@ -237,6 +237,259 @@ def test_statistics_unsupported_arrays_and_noncanonical_bool(tmp_path):
         np.testing.assert_allclose(file["primal"].attrs[W.STATS_MEAN_ATTRIBUTE], values.astype(float).mean())
 
 
+def _assert_statistics_match_float64(values, workers=0):
+    actual = _hdf5.statistics(values, workers=workers)
+    expected = _hdf5.statistics(values.astype(np.float64), workers=workers)
+    assert actual is not None and expected is not None
+    assert actual[0] == expected[0] == values.shape[0]
+    for result, reference in zip(actual[1:], expected[1:]):
+        assert result.shape == reference.shape == values.shape[1:]
+        assert result.dtype == reference.dtype == np.dtype(np.float64)
+        # Conversion must feed the same double values to the streaming updates,
+        # including identical NaN/inf propagation and integer rounding.
+        np.testing.assert_array_equal(result, reference)
+    return actual
+
+
+@pytest.mark.parametrize("workers", [1, 2, 3, 4])
+def test_statistics_parallel_partition_overflow_cancels_to_finite_mean(workers):
+    values = np.array([-1e308, 0, 1e308, 1e308, -1e308, 0])
+    count, mean, moment = _hdf5.statistics(values, workers=workers)
+    assert count == 6
+    assert mean == 0
+    assert moment == np.inf
+
+
+@pytest.mark.parametrize("workers", [1, 4], ids=["serial", "parallel"])
+@pytest.mark.parametrize("dtype", [
+    "bool", "float16", "float32", "float64",
+    "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64",
+    *[np.dtype(dtype).newbyteorder("S") for dtype in ("f2", "f4", "f8", "i8", "u8")],
+])
+def test_statistics_dtype_conversion_matches_float64(dtype, workers):
+    dtype = np.dtype(dtype)
+    if dtype.kind == "b":
+        samples = np.array([0, 2, 255, 128, 1, 0], dtype=np.uint8).view(np.bool_)
+    elif dtype.kind in "iu":
+        limits = np.iinfo(dtype)
+        samples = [limits.min, limits.min + 1, 0, 1, limits.max - 1, limits.max]
+        if dtype.itemsize == 8:
+            samples += [2**53 - 1, 2**53, 2**53 + 1, 2**63 - 1]
+            if dtype.kind == "i":
+                samples += [-2**53 - 1, -2**53, -2**53 + 1]
+            else:
+                samples += [2**63, 2**63 + 1]
+        samples = np.array(samples, dtype=dtype)
+    else:
+        limits = np.finfo(dtype)
+        # Keep double squares finite while covering float16/float32 limits,
+        # subnormals, and adjacent representable values around one.
+        large = min(float(limits.max), 1e100)
+        samples = np.array([
+            0, -0.0, limits.smallest_subnormal, -limits.smallest_subnormal,
+            limits.tiny, -limits.tiny, 1, 1 + limits.eps, -1, large, -large,
+        ], dtype=dtype)
+    values = np.empty((samples.size, 2), dtype=dtype)
+    values[:, 0], values[:, 1] = samples, samples[::-1]
+    before = values.tobytes()
+    actual = _assert_statistics_match_float64(values, workers=workers)
+    if workers > 1:
+        serial = _hdf5.statistics(values, workers=1)
+        assert serial is not None
+        for result, reference in zip(actual[1:], serial[1:]):
+            np.testing.assert_allclose(result, reference, rtol=8e-15, atol=0)
+    assert values.tobytes() == before
+
+
+def test_statistics_longdouble_conversion_matches_float64():
+    dtype = np.dtype(np.longdouble)
+    if dtype.itemsize not in (8, ctypes.sizeof(ctypes.c_longdouble)):
+        pytest.skip("NumPy longdouble does not match a supported native floating type")
+    values = np.array([
+        2**53 - 1, 2**53, 2**53 + 1, -2**53 - 1, -2**53 + 1, 0,
+    ], dtype=dtype)
+    values = np.concatenate((values, [np.longdouble(1) + np.finfo(dtype).eps]))
+    _assert_statistics_match_float64(values)
+
+
+@pytest.mark.parametrize("dtype,shape", [
+    pytest.param(np.dtype("f2"), (18727, 7), id="float16-matrix"),
+    pytest.param(np.dtype("u8"), (37452, 7), id="uint64-three-chunk-matrix"),
+    pytest.param(np.dtype("f4").newbyteorder("S"), (18727, 7), id="opposite-endian-matrix"),
+    pytest.param(np.dtype("bool"), (18727, 7), id="noncanonical-bool-matrix"),
+    pytest.param(np.dtype("i2"), (131089,), id="int16-vector"),
+])
+def test_statistics_chunked_conversion_matches_float64(dtype, shape):
+    # The <=1 MiB conversion buffer holds 131072 elements for these types.
+    # Seven-column rows straddle that boundary, and every case has a tail.
+    size = int(np.prod(shape))
+    assert size > 131072 and size % 131072
+    if len(shape) == 2:
+        assert 131072 % shape[1]
+    indices = np.arange(size, dtype=np.int64)
+    if dtype.kind == "b":
+        raw = ((indices * 37 + indices // 97) % 5).astype(np.uint8)
+        raw[::11] = 255
+        values = raw.view(np.bool_)
+    elif dtype == np.dtype("u8"):
+        values = ((indices * 8191 + indices // 97) % 1_000_003).astype(dtype)
+        values += np.uint64(2**63)
+    else:
+        values = ((indices * 37 + indices // 97) % 1009 - 504).astype(dtype)
+        if dtype.kind == "f":
+            values /= 8
+    _assert_statistics_match_float64(values.reshape(shape))
+
+
+def test_statistics_float32_cancellation_and_large_offset_accuracy():
+    values = np.array([
+        [2**60, 2**20 - 0.25],
+        [1, 2**20 - 0.125],
+        [-2**60, 2**20 + 0.125],
+        [0, 2**20 + 0.25],
+    ], dtype=np.float32)
+    _, mean, deviation = _assert_statistics_match_float64(values)
+    np.testing.assert_array_equal(mean, [0.25, 2**20])
+    np.testing.assert_allclose(deviation, [2.0**121, 0.15625], rtol=2e-15, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64, np.dtype("f8").newbyteorder("S")])
+def test_statistics_nonfinite_conversion_matches_float64(dtype):
+    values = np.array([
+        [np.nan, np.inf, -np.inf, np.inf, np.inf],
+        [1, 1, 1, -np.inf, np.inf],
+        [0, 0, 0, 0, 1],
+    ], dtype=dtype)
+    _, mean, deviation = _assert_statistics_match_float64(values)
+    np.testing.assert_array_equal(mean, [np.nan, np.inf, -np.inf, np.nan, np.inf])
+    assert np.isnan(deviation).all()
+
+
+@pytest.mark.parametrize("shape,workers", [
+    pytest.param((23, 67), 4, id="wide"),
+    pytest.param((257,), 4, id="tall"),
+    pytest.param((257, 13), 4, id="matrix"),
+    pytest.param((257, 13), 7, id="more-workers"),
+])
+def test_statistics_parallel_rows_match_serial_and_are_deterministic(shape, workers):
+    indices = np.arange(np.prod(shape), dtype=np.int64)
+    values = (16 + ((indices * 17 + indices // 13) % 101 - 50) / 8).reshape(shape)
+    before = values.copy()
+    serial = _hdf5.statistics(values, workers=1)
+    parallel = _hdf5.statistics(values, workers=workers)
+    assert serial is not None and parallel is not None
+    assert serial[0] == parallel[0] == shape[0]
+    expected_mean = values.mean(axis=0)
+    expected_moment = ((values - expected_mean) ** 2).sum(axis=0)
+    for actual, reference, analytical in zip(parallel[1:], serial[1:], (expected_mean, expected_moment)):
+        assert actual.shape == reference.shape == shape[1:]
+        assert actual.dtype == reference.dtype == np.dtype(np.float64)
+        np.testing.assert_allclose(actual, reference, rtol=8e-15, atol=0)
+        np.testing.assert_allclose(actual, analytical, rtol=8e-15, atol=0)
+    for _ in range(3):
+        repeated = _hdf5.statistics(values, workers=workers)
+        assert repeated[0] == parallel[0]
+        for actual, reference in zip(repeated[1:], parallel[1:]):
+            np.testing.assert_array_equal(actual, reference)
+    np.testing.assert_array_equal(values, before)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int16, np.dtype("f4").newbyteorder("S")])
+@pytest.mark.parametrize("workers", [1, 4], ids=["serial", "parallel"])
+def test_statistics_unaligned_and_noncontiguous_inputs(dtype, workers):
+    samples = (np.arange(65 * 13).reshape(65, 13) % 97).astype(dtype)
+    storage = np.empty(samples.nbytes + 1, dtype=np.uint8)
+    unaligned = np.ndarray(samples.shape, dtype=dtype, buffer=storage, offset=1)
+    unaligned[:] = samples
+    assert unaligned.flags.c_contiguous and not unaligned.flags.aligned
+    before = storage.tobytes()
+    for values in (unaligned, unaligned[::-1, ::-1], unaligned.T):
+        actual = _hdf5.statistics(values, workers=workers)
+        reference = _hdf5.statistics(np.array(values, dtype=np.float64, order="C"), workers=workers)
+        assert actual[0] == reference[0] == values.shape[0]
+        for result, expected in zip(actual[1:], reference[1:]):
+            np.testing.assert_array_equal(result, expected)
+    assert storage.tobytes() == before
+
+
+@pytest.mark.parametrize("width", [1, 5, 17], ids=["width-1", "width-5", "width-17"])
+def test_statistics_parallel_numerical_edge_cases(width):
+    offset = 1e12 + 0.1
+    step = np.spacing(offset)
+    largest = np.finfo(np.float64).max
+    cases = [
+        ([1e16, 1, -1e16], 1 / 3, 2e32),
+        ([1e16, *([1] * 257), -1e16], 257 / 259, 2e32),
+        ([offset] * 9, offset, 0),
+        ([offset, offset, offset + step], offset, step * step * (2 / 3)),
+        ([offset - 0.25, offset, offset + 0.25], offset, 0.125),
+        ([largest] * 9, largest, 0),
+        ([largest, -largest, 1, -1], 0, np.inf),
+        ([1e200, -1e200], 0, np.inf),
+        ([1e200, -1e200, np.nan], np.nan, np.nan),
+        ([np.inf, 1, 0], np.inf, np.nan),
+        ([np.inf, -np.inf, 0], np.nan, np.nan),
+    ]
+    signs = np.where(np.arange(width) % 2, -1, 1)
+    for samples, mean, moment in cases:
+        values = np.asarray(samples)[:, None] * signs
+        actual = _hdf5.statistics(values, workers=4)
+        assert actual[0] == len(samples)
+        np.testing.assert_allclose(actual[1], mean * signs, rtol=2e-15, atol=0)
+        np.testing.assert_allclose(actual[2], np.full(width, moment), rtol=2e-15, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (0, 2), (7, 0), (1,), (1, 1), (1, 17), (2, 2, 2)])
+def test_statistics_empty_singleton_and_unsupported_shapes(shape):
+    values = np.full(shape, 7.0)
+    actual = _hdf5.statistics(values, workers=8)
+    if values.ndim not in (1, 2) or values.shape[0] == 0:
+        assert actual is None
+    else:
+        assert actual[0] == shape[0]
+        assert actual[1].shape == actual[2].shape == shape[1:]
+        np.testing.assert_array_equal(actual[1], np.full(shape[1:], 7.0))
+        np.testing.assert_array_equal(actual[2], np.zeros(shape[1:]))
+
+
+@pytest.mark.parametrize("threads", ["1", "2", "4"])
+def test_statistics_thread_environment_and_explicit_override(monkeypatch, threads):
+    values = (16 + (np.arange(257 * 13) % 97) / 8).reshape(257, 13)
+    monkeypatch.setenv("DSBO_STATISTICS_THREADS", "1")
+    serial = _hdf5.statistics(values, workers=1)
+    forced = _hdf5.statistics(values, workers=4)
+    monkeypatch.setenv("DSBO_STATISTICS_THREADS", threads)
+    explicit = _hdf5.statistics(values, workers=4)
+    automatic = _hdf5.statistics(values, workers=0)
+    configured = _hdf5.statistics(values, workers=int(threads))
+    default = _hdf5.statistics(values)
+    for result, expected in zip(explicit[1:], forced[1:]):
+        np.testing.assert_array_equal(result, expected)
+    for actual, expected in zip(automatic[1:], configured[1:]):
+        np.testing.assert_array_equal(actual, expected)
+    # The env var is still set here, so the default call uses that worker count.
+    for actual, expected in zip(default[1:], configured[1:]):
+        np.testing.assert_array_equal(actual, expected)
+    monkeypatch.delenv("DSBO_STATISTICS_THREADS")
+    automatic_small = _hdf5.statistics(values, workers=0)
+    assert automatic_small[0] == serial[0]
+    for actual, expected in zip(automatic_small[1:], serial[1:]):
+        # Unconfigured auto mode keeps modest inputs serial.
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("threads", ["", "0", "-1", "two", "2workers", "2 "])
+def test_statistics_invalid_thread_environment_and_explicit_override(monkeypatch, threads):
+    values = np.arange(17.0)
+    monkeypatch.setenv("DSBO_STATISTICS_THREADS", threads)
+    with pytest.raises(ValueError, match="DSBO_STATISTICS_THREADS"):
+        _hdf5.statistics(values)
+    actual = _hdf5.statistics(values, workers=4)
+    assert actual[0] == len(values)
+    np.testing.assert_allclose(actual[1], np.array(8.0), rtol=8e-15)
+    np.testing.assert_allclose(actual[2], np.array(408.0), rtol=8e-15)
+
+
 @pytest.mark.parametrize("matrix", [False, True], ids=["scalar-stats", "vector-stats"])
 def test_statistics_binding_and_persistence(tmp_path, matrix):
     # Numerical edge cases live in cpp/tests/hdf5.cpp. Here, check binding shapes
