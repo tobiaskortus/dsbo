@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 import torch
 
 from dsbo.modules import Module
-from dsbo.container import ContainerWrapperBase
+from dsbo.container import ContainerDefinition, ContainerWrapperBase
 
 
 class ReconstructionBase(Module):
@@ -27,7 +27,7 @@ class ReconstructionBase(Module):
 
 
 class ReconstructionContainerWrapper(ReconstructionBase, ContainerWrapperBase):
-    def __init__(self, container_path: str, container_extra_flags: Optional[str] = None, cuda_enabled: bool = True) -> None:
+    def __init__(self, container_path: ContainerDefinition, container_extra_flags: Optional[str] = None, cuda_enabled: bool = True) -> None:
         ReconstructionBase.__init__(self)
         ContainerWrapperBase.__init__(self, container_path=container_path,
                                       container_extra_flags=container_extra_flags,

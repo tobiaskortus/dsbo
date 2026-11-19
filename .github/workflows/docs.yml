@@ -1,0 +1,30 @@
+name: Docs
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package and docs dependencies
+        run: |
+          pip install "torch==2.15.0" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install ".[dev]"
+
+      - name: Build documentation
+        run: python -m mkdocs build --strict
