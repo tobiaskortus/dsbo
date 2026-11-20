@@ -24,7 +24,6 @@ inline Array copy(ArrayView value) {
 
 // Numeric promotion follows NumPy's array/array promotion, not C++ scalar rules.
 inline DType promote(DType left, DType right) {
-    left.little_endian = right.little_endian = native_little_endian();
     if (left.kind == Kind::boolean) return right;
     if (right.kind == Kind::boolean) return left;
     DType result;
@@ -54,14 +53,14 @@ inline Array cast(ArrayView value, DType target) {
         return cast(normalized.view(), target);
     }
     if (target.kind == Kind::boolean) {
-        const auto numbers = cast(value, dtype<long double>()).values<long double>();
+        const auto numbers = cast(value, dtype<double>()).values<double>();
         Array result(target, value.shape);
         for (std::size_t i = 0; i < value.size(); ++i)
             result.storage[i] = numbers[i] != 0;
         return result;
     }
-    auto source_type = datatype(value.type, false);
-    auto target_type = datatype(target, false);
+    auto source_type = datatype(value.type);
+    auto target_type = datatype(target);
     std::vector<unsigned char> buffer(value.size() * std::max(value.type.size, target.size));
     if (!buffer.empty()) {
         std::memcpy(buffer.data(), value.data, value.nbytes());
@@ -75,7 +74,6 @@ inline Array cast(ArrayView value, DType target) {
 inline Array stack(const std::vector<ArrayView>& arrays) {
     if (arrays.empty()) throw std::invalid_argument("need at least one array to stack");
     auto type = arrays.front().type;
-    type.little_endian = native_little_endian();
     for (const auto& value : arrays) {
         if (value.shape != arrays.front().shape) throw std::invalid_argument("all input arrays must have the same shape");
         type = promote(type, value.type);
@@ -160,7 +158,7 @@ inline Array add(ArrayView left, ArrayView right) {
         return cast(a.view(), type);
     } else if (type.size == 4) add_values<float>(result, other);
     else if (type.size == 8) add_values<double>(result, other);
-    else add_values<long double>(result, other);
+    else throw TypeError("Unsupported floating-point width.");
     return result;
 }
 } // namespace internal

@@ -16,11 +16,17 @@ target_link_libraries(dsbo_check_hdf5 PRIVATE hdf5-static)
 set_target_properties(dsbo_check_hdf5 PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 
-set(PYBIND11_FINDPYTHON ON)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
-find_package(pybind11 3.0 CONFIG REQUIRED)
-pybind11_add_module(_hdf5 MODULE NO_EXTRAS ../bindings/hdf5.cpp)
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT)
+find_package(nanobind CONFIG REQUIRED)
+nanobind_add_module(_hdf5 ../bindings/hdf5.cpp)
 target_compile_features(_hdf5 PRIVATE cxx_std_17)
+# nanobind defaults to -Os; use speed optimization for Release builds.
+target_compile_options(_hdf5 PRIVATE
+    $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:MSVC>>:/O2>
+    $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-O3>)
 target_include_directories(_hdf5 PRIVATE ../include)
 target_link_libraries(_hdf5 PRIVATE hdf5-static)
 set_target_properties(_hdf5 PROPERTIES
@@ -37,5 +43,5 @@ elseif(UNIX)
         "LINKER:--version-script,${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
     set_property(TARGET _hdf5 APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
 endif()
-# On Windows, static HDF5/zlib have no dllexport decorations; pybind11 exports
+# On Windows, static HDF5/zlib have no dllexport decorations; nanobind exports
 # PyInit__hdf5 explicitly. Neither dependency is built as a DLL.

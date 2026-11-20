@@ -3,7 +3,7 @@
 - The vendored `dsbo/third_party/json.hpp` header is nlohmann/json **3.12.0**, imported
   unmodified from its `single_include/nlohmann/json.hpp`. Its MIT license is in
   `nlohmann-json.txt`.
-- Python bindings use pybind11 (BSD-3-Clause); its license is in `pybind11.txt`.
+- Python bindings use nanobind (BSD-3-Clause); its license is in `nanobind.txt`.
 - The native C++ tests use doctest **2.5.3** (MIT), vendored as a single header in
   `cpp/tests/doctest.h`; its license is in `doctest.txt`. It is test-only and is
   not part of the public SDK or Python package.

@@ -116,7 +116,6 @@ public:
         std::vector<std::string> keys;
         std::size_t rows = features.front().second.size();
         auto type = features.front().second.type;
-        type.little_endian = native_little_endian();
         for (const auto& [key, value] : features) {
             if (key.empty() || key.find('\0') != std::string::npos) throw std::invalid_argument("Feature keys must be non-empty strings without NUL characters.");
             if (value.shape.size() > 1) throw std::invalid_argument("Row-store features must be scalars or one-dimensional arrays.");

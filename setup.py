@@ -13,7 +13,7 @@ import sys
 import sysconfig
 from pathlib import Path
 
-import pybind11
+import nanobind
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
@@ -61,7 +61,7 @@ class BundledBuildExt(build_ext):
             "cmake", "-S", str(ROOT / "cpp/python"), "-B", str(temporary), "-G", "Ninja",
             f"-DCMAKE_BUILD_TYPE={configuration}",
             f"-DPython_EXECUTABLE={sys.executable}",
-            f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
+            f"-Dnanobind_DIR={nanobind.cmake_dir()}",
             f"-DDSBO_EXTENSION_DIRECTORY={destination.parent}",
             f"-DDSBO_EXTENSION_SUFFIX={sysconfig.get_config_var('EXT_SUFFIX')}",
         ]

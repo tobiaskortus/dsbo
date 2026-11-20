@@ -199,9 +199,11 @@ The main APIs in `dsbo::io` are:
 | Inspect or partially read datasets | `Reader::shape`, `type`, `statistics`, `read`, `read_indices`, `close` |
 
 Arrays support booleans, signed/unsigned 8/16/32/64-bit integers, and
-float16/32/64, plus platform long double. Scalar and empty shapes are
-supported. Strings, objects, ragged arrays, references, and arbitrary compound
-dtypes are unsupported and raise `dsbo::io::TypeError`.
+float16/32/64. Byte order is handled by HDF5 and is not part of the DSBO dtype
+model, so datasets are readable regardless of the host or file byte order.
+Scalar and empty shapes are supported. Strings, objects, ragged arrays,
+references, and arbitrary compound dtypes are unsupported and raise
+`dsbo::io::TypeError`.
 
 Use DSBO's write methods to create files for training dataset reads and
 reductions. Older named-column files are read as named arrays, not stacked

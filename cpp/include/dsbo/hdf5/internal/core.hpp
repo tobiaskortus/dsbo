@@ -150,42 +150,55 @@ inline Handle dataspace(const Shape& dimensions) {
                               : H5Screate_simple(static_cast<int>(dimensions.size()), dimensions.data(), nullptr), H5Sclose};
 }
 
-inline Handle datatype(DType type, bool boolean_enum = true) {
+inline Handle boolean_datatype() {
+    Handle result(H5Tcopy(H5T_NATIVE_UCHAR), H5Tclose);
+    Handle enumeration(H5Tenum_create(result), H5Tclose);
+    const unsigned char no = 0, yes = 1;
+    check(H5Tenum_insert(enumeration, "FALSE", &no), "Cannot create boolean dtype.");
+    check(H5Tenum_insert(enumeration, "TRUE", &yes), "Cannot create boolean dtype.");
+    return enumeration;
+}
+
+// Native datatype for both memory and file. HDF5 records the byte order in
+// the file and converts transparently when the reader's host order differs.
+inline Handle datatype(DType type) {
     check_environment();
+    if (type.kind == Kind::boolean) return boolean_datatype();
     hid_t base = -1;
-    const bool little = type.little_endian;
     if (type.kind == Kind::floating) {
-        if (type.size == 2) base = little ? H5T_IEEE_F16LE : H5T_IEEE_F16BE;
-        else if (type.size == 4) base = little ? H5T_IEEE_F32LE : H5T_IEEE_F32BE;
-        else if (type.size == 8) base = little ? H5T_IEEE_F64LE : H5T_IEEE_F64BE;
-        else if (type.size == sizeof(long double)) base = H5T_NATIVE_LDOUBLE;
+        if (type.size == 2) {
+            base = H5T_NATIVE_FLOAT16;
+            if (base < 0) {
+                // Fall back to IEEE half when the compiler has no _Float16.
+                const bool little = H5Tget_order(H5T_NATIVE_INT16) == H5T_ORDER_LE;
+                base = little ? H5T_IEEE_F16LE : H5T_IEEE_F16BE;
+            }
+        } else if (type.size == 4) base = H5T_NATIVE_FLOAT;
+        else if (type.size == 8) base = H5T_NATIVE_DOUBLE;
     } else {
         const bool sign = type.kind == Kind::signed_integer;
-        if (type.size == 1) base = sign ? H5T_STD_I8LE : H5T_STD_U8LE;
-        else if (type.size == 2) base = sign ? (little ? H5T_STD_I16LE : H5T_STD_I16BE) : (little ? H5T_STD_U16LE : H5T_STD_U16BE);
-        else if (type.size == 4) base = sign ? (little ? H5T_STD_I32LE : H5T_STD_I32BE) : (little ? H5T_STD_U32LE : H5T_STD_U32BE);
-        else if (type.size == 8) base = sign ? (little ? H5T_STD_I64LE : H5T_STD_I64BE) : (little ? H5T_STD_U64LE : H5T_STD_U64BE);
+        if (type.size == 1) base = sign ? H5T_NATIVE_SCHAR : H5T_NATIVE_UCHAR;
+        else if (type.size == 2) base = sign ? H5T_NATIVE_INT16 : H5T_NATIVE_UINT16;
+        else if (type.size == 4) base = sign ? H5T_NATIVE_INT32 : H5T_NATIVE_UINT32;
+        else if (type.size == 8) base = sign ? H5T_NATIVE_INT64 : H5T_NATIVE_UINT64;
     }
     if (base < 0) throw TypeError("Unsupported numeric dtype.");
-    Handle result(H5Tcopy(base), H5Tclose);
-    if (type.kind == Kind::floating && type.size > 8)
-        check(H5Tset_order(result, little ? H5T_ORDER_LE : H5T_ORDER_BE), "Cannot set extended float byte order.");
-    if (type.kind == Kind::boolean && boolean_enum) {
-        Handle enumeration(H5Tenum_create(result), H5Tclose);
-        const unsigned char no = 0, yes = 1;
-        check(H5Tenum_insert(enumeration, "FALSE", &no), "Cannot create boolean dtype.");
-        check(H5Tenum_insert(enumeration, "TRUE", &yes), "Cannot create boolean dtype.");
-        return enumeration;
-    }
-    return result;
+    return Handle(H5Tcopy(base), H5Tclose);
 }
 
 inline DType dtype_from_hdf5(hid_t type) {
     const auto size = H5Tget_size(type);
     const auto kind = H5Tget_class(type);
-    const bool little = H5Tget_order(type) != H5T_ORDER_BE;
-    if (kind == H5T_INTEGER) return {H5Tget_sign(type) == H5T_SGN_NONE ? Kind::unsigned_integer : Kind::signed_integer, size, little};
-    if (kind == H5T_FLOAT) return {Kind::floating, size, little};
+    if (kind == H5T_INTEGER) {
+        if (size != 1 && size != 2 && size != 4 && size != 8)
+            throw TypeError("Unsupported integer width.");
+        return {H5Tget_sign(type) == H5T_SGN_NONE ? Kind::unsigned_integer : Kind::signed_integer, size};
+    }
+    if (kind == H5T_FLOAT) {
+        if (size != 2 && size != 4 && size != 8)
+            throw TypeError("Unsupported floating-point width.");
+        return {Kind::floating, size};
+    }
     if (kind == H5T_ENUM) {
         if (size == 1 && H5Tget_nmembers(type) == 2) {
             unsigned char no = 2, yes = 2;

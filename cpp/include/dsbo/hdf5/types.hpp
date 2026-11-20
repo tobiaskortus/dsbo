@@ -41,26 +41,21 @@ inline std::size_t elements(const Shape& shape) {
 
 enum class Kind { boolean, signed_integer, unsigned_integer, floating };
 
-inline bool native_little_endian() {
-    const std::uint16_t value = 1;
-    return *reinterpret_cast<const unsigned char*>(&value) == 1;
-}
-
 struct DType {
     Kind kind = Kind::floating;
     std::size_t size = sizeof(double);
-    bool little_endian = native_little_endian();
-    bool operator==(const DType& other) const {
-        return kind == other.kind && size == other.size && (size == 1 || little_endian == other.little_endian);
-    }
+    bool operator==(const DType& other) const { return kind == other.kind && size == other.size; }
     bool operator!=(const DType& other) const { return !(*this == other); }
 };
 
 template<class T> inline DType dtype() {
     if constexpr (std::is_same_v<T, bool>) return {Kind::boolean, 1};
-    else if constexpr (std::is_integral_v<T>)
+    else if constexpr (std::is_integral_v<T>) {
+        static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8,
+                      "DSBO supports only 8-, 16-, 32-, and 64-bit integers.");
         return {std::is_signed_v<T> ? Kind::signed_integer : Kind::unsigned_integer, sizeof(T)};
-    else if constexpr (std::is_floating_point_v<T>) return {Kind::floating, sizeof(T)};
+    } else if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>)
+        return {Kind::floating, sizeof(T)};
     else static_assert(!sizeof(T), "Unsupported native array element type");
 }
 

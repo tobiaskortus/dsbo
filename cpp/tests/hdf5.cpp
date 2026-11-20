@@ -534,13 +534,10 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/conversion-and-unaligned-inp
     std::vector<double> samples(257 * 13);
     for (std::size_t i = 0; i < samples.size(); ++i) samples[i] = static_cast<double>(i % 97);
     const auto source = io::Array::from(samples, {257, 13});
-    auto swapped = io::dtype<double>();
-    swapped.little_endian = !swapped.little_endian;
     for (const auto type : {io::dtype<float>(), io::dtype<double>(), io::dtype<std::int16_t>(),
                             io::dtype<std::uint64_t>(), io::dtype<bool>(),
-                            io::DType{io::Kind::floating, 2}, swapped}) {
+                            io::DType{io::Kind::floating, 2}}) {
         CAPTURE(type.size);
-        CAPTURE(type.little_endian);
         auto array = io::convert(source.view(), type);
         if (type.kind == io::Kind::boolean)
             for (std::size_t i = 0; i < array.storage.size(); ++i)
@@ -644,6 +641,15 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/unsupported-dtype-error-and-
     REQUIRE(stats.has_value());
     CHECK(stats->mean.values<double>() == std::vector<double>{2.5});
     CHECK(stats->squared_deviation.values<double>() == std::vector<double>{5});
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "convert/unsupported-widths-rejected") {
+    const auto values = io::Array::from<double>({1, 2}, {2});
+    for (const auto type : {io::DType{io::Kind::floating, 16}, io::DType{io::Kind::signed_integer, 3},
+                            io::DType{io::Kind::unsigned_integer, 16}}) {
+        CHECK_THROWS_WITH_AS(io::convert(values.view(), type),
+                             doctest::Contains("Unsupported numeric dtype"), io::TypeError);
+    }
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "environment/bundled-deflate-filter") {
@@ -874,19 +880,6 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "dict/legacy-column-group-without-metadata") {
     REQUIRE(legacy.size() == 2);
     CHECK(legacy[0].first == "a");
     CHECK(legacy[1].first == "b");
-}
-
-TEST_CASE_FIXTURE(Hdf5Fixture, "io/extended-float-byte-order") {
-    TestDirectory directory;
-    const auto path = directory("extended.h5");
-    const auto extended = io::Array::from<long double>({1.25L, -2.5L}, {2});
-    auto swapped_type = extended.type;
-    swapped_type.little_endian = !swapped_type.little_endian;
-    const auto swapped = io::convert(extended.view(), swapped_type);
-    io::HDF5Storage::write_primal(path, swapped.view());
-    const auto loaded = io::HDF5Storage::open_primal(path);
-    CHECK(loaded.type == swapped_type);
-    CHECK(io::convert(loaded.view(), extended.type).values<long double>() == extended.values<long double>());
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "headers/conversion-and-statistics-work-across-cpp-files") {

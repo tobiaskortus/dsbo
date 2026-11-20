@@ -99,8 +99,8 @@ inline void create_dsbo_dataset(hid_t parent, const std::string& name, ArrayView
 
 inline Array read_dataset(hid_t value) {
     Array result(dataset_dtype(value), dataset_shape(value));
-    auto type = datatype(result.type);
-    if (result.size()) check(H5Dread(value, type, H5S_ALL, H5S_ALL, H5P_DEFAULT, result.storage.data()), "Cannot read HDF5 dataset.");
+    auto memory_type = datatype(result.type);
+    if (result.size()) check(H5Dread(value, memory_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, result.storage.data()), "Cannot read HDF5 dataset.");
     return result;
 }
 

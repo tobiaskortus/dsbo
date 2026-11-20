@@ -22,7 +22,7 @@ from dsbo.utils.io.storage import HDF5Writer as W
 from dsbo.utils.io.storage import _hdf5
 
 
-DTYPES = ["bool", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float16", "float32", "float64", ">i4", ">f8"]
+DTYPES = ["bool", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float16", "float32", "float64"]
 INCLUDE_DIRECTORY = Path(__file__).resolve().parents[1] / "cpp/include"
 LICENSE_DIRECTORY = Path(__file__).resolve().parents[1] / "LICENSES"
 
@@ -237,6 +237,22 @@ def test_statistics_unsupported_arrays_and_noncanonical_bool(tmp_path):
         np.testing.assert_allclose(file["primal"].attrs[W.STATS_MEAN_ATTRIBUTE], values.astype(float).mean())
 
 
+def test_non_native_input_rejected_and_big_endian_file_converted(tmp_path):
+    values = np.array([1, 2], dtype=">i4")
+    with pytest.raises(TypeError, match="native-endian"):
+        W.write_primal(tmp_path / "primal.h5", values)
+    with pytest.raises(TypeError, match="native-endian"):
+        W.write_gradient(tmp_path / "gradient.h5", values)
+    assert W._statistics(values) is None
+
+    path = tmp_path / "big_endian.h5"
+    with h5py.File(path, "w") as file:
+        file.create_dataset("primal", data=values)
+    loaded = W.open_primal(path)
+    assert loaded.dtype == np.dtype(np.int32)
+    np.testing.assert_array_equal(loaded, values)
+
+
 def _assert_statistics_match_float64(values, workers=0):
     actual = _hdf5.statistics(values, workers=workers)
     expected = _hdf5.statistics(values.astype(np.float64), workers=workers)
@@ -264,7 +280,6 @@ def test_statistics_parallel_partition_overflow_cancels_to_finite_mean(workers):
 @pytest.mark.parametrize("dtype", [
     "bool", "float16", "float32", "float64",
     "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64",
-    *[np.dtype(dtype).newbyteorder("S") for dtype in ("f2", "f4", "f8", "i8", "u8")],
 ])
 def test_statistics_dtype_conversion_matches_float64(dtype, workers):
     dtype = np.dtype(dtype)
@@ -301,21 +316,9 @@ def test_statistics_dtype_conversion_matches_float64(dtype, workers):
     assert values.tobytes() == before
 
 
-def test_statistics_longdouble_conversion_matches_float64():
-    dtype = np.dtype(np.longdouble)
-    if dtype.itemsize not in (8, ctypes.sizeof(ctypes.c_longdouble)):
-        pytest.skip("NumPy longdouble does not match a supported native floating type")
-    values = np.array([
-        2**53 - 1, 2**53, 2**53 + 1, -2**53 - 1, -2**53 + 1, 0,
-    ], dtype=dtype)
-    values = np.concatenate((values, [np.longdouble(1) + np.finfo(dtype).eps]))
-    _assert_statistics_match_float64(values)
-
-
 @pytest.mark.parametrize("dtype,shape", [
     pytest.param(np.dtype("f2"), (18727, 7), id="float16-matrix"),
     pytest.param(np.dtype("u8"), (37452, 7), id="uint64-three-chunk-matrix"),
-    pytest.param(np.dtype("f4").newbyteorder("S"), (18727, 7), id="opposite-endian-matrix"),
     pytest.param(np.dtype("bool"), (18727, 7), id="noncanonical-bool-matrix"),
     pytest.param(np.dtype("i2"), (131089,), id="int16-vector"),
 ])
@@ -353,7 +356,7 @@ def test_statistics_float32_cancellation_and_large_offset_accuracy():
     np.testing.assert_allclose(deviation, [2.0**121, 0.15625], rtol=2e-15, atol=0)
 
 
-@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64, np.dtype("f8").newbyteorder("S")])
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
 def test_statistics_nonfinite_conversion_matches_float64(dtype):
     values = np.array([
         [np.nan, np.inf, -np.inf, np.inf, np.inf],
@@ -394,7 +397,7 @@ def test_statistics_parallel_rows_match_serial_and_are_deterministic(shape, work
     np.testing.assert_array_equal(values, before)
 
 
-@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int16, np.dtype("f4").newbyteorder("S")])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int16])
 @pytest.mark.parametrize("workers", [1, 4], ids=["serial", "parallel"])
 def test_statistics_unaligned_and_noncontiguous_inputs(dtype, workers):
     samples = (np.arange(65 * 13).reshape(65, 13) % 97).astype(dtype)
@@ -672,7 +675,7 @@ def test_dataset_discovery_root_validation_and_closed_reader(tmp_path):
         reader.keys()
 
 
-@pytest.mark.parametrize("left,right", [(a, b) for a in DTYPES[:14] for b in DTYPES[:14]])
+@pytest.mark.parametrize("left,right", [(a, b) for a in DTYPES for b in DTYPES])
 def test_gradient_numeric_promotion(tmp_path, left, right):
     a = np.array([1, 0], dtype=left)
     b = np.array([1, 1], dtype=right)
