@@ -120,6 +120,18 @@ struct Array {
 using NamedArrays = std::vector<std::pair<std::string, ArrayView>>;
 using NamedArrayValues = std::vector<std::pair<std::string, Array>>;
 
+// Looks up an owning named array while preserving the stored or requested order.
+inline Array& at(NamedArrayValues& values, const std::string& key) {
+    for (auto& [name, value] : values)
+        if (name == key) return value;
+    throw KeyError("No named array for key '" + key + "'.");
+}
+inline const Array& at(const NamedArrayValues& values, const std::string& key) {
+    for (const auto& [name, value] : values)
+        if (name == key) return value;
+    throw KeyError("No named array for key '" + key + "'.");
+}
+
 // Axis-0 sample count and float64 summaries. For 1-D input the summaries are
 // scalars; for 2-D input they have shape {input.shape[1]}. squared_deviation is
 // M2 (the sum of squared deviations from the mean), not variance.

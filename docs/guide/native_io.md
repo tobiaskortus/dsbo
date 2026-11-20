@@ -69,9 +69,8 @@ unmodified for the duration of the call. Use
 
 Use `NamedArrays` to write several named fields without stacking or converting
 them to one dtype. It is an ordered vector of `(key, ArrayView)` pairs. Reads
-return `NamedArrayValues`, an ordered vector of `(key, Array)` pairs that **owns**
-its data. The following snippets use the headers and `io` alias from `step.cpp`
-and can be placed inside `main()`:
+return `NamedArrayValues`, an ordered vector of `(key, Array)` pairs that
+**owns** its data. Use `io::at(values, key)` for lookup by name.
 
 ```cpp
 auto energy = io::Array::from<double>({1.0, 2.0, 3.0}, {3});
@@ -84,7 +83,7 @@ io::HDF5Storage::write_primal("events.h5", io::NamedArrays{
 auto selected = io::HDF5Storage::open_dict(
     "events.h5", std::vector<std::string>{"position", "energy"});
 std::cout << selected[0].first << '\n';  // position
-auto coordinates = selected[0].second.values<float>();  // six row-major values
+auto coordinates = io::at(selected, "position").values<float>();  // six row-major values
 ```
 
 Reads preserve key order; a selection returns fields in the requested order.

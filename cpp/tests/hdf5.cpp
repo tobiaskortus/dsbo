@@ -684,6 +684,8 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "dict/per-key-shapes-dtypes-and-order") {
     REQUIRE(subset.size() == 1);
     CHECK(subset[0].first == "floats");
     CHECK(subset[0].second.storage == floats.storage);
+    CHECK(io::at(loaded, "ints").storage == ints.storage);
+    CHECK_THROWS_AS(io::at(loaded, "missing"), io::KeyError);
     const auto shapes = io::HDF5Storage::dict_shape_from_path(path);
     REQUIRE(shapes.size() == 2);
     CHECK(shapes[0].second == ints.shape);
