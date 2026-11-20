@@ -134,7 +134,7 @@ class ContainerSimulation(SimulationContainerWrapperBase):
 
 !!! note "Gradient files"
 
-    Gradient file definition is currently Python-only through `HDF5File`; a general library for file operations is in development. Containerized modules that write gradients directly must resolve paths from `self.output.gradient()` and `self.input.gradient()` so replica and batch scopes apply. See [Validation and Lifetime](gradient-flow.md#validation-and-lifetime) for the completion rules.
+    The [native C++ HDF5 backend](native_io.md) reads and writes workflow primals, tangents, and gradients without requiring Python inside the container. Containerized modules that write gradients directly must receive paths resolved from `self.output.gradient()` and `self.input.gradient()` so replica and batch scopes apply. The output-gradient path is read-only; write the local vector-Jacobian product to the input-gradient path and finish writing before the container call returns. See [Validation and Lifetime](gradient-flow.md#validation-and-lifetime) for the completion rules and [Use in a DSBO Workflow](native_io.md#use-in-a-dsbo-workflow) for a complete native example.
 
 ## Defining New Container Module Types
 

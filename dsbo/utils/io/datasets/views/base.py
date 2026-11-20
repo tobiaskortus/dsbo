@@ -75,33 +75,25 @@ class DatasetView(ABC):
 
 
 class ColumnStoreDatasetView(DatasetView):
-    def __init__(
-        self,
-        group_name: str = "primal",
-        sample_shape: tuple[int, ...] = (),
-        partitions: tuple[int, ...] = (0,),
-    ):
+    def __init__(self, group_name: str = "primal", keys: tuple[str, ...] = ()):
         self._group_name = group_name
-        self._keys = (group_name,)
-        self.columns: tuple[str, ...] = ()
-        self.sample_shape = tuple(sample_shape)
-        self._partitions = tuple(partitions)
-        self.num_samples = sum(self._partitions)
+        self._keys = tuple(keys)
 
-    def shape(self, key: str) -> tuple[int, ...]:
-        return (self.num_samples, *self.sample_shape, len(self.columns))
+    def read_many(self, keys: list[str], index: int | slice) -> dict[str, np.ndarray]:
+        return {key: np.asarray(self.read(key, index)) for key in keys}
 
-    def read(self, key: str, index: int | slice):
-        return np.stack(
-            [np.asarray(self._read_column(column, index)) for column in self.columns],
-            axis=-1,
-        )
+    def read_indices(self, keys: list[str], indices: list[int]) -> dict[str, np.ndarray]:
+        return {key: self._read_indices(key, indices) for key in keys}
 
-    def partition_sizes(self, key: str) -> tuple[int, ...]:
-        return self._partitions
+    def statistics(self, keys: list[str]) -> dict[str, tuple[int, np.ndarray, np.ndarray] | None]:
+        return {key: self._statistics(key) for key in keys}
 
     @abstractmethod
-    def _read_column(self, column: str, index: int | slice):
+    def _read_indices(self, key: str, indices: list[int]) -> np.ndarray:
+        ...
+
+    @abstractmethod
+    def _statistics(self, key: str) -> tuple[int, np.ndarray, np.ndarray] | None:
         ...
 
 

@@ -84,9 +84,9 @@ The fused stage runs in the `batch_reduce` subdirectory. An empty batch executes
 
 ## Reduced Inputs
 
-Registered inputs are matched to upstream registered outputs by logical path. Files from ordinary upstream producers are combined in replica order, then candidate order; rows within each source keep their original order. Reduction is lazy: resolving an input handle such as `self.training_data()` builds the view when needed, and unused inputs are not opened.
+Declare the upstream output as an `Input` and read it through its normal handle, such as `self.training_data()`. The fused stage receives the combined values in replica order, then candidate order; rows within each source keep their original order.
 
-The active file backend performs the reduction. HDF5 uses virtual datasets that reference the source files, so those sources must remain available. See [Combining Replica Outputs](io.md#combining-replica-outputs).
+Keep the source files available while the combined input is in use. See [Combining Replica Outputs](io.md#combining-replica-outputs) for the supported shapes and ordering rules.
 
 ## Results and Gradients
 
@@ -94,7 +94,7 @@ The wrapped stage must expose at least one registered `Input`; for a dynamic sub
 
 A fused stage's returned metrics are discarded. A nonempty result dictionary produces a warning; metrics returned by ordinary downstream tasks remain candidate-specific workflow results.
 
-`batch_fuse()` marks the wrapped module as reverse-mode no-grad. The reverse pass skips that stage and does not differentiate the shared fitting operation.
+The shared fitting operation is not differentiable: its `backward()` method is not called, and gradients do not propagate through the fused stage.
 
 ## References
 

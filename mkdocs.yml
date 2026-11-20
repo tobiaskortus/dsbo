@@ -49,6 +49,7 @@ nav:
           - Parameter Spaces and Candidates: guide/parameters.md
           - Writing Modules: guide/modules.md
           - File Storage and Working Directories: guide/io.md
+          - Native C++ HDF5 I/O: guide/native_io.md
           - Building Workflows: guide/workflows.md
           - Differentiable Workflows: guide/autograd.md
           - Parallelization with Dask: guide/parallelization.md

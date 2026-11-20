@@ -7,6 +7,9 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator
 
+import numpy as np
+from tensordict import TensorDict
+
 if TYPE_CHECKING:
     from torch.utils.hooks import RemovableHandle
 
@@ -54,10 +57,11 @@ def get_reader_hook_handles() -> dict[str, list[RemovableHandle]]:
 
 
 def claim_gradient_reader(fpath: str) -> None:
-    """Register one backward hook for a file in the current module/task.
+    """Register backward hooks for a file in the current module/task.
 
-    NOTE: A module may register at most one reader hook per file during its
-    backward pass. A second hook inside a module is intentionally disabled (at least for now).
+    NOTE: A module may register at most one reader open per file during its
+    backward pass. A second open() of the same file inside a module is
+    intentionally disabled (at least for now).
     """
     if not is_active():
         return
@@ -66,7 +70,7 @@ def claim_gradient_reader(fpath: str) -> None:
         raise RuntimeError(
             f"File '{fpath}' registered more than one backward reader in the same module. "
             "Open each file once during the module's backward pass and reuse the "
-            "returned tensor; selecting different column subsets with separate "
+            "returned tensors; selecting different key subsets with separate "
             "open() calls in one module is currently not supported."
         )
     writer.files_with_reader_hooks.add(fpath)
@@ -82,6 +86,15 @@ def allocate_contribution_path(file: str) -> str:
     return path
 
 
+def add_gradients(left: np.ndarray | TensorDict, right: np.ndarray | TensorDict) -> np.ndarray | TensorDict:
+    if isinstance(left, TensorDict):
+        result = left.copy()
+        for key in right.keys():
+            result[key] = result[key] + right[key] if key in result.keys() else right[key]
+        return result
+    return left + right
+
+
 def complete_gradient_output(file: str, path: str, backend) -> None:
     """Validate and route a completed gradient file, regardless of its producer."""
     if is_active():
@@ -90,20 +103,22 @@ def complete_gradient_output(file: str, path: str, backend) -> None:
             raise RuntimeError(f"Gradient output '{path}' belongs to a different primal or backend.")
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Backward task did not write its gradient output: {path}")
-    for target, source, columns in backend.writer.gradient_file_contributions(file, path):
+    for target, source, keys in backend.writer.gradient_file_contributions(file, path):
         if not is_active():
-            value = backend.writer.load_gradient(source, columns=columns) if isinstance(source, str) else source
+            value = backend.writer.load_gradient(source, columns=keys) if isinstance(source, str) else source
+            if isinstance(value, TensorDict) and keys is not None:
+                value = value.select(*keys)
             destination = gradient_path(target)
             merge = destination in backend._gradient_written
             if merge:
-                value = value + backend.writer.load_gradient(destination, columns=columns)
-            backend.writer.write_gradient(destination, value, columns=columns, merge=merge)
+                value = add_gradients(value, backend.writer.load_gradient(destination))
+            backend.writer.write_gradient(destination, value, merge=merge)
             backend._gradient_written.add(destination)
             continue
 
         if not isinstance(source, str):
             contribution = allocate_contribution_path(target)
-            backend.write_gradient_contribution(contribution, target, source, columns)
+            backend.write_gradient_contribution(contribution, source, keys)
             source = contribution
 
         overlay = Workdir._current_gradient_overlays.get()
@@ -231,6 +246,3 @@ def gradient_output(file: str, backend) -> Generator[str, None, None]:
     finally:
         if not is_active():
             backend.remove(path)
-
-
-

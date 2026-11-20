@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import torch
 import numpy as np
+from tensordict import TensorDict
 from typing import TYPE_CHECKING
 from torch.utils.data import Dataset
 
 from dsbo.utils.io.datasets.views import RowSource
+from dsbo.utils.io.datasets.views.base import _stack_statistics
 
 if TYPE_CHECKING:
     from dsbo.utils.io.storage.autograd import AutogradFileInterface
     from dsbo.utils.io.datasets.views import DatasetView
+
+
+def _stack_fields(values: torch.Tensor | TensorDict) -> torch.Tensor:
+    if isinstance(values, TensorDict):
+        return torch.stack(list(values.values()), dim=-1)
+    return values
 
 
 class RowSubset(RowSource):
@@ -22,8 +30,8 @@ class RowSubset(RowSource):
     def _read(self, index):
         sel = self._indices[index]
         if np.ndim(sel) == 0:
-            return self._view.read_many(self._keys, int(sel))
-        return self._view.read_indices(self._keys, sel.tolist())
+            return _stack_fields(self._view.read_many(self._keys, int(sel)))
+        return _stack_fields(self._view.read_indices(self._keys, sel.tolist()))
 
 
 class SurrogateDataset(Dataset):
@@ -141,6 +149,8 @@ class SurrogateDataset(Dataset):
 
     def _set_normalization_from_view(self, name: str, view: "DatasetView", key: str) -> bool:
         stats = view.statistics([key])
+        if isinstance(stats, dict):
+            stats = stats.get(key)
         if stats is None:
             return False
         count, mean, squared_deviation = stats
@@ -194,8 +204,8 @@ class ModuleSurrogateDataset(SurrogateDataset):
             raise
 
         try:
-            if "primal" not in data.keys or "primal" not in cond.keys:
-                raise ValueError("Module surrogate data must contain a 'primal' dataset.")
+            if data.keys != ("primal",) or cond.keys != ("primal",):
+                raise ValueError("Module surrogate data must contain a single 'primal' dataset.")
             data_shape = data.shape("primal")
             cond_shape = cond.shape("primal")
             if not data_shape or not cond_shape:
@@ -241,8 +251,11 @@ class ModuleSurrogateDataset(SurrogateDataset):
             x_values = self._data.read("primal", selection)
             c_values = self._cond.read("primal", selection)
         else:
-            x_values = self._data.read_indices(["primal"], indices)[:, 0]
-            c_values = self._cond.read_indices(["primal"], indices)[:, 0]
+            x_values = self._data.read_indices(["primal"], indices)
+            c_values = self._cond.read_indices(["primal"], indices)
+            if isinstance(x_values, TensorDict):
+                x_values = x_values["primal"]
+                c_values = c_values["primal"]
         x = torch.as_tensor(x_values, dtype=torch.float32)
         c = torch.as_tensor(c_values, dtype=torch.float32)
         return list(zip(self.normalize("x", x), self.normalize("c", c), strict=True))
@@ -327,6 +340,8 @@ class WorkflowSurrogateDataset(SurrogateDataset):
             self.fit_normalization({"y": RowSubset(self._records, self._keys, row_indices)})
             return
         stored = self._records.statistics(self._keys)
+        if isinstance(stored, dict):
+            stored = _stack_statistics(list(stored.values()))
         if stored is not None:
             self.set_normalization_stats("y", *stored)
             return
@@ -357,7 +372,7 @@ class WorkflowSurrogateDataset(SurrogateDataset):
             else self._records.read_indices(self._keys, indices)
         )
         y = torch.as_tensor(
-            values,
+            _stack_fields(values),
             dtype=torch.float32,
         )
         design_indices = torch.as_tensor(indices) // self._n

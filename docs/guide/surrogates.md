@@ -184,6 +184,10 @@ The contract tells the surrogate:
 - `output_conditional_fn` — how to build the additional conditioning tensor (e.g. particle type, sampled energies) that the model is trained on; defaults to the design values. Designs containing non-numeric parameters require an explicit implementation.
 - `data_file` / `conditional_file` — where training data comes from and where predictions are written. Both are required to train the surrogate.
 
+!!! warning "Tensor inputs for training"
+
+    Write a sample-first tensor with `HDF5File.write(path, tensor)` for the contract's data and conditioning files. A tensor shaped `(N, D)` provides `N` training samples with event shape `(D,)`. `LazyShape` and `ModuleSurrogateDataset` do not currently support TensorDict inputs. [TensorDict storage](io.md#tensordict-storage) is available for workflow I/O, but requires a custom training adapter for module surrogates.
+
 The module's `patch()` method attaches the surrogate and returns the module, so it composes with the workflow DSL:
 
 ```python
