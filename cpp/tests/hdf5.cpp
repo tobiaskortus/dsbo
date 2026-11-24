@@ -3,11 +3,13 @@
 
 #include <dsbo/hdf5.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <future>
 #include <limits>
+#include <list>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -19,6 +21,8 @@
 namespace io = dsbo::io;
 namespace fs = std::filesystem;
 using dsbo::test::TestDirectory;
+using dsbo::test::same_bytes;
+using dsbo::test::same_values;
 
 io::DType double_dtype_from_separate_cpp_file();
 io::Statistics double_statistics_from_separate_cpp_file(io::ArrayView value);
@@ -103,8 +107,10 @@ static void create_hdf5_files_with_links_and_cycles(const std::string& path) {
                                                H5P_DEFAULT, H5P_DEFAULT),
                             "Cannot create test external group link");
         io::internal::check(H5Lcreate_external((path + ".missing.h5").c_str(), "/", file, "dangling_external",
-                                               H5P_DEFAULT, H5P_DEFAULT),
-                            "Cannot create test dangling external link");
+                                                H5P_DEFAULT, H5P_DEFAULT),
+                             "Cannot create test dangling external link");
+        io::internal::check(H5Lcreate_soft("/external_dataset", file, "soft_external", H5P_DEFAULT, H5P_DEFAULT),
+                             "Cannot create test indirect external link");
     }
 }
 
@@ -161,8 +167,8 @@ static void check_statistics(const std::vector<double>& values, double mean, dou
             const auto shape = matrix ? io::Shape{width} : io::Shape{};
             CHECK(stats->mean.shape == shape);
             CHECK(stats->squared_deviation.shape == shape);
-            const auto means = stats->mean.values<double>();
-            const auto deviations = stats->squared_deviation.values<double>();
+            const auto* means = stats->mean.data<double>();
+            const auto* deviations = stats->squared_deviation.data<double>();
             for (std::size_t column = 0; column < width; ++column) {
                 const double expected_mean = column ? -mean : mean;
                 const bool mean_matches = squared_deviation == 0
@@ -185,6 +191,412 @@ static std::string create_rectangular_file(TestDirectory& directory, const std::
     return path;
 }
 
+template<class Buffer, class = void> struct HasTypedWrite : std::false_type {};
+template<class Buffer>
+struct HasTypedWrite<Buffer, std::void_t<decltype(io::write_primal(
+    std::declval<const std::string&>(), std::declval<const Buffer&>()))>> : std::true_type {};
+
+struct DataOnlyBuffer { const double* data() const; };
+
+static_assert(HasTypedWrite<std::array<double, 4>>::value);
+static_assert(HasTypedWrite<double[4]>::value);
+static_assert(!HasTypedWrite<std::vector<bool>>::value);
+static_assert(!HasTypedWrite<std::vector<long double>>::value);
+static_assert(!HasTypedWrite<std::list<double>>::value);
+static_assert(!HasTypedWrite<DataOnlyBuffer>::value);
+static_assert(!std::is_copy_constructible_v<io::internal::ArrayStorage>);
+static_assert(std::is_nothrow_move_constructible_v<io::Array>);
+static_assert(std::is_nothrow_move_assignable_v<io::Array>);
+
+template<class T>
+static void check_typed_array_data(io::internal::Initialization initialization) {
+    io::Array array(io::dtype<T>(), {2, 3}, initialization);
+    CHECK(array.nbytes() == 6 * sizeof(T));
+    auto* data = array.template data<T>();
+    if (initialization == io::internal::Initialization::zero)
+        for (std::size_t i = 0; i < array.size(); ++i) CHECK(data[i] == T(0));
+    for (std::size_t i = 0; i < array.size(); ++i) data[i] = T(i + 1);
+    const auto& constant = array;
+    static_assert(std::is_same_v<decltype(array.template data<T>()), T*>);
+    static_assert(std::is_same_v<decltype(constant.template data<T>()), const T*>);
+    static_assert(std::is_same_v<decltype(array.data()), unsigned char*>);
+    static_assert(std::is_same_v<decltype(constant.data()), const unsigned char*>);
+    CHECK(static_cast<const void*>(data) == static_cast<const void*>(array.data()));
+    CHECK(reinterpret_cast<std::uintptr_t>(data) % alignof(T) == 0);
+    CHECK(constant.template data<T>() == data);
+    CHECK(data[5] == T(6));
+    data[4] = T(9);
+    CHECK(constant.template data<T>()[4] == T(9));
+
+    auto copy = array;
+    CHECK(same_bytes(copy, array));
+    CHECK(copy.template data<T>() != data);
+    copy.template data<T>()[0] = T(7);
+    CHECK(data[0] == T(1));
+    const auto* copied_data = copy.template data<T>();
+    auto moved = std::move(copy);
+    CHECK(moved.template data<T>() == copied_data);
+    CHECK(moved.template data<T>()[0] == T(7));
+    CHECK(copy.nbytes() == 0);
+    CHECK(copy.data() == nullptr);
+    array = moved;
+    CHECK(same_bytes(array, moved));
+    CHECK(array.template data<T>() != moved.template data<T>());
+    array = std::move(moved);
+    CHECK(array.template data<T>() == copied_data);
+    CHECK(moved.nbytes() == 0);
+    CHECK(moved.data() == nullptr);
+
+    auto& self = array;
+    const auto expected = array;
+    array = self;
+    CHECK(same_bytes(array, expected));
+    const auto* assigned_data = array.template data<T>();
+    array = std::move(self);
+    CHECK(array.template data<T>() == assigned_data);
+    CHECK(same_bytes(array, expected));
+
+    io::Array empty(io::dtype<T>(), {0, 3}, initialization);
+    CHECK_NOTHROW(empty.template data<T>());
+    CHECK(empty.shape == io::Shape{0, 3});
+    const auto empty_copy = empty;
+    CHECK(empty_copy.template data<T>() == nullptr);
+    CHECK(empty_copy.nbytes() == 0);
+    io::Array scalar(io::dtype<T>(), {}, initialization);
+    scalar.template data<T>()[0] = T(3);
+    CHECK(std::as_const(scalar).template data<T>()[0] == T(3));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "namespace-io/read-write-and-typed-access") {
+    TestDirectory directory;
+    const auto primal_path = directory("primal.h5");
+    const auto gradient_path = directory("gradient.h5");
+    const std::vector<double> values{1, 2, 3, 4};
+    const std::vector<double> derivatives{5, 6, 7, 8};
+
+    io::write_primal(primal_path, values, {2, 2});
+    const auto primal = io::open_primal(primal_path);
+    CHECK(primal.shape == io::Shape{2, 2});
+    CHECK(primal.data<double>()[3] == 4);
+    CHECK(io::columns(primal_path).empty());
+    CHECK(io::shape_from_path(primal_path) == primal.shape);
+    CHECK_FALSE(io::open_primal_tangent(primal_path).second.has_value());
+
+    io::write_primal_tangent(primal_path, values, derivatives, {2, 2});
+    const auto [dual_primal, tangent] = io::open_primal_tangent(primal_path);
+    CHECK(dual_primal.data<double>()[0] == 1);
+    REQUIRE(tangent.has_value());
+    CHECK(tangent->shape == primal.shape);
+    CHECK(tangent->data<double>()[3] == 8);
+
+    io::write_gradient(gradient_path, derivatives, {2, 2});
+    CHECK(io::load_gradient(gradient_path).data<double>()[0] == 5);
+    const auto adjoint = io::load_backward_gradient(primal_path, gradient_path);
+    CHECK(adjoint.shape == primal.shape);
+    CHECK(adjoint.data<double>()[3] == 8);
+    CHECK_THROWS_AS(primal.data<float>(), io::TypeError);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "namespace-io/keyed-read-selection-and-validation") {
+    TestDirectory directory;
+    const auto primal_path = directory("primal.h5");
+    const auto gradient_path = directory("gradient.h5");
+    const std::vector<double> absorber{2, 3};
+    const std::vector<float> gap{4, 5};
+    const auto selected = std::vector<std::string>{"gap", "absorber"};
+    const io::NamedArrays fields{io::field("absorber", absorber), io::field("gap", gap)};
+
+    io::write_primal(primal_path, fields);
+    CHECK(io::columns(primal_path) == std::vector<std::string>{"absorber", "gap"});
+    const auto shapes = io::dict_shape_from_path(primal_path);
+    REQUIRE(shapes.size() == 2);
+    CHECK(shapes[0].first == "absorber");
+    CHECK(shapes[0].second == io::Shape{2});
+    CHECK(shapes[1].first == "gap");
+    CHECK(shapes[1].second == io::Shape{2});
+    const auto primals = io::open_dict(primal_path);
+    CHECK(io::at(primals, "absorber").data<double>()[1] == 3);
+    CHECK(io::at(primals, "gap").data<float>()[1] == 5);
+    CHECK(io::open_dict(primal_path, selected)[0].first == "gap");
+    CHECK_FALSE(io::open_dict_tangent(primal_path).second.has_value());
+    CHECK_THROWS_AS(io::open_dict(primal_path, std::vector<std::string>{"missing"}), io::KeyError);
+    CHECK_THROWS_AS(io::open_primal(primal_path), std::invalid_argument);
+
+    io::write_primal_tangent(primal_path, fields, {io::field("gap", gap)});
+    const auto [dual_primals, tangents] = io::open_dict_tangent(primal_path, selected);
+    CHECK(dual_primals[0].first == "gap");
+    REQUIRE(tangents.has_value());
+    REQUIRE(tangents->size() == 1);
+    CHECK(io::at(*tangents, "gap").data<float>()[0] == 4);
+
+    io::write_gradient(gradient_path, fields);
+    CHECK(io::load_dict_gradient(gradient_path).size() == 2);
+    CHECK(io::load_dict_gradient(gradient_path, selected)[0].first == "gap");
+    const auto adjoints = io::load_backward_dict_gradient(primal_path, gradient_path);
+    CHECK(io::at(adjoints, "absorber").data<double>()[0] == 2);
+    CHECK(io::at(adjoints, "gap").data<float>()[1] == 5);
+    io::write_gradient(gradient_path, {io::field("gap", gap, {1, 2})});
+    CHECK_THROWS_AS(io::load_backward_dict_gradient(primal_path, gradient_path), std::invalid_argument);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "array-data/typed-storage-and-ownership") {
+    for (auto initialization : {io::internal::Initialization::zero, io::internal::Initialization::uninitialized}) {
+        CAPTURE(initialization == io::internal::Initialization::zero);
+        check_typed_array_data<float>(initialization);
+        check_typed_array_data<double>(initialization);
+        check_typed_array_data<std::int8_t>(initialization);
+        check_typed_array_data<std::uint8_t>(initialization);
+        check_typed_array_data<std::int16_t>(initialization);
+        check_typed_array_data<std::uint16_t>(initialization);
+        check_typed_array_data<std::int32_t>(initialization);
+        check_typed_array_data<std::uint32_t>(initialization);
+        check_typed_array_data<std::int64_t>(initialization);
+        check_typed_array_data<std::uint64_t>(initialization);
+    }
+
+    for (const auto type : {io::dtype<bool>(), io::DType{io::Kind::floating, 2}}) {
+        io::Array zeroed(type, {3});
+        const auto* bytes = zeroed.data();
+        for (std::size_t i = 0; i < zeroed.nbytes(); ++i) CHECK(bytes[i] == 0);
+        io::Array overwritten(type, {3}, io::internal::Initialization::uninitialized);
+        std::memset(overwritten.data(), 0x42, overwritten.nbytes());
+        auto copy = overwritten;
+        CHECK(same_bytes(copy, overwritten));
+        CHECK(copy.data() != overwritten.data());
+        auto assigned = io::Array::from<double>({1}, {});
+        assigned = overwritten;
+        CHECK(same_bytes(assigned, overwritten));
+        CHECK(assigned.data() != overwritten.data());
+    }
+
+    auto array = io::Array::from<double>({1, 2}, {2});
+    CHECK_THROWS_AS(array.data<float>(), io::TypeError);
+    CHECK_THROWS_AS(std::as_const(array).data<std::int64_t>(), io::TypeError);
+    array.type = io::dtype<std::int64_t>();
+    CHECK_THROWS_AS(array.data<std::int64_t>(), io::TypeError);
+    const auto retagged_copy = array;
+    CHECK(same_bytes(retagged_copy, array));
+    CHECK_THROWS_AS(retagged_copy.data<std::int64_t>(), io::TypeError);
+    array.type = io::dtype<double>();
+    array.shape = {3};
+    CHECK_THROWS(array.data<double>());
+    const auto reshaped_copy = array;
+    CHECK(reshaped_copy.nbytes() == 2 * sizeof(double));
+    CHECK(same_bytes(reshaped_copy, array));
+    CHECK_THROWS_AS(reshaped_copy.data<double>(), io::TypeError);
+
+    const auto integers = io::Array::from<std::int64_t>({1, 2}, {2});
+    using OtherInteger = std::conditional_t<std::is_same_v<std::int64_t, long>, long long, long>;
+    if constexpr (sizeof(OtherInteger) == sizeof(std::int64_t))
+        CHECK_THROWS_AS(integers.data<OtherInteger>(), io::TypeError);
+
+    const auto boolean = io::Array::from<bool>({true, false}, {2});
+    CHECK_THROWS_AS(boolean.data<bool>(), io::TypeError);
+    CHECK(same_values(boolean, std::vector<bool>{true, false}));
+    const auto boolean_bytes = io::convert(boolean.view(), io::dtype<std::uint8_t>());
+    CHECK(boolean_bytes.data<std::uint8_t>()[0] == 1);
+    CHECK(boolean_bytes.data<std::uint8_t>()[1] == 0);
+
+    auto special = io::Array::from<double>({0, -0.0}, {2});
+    const std::uint64_t nan_payload = UINT64_C(0x7ff8000000000042);
+    std::memcpy(special.data(), &nan_payload, sizeof(nan_payload));
+    const auto special_copy = special;
+    CHECK(same_bytes(special_copy, special));
+    CHECK(std::signbit(special_copy.data<double>()[1]));
+
+    auto assigned = io::Array::from<std::uint8_t>({1}, {});
+    assigned = special;
+    CHECK(same_bytes(assigned, special));
+    CHECK(assigned.data<double>() != special.data<double>());
+    const auto* assigned_data = assigned.data<double>();
+    auto moved = io::Array::from<float>({1}, {});
+    moved = std::move(assigned);
+    CHECK(same_bytes(moved, special));
+    CHECK(moved.data<double>() == assigned_data);
+    CHECK(assigned.nbytes() == 0);
+    CHECK(assigned.data() == nullptr);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "array-data/allocation-rejects-byte-overflow") {
+    for (const auto type : {io::dtype<double>(), io::DType{io::Kind::floating, 2}}) {
+        const auto count = std::numeric_limits<std::size_t>::max() / type.size + 1;
+        CHECK_THROWS_AS(io::Array(type, {count}), std::overflow_error);
+    }
+    CHECK_THROWS_AS(io::Array(io::DType{io::Kind::floating, 0}, {0}), std::overflow_error);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "array-data/nd-hdf5-read-and-write") {
+    TestDirectory directory;
+    const std::vector<double> values{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    const auto path = directory("nd.h5");
+    io::write_primal(path, values, {2, 2, 3});
+    auto array = io::HDF5Storage::open_primal(path);
+    REQUIRE(array.shape == io::Shape{2, 2, 3});
+    auto* data = array.data<double>();
+    for (std::size_t i = 0; i < 2; ++i)
+        for (std::size_t j = 0; j < 2; ++j)
+            for (std::size_t k = 0; k < 3; ++k) {
+                const auto offset = (i * array.shape[1] + j) * array.shape[2] + k;
+                CHECK(data[offset] == values[offset]);
+            }
+    data[(1 * 2 + 0) * 3 + 2] = 42;
+    io::write_primal(directory("modified.h5"), array);
+    const auto modified = io::HDF5Storage::open_primal(directory("modified.h5"));
+    CHECK(modified.shape == array.shape);
+    CHECK(modified.data<double>()[8] == 42);
+    CHECK(modified.data<double>()[0] == 0);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "typed-writes/borrow-containers-and-preserve-dtypes") {
+    TestDirectory directory;
+    const std::vector<double> values{1.0000000000000002, -2.25, 3.5, 4.0};
+    const int rows = 2;
+    const std::size_t columns = 2;
+    const auto view = io::view_of(values, {rows, columns});
+    CHECK(view.data == values.data());
+    CHECK(view.type == io::dtype<double>());
+    CHECK(view.shape == io::Shape{2, 2});
+    io::write_primal(directory("double.h5"), values, {rows, columns});
+    const auto result = io::HDF5Storage::open_primal(directory("double.h5"));
+    CHECK(result.type == io::dtype<double>());
+    CHECK(result.shape == view.shape);
+    CHECK(same_values(result, values));
+
+    const std::array<float, 3> floats{{1.0f, 2.5f, -3.0f}};
+    io::write_primal(directory("float.h5"), floats);
+    CHECK(io::HDF5Storage::open_primal(directory("float.h5")).type == io::dtype<float>());
+    const std::uint64_t integers[]{0, (std::uint64_t(1) << 63) + 1, UINT64_MAX};
+    io::write_primal(directory("integer.h5"), integers);
+    const auto integer_result = io::HDF5Storage::open_primal(directory("integer.h5"));
+    CHECK(integer_result.type == io::dtype<std::uint64_t>());
+    CHECK(same_values(integer_result, std::vector<std::uint64_t>(integers, integers + 3)));
+
+    const bool flags[]{true, false, true};
+    io::write_primal(directory("bool.h5"), flags);
+    const auto bool_result = io::HDF5Storage::open_primal(directory("bool.h5"));
+    CHECK(bool_result.type == io::dtype<bool>());
+    CHECK(same_values(bool_result, std::vector<bool>{true, false, true}));
+
+    io::write_primal(directory("pointer.h5"), values.data() + 1, 2, {1, 2});
+    CHECK(same_values(io::HDF5Storage::open_primal(directory("pointer.h5")),
+                     std::vector<double>{-2.25, 3.5}));
+    io::write_primal(directory("inferred-pointer.h5"), values.data(), values.size());
+    CHECK(io::HDF5Storage::shape_from_path(directory("inferred-pointer.h5")) == io::Shape{4});
+
+    const io::Shape dynamic_shape{2, 2};
+    CHECK(io::view_of(values, dynamic_shape).shape == dynamic_shape);
+    CHECK(io::field("matrix", values, dynamic_shape).second.shape == dynamic_shape);
+    io::write_primal(directory("owned.h5"), result);
+    CHECK(same_values(io::HDF5Storage::open_primal(directory("owned.h5")), values));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "typed-writes/scalars-empty-and-invalid-shapes") {
+    TestDirectory directory;
+    const std::array<double, 1> scalar{{3.5}};
+    io::write_primal(directory("scalar.h5"), scalar, {});
+    CHECK(io::HDF5Storage::shape_from_path(directory("scalar.h5")).empty());
+    io::write_gradient(directory("scalar-gradient.h5"), scalar, {});
+    CHECK(io::HDF5Storage::load_gradient(directory("scalar-gradient.h5")).shape.empty());
+
+    const std::vector<double> empty;
+    io::write_primal(directory("empty.h5"), empty);
+    CHECK(io::HDF5Storage::shape_from_path(directory("empty.h5")) == io::Shape{0});
+    io::write_primal(directory("empty-matrix.h5"), empty, {0, 3});
+    CHECK(io::HDF5Storage::shape_from_path(directory("empty-matrix.h5")) == io::Shape{0, 3});
+    io::write_primal(directory("empty-pointer.h5"), static_cast<const float*>(nullptr), 0);
+    CHECK(io::HDF5Storage::open_primal(directory("empty-pointer.h5")).nbytes() == 0);
+
+    const auto invalid_path = directory("invalid.h5");
+    CHECK_THROWS_AS(io::write_primal(invalid_path, scalar, {2}), std::invalid_argument);
+    CHECK_THROWS_AS(io::write_primal(invalid_path, scalar, {0}), std::invalid_argument);
+    const double c_array[]{1, 2};
+    CHECK_THROWS_AS(io::view_of(c_array, {3}), std::invalid_argument);
+    CHECK_THROWS_AS(io::view_of(c_array, {}), std::invalid_argument);
+    CHECK_THROWS_AS(io::write_primal(invalid_path, c_array, {3}), std::invalid_argument);
+    CHECK_THROWS_AS(io::write_primal(invalid_path, c_array, {}), std::invalid_argument);
+    CHECK_THROWS_AS(io::write_gradient(invalid_path, c_array, {3}), std::invalid_argument);
+    CHECK_THROWS_AS(io::write_gradient(invalid_path, c_array, {}), std::invalid_argument);
+    CHECK_THROWS_AS(io::field("c-array", c_array, {3}), std::invalid_argument);
+    CHECK_THROWS_AS(io::field("c-array", c_array, {}), std::invalid_argument);
+    CHECK_THROWS_AS(io::write_primal(invalid_path, scalar, {H5S_UNLIMITED}), std::invalid_argument);
+    const io::Shape unlimited_shape{H5S_UNLIMITED};
+    CHECK_THROWS_AS(io::write_primal(invalid_path, scalar, unlimited_shape), std::invalid_argument);
+    const auto maximum = std::numeric_limits<std::size_t>::max() / 2;
+    const io::Shape overflow_shape{maximum, maximum};
+    CHECK_THROWS_AS(io::write_primal(invalid_path, scalar, overflow_shape), std::overflow_error);
+    CHECK_FALSE(fs::exists(invalid_path));
+
+    const double c_scalar[]{3.5};
+    CHECK(io::view_of(c_scalar, {}).shape.empty());
+    CHECK(io::field("scalar", c_scalar, {}).second.shape.empty());
+    io::write_primal(directory("c-scalar.h5"), c_scalar, {});
+    CHECK(io::HDF5Storage::shape_from_path(directory("c-scalar.h5")).empty());
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "typed-writes/heterogeneous-fields-tangents-and-gradients") {
+    TestDirectory directory;
+    const std::vector<double> energy{1.0000000000000002, -2.25};
+    const std::array<float, 4> position{{1, 2, 3, 4}};
+    const std::int32_t labels[]{1, 2};
+    auto energy_view = io::view_of(energy);
+    const auto* shape_data = energy_view.shape.data();
+    const auto energy_field = io::field("energy", std::move(energy_view));
+    CHECK(energy_field.second.data == energy.data());
+    CHECK(energy_field.second.shape.data() == shape_data);
+    const auto path = directory("fields.h5");
+    io::write_primal(path, {
+        energy_field,
+        io::field("position", position, {2, 2}),
+        io::field("label", labels),
+    });
+    const auto result = io::HDF5Storage::open_dict(path);
+    REQUIRE(result.size() == 3);
+    CHECK(result[0].first == "energy");
+    CHECK(result[1].first == "position");
+    CHECK(result[2].first == "label");
+    CHECK(io::at(result, "energy").type == io::dtype<double>());
+    CHECK(same_values(io::at(result, "energy"), energy));
+    CHECK(io::at(result, "position").type == io::dtype<float>());
+    CHECK(io::at(result, "position").shape == io::Shape{2, 2});
+    CHECK(io::at(result, "label").type == io::dtype<std::int32_t>());
+
+    io::write_primal_tangent(directory("flat-tangent.h5"), energy, energy, {1, 2});
+    const auto flat_tangent = io::HDF5Storage::open_primal_tangent(directory("flat-tangent.h5"));
+    REQUIRE(flat_tangent.second.has_value());
+    CHECK(flat_tangent.first.type == io::dtype<double>());
+    CHECK(flat_tangent.second->shape == io::Shape{1, 2});
+    io::write_primal_tangent(directory("inferred-tangent.h5"), energy, energy);
+    io::write_primal_tangent(directory("pointer-tangent.h5"), energy.data(), energy.data(), energy.size());
+    io::write_primal_tangent(directory("pointer-tangent.h5"), energy.data(), energy.data(), energy.size(), {1, 2});
+    const auto pointer_tangent = io::HDF5Storage::open_primal_tangent(directory("pointer-tangent.h5"));
+    REQUIRE(pointer_tangent.second.has_value());
+    CHECK(same_values(*pointer_tangent.second, energy));
+    CHECK(pointer_tangent.second->shape == io::Shape{1, 2});
+
+    io::write_primal_tangent(path,
+        {io::field("energy", energy), io::field("position", position, {2, 2})},
+        {io::field("energy", energy)});
+    const auto named_tangent = io::HDF5Storage::open_dict_tangent(path);
+    REQUIRE(named_tangent.second.has_value());
+    CHECK(same_values(io::at(*named_tangent.second, "energy"), energy));
+
+    const auto gradient_path = directory("gradient.h5");
+    io::write_gradient(gradient_path, {io::field("energy", energy)});
+    io::write_gradient(gradient_path, {io::field("position", position, {2, 2})}, true);
+    const auto gradients = io::HDF5Storage::load_dict_gradient(gradient_path);
+    CHECK(io::at(gradients, "energy").type == io::dtype<double>());
+    CHECK(io::at(gradients, "position").type == io::dtype<float>());
+
+    io::write_gradient(gradient_path, energy, {1, 2});
+    CHECK(io::HDF5Storage::load_gradient(gradient_path).shape == io::Shape{1, 2});
+    io::write_gradient(gradient_path, energy);
+    io::write_gradient(gradient_path, energy.data(), energy.size());
+    io::write_gradient(gradient_path, energy.data(), energy.size(), {1, 2});
+    CHECK(same_values(io::HDF5Storage::load_gradient(gradient_path), energy));
+    CHECK(io::field("prefix", io::view_of(energy.data(), 1)).second.size() == 1);
+    CHECK(io::field("matrix", io::view_of(position.data(), position.size(), {2, 2})).second.data == position.data());
+}
+
 TEST_CASE_FIXTURE(Hdf5Fixture, "dataspace/scalar-and-empty") {
     TestDirectory directory;
     const auto path = directory("dataspace.h5");
@@ -197,11 +609,11 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "dataspace/scalar-and-empty") {
     }
     io::Reader reader(path);
     CHECK(reader.shape("scalar").empty());
-    CHECK(reader.read("scalar").values<double>() == scalar.values<double>());
-    CHECK(reader.read("scalar", {0, 1, 1, true}).values<double>() == scalar.values<double>());
-    CHECK(reader.read_indices("scalar", {0}).values<double>() == scalar.values<double>());
+    CHECK(reader.read("scalar").data<double>()[0] == scalar.data<double>()[0]);
+    CHECK(reader.read("scalar", {0, 1, 1, true}).data<double>()[0] == scalar.data<double>()[0]);
+    CHECK(reader.read_indices("scalar", {0}).data<double>()[0] == scalar.data<double>()[0]);
     CHECK(reader.shape("empty") == empty.shape);
-    CHECK(reader.read("empty").storage.empty());
+    CHECK(reader.read("empty").nbytes() == 0);
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "dataspace/null-rejected") {
@@ -270,7 +682,7 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "reader/lists-datasets-inside-file-without-duplic
     CHECK(reader.keys("nested") == std::vector<std::string>({"nested/a_values"}));
     CHECK(reader.keys("/nested") == std::vector<std::string>({"/nested/a_values"}));
     CHECK(reader.keys("empty").empty());
-    CHECK(reader.read("a_group/a_values").storage == io::Array::from<double>({1, 2, 3}, {3}).storage);
+    CHECK(same_bytes(reader.read("a_group/a_values"), io::Array::from<double>({1, 2, 3}, {3})));
     auto file = io::internal::open_file(path);
     CHECK(io::internal::dataset_paths(file) == std::vector<std::string>({"a_group/a_values", "a_primal"}));
     CHECK(io::internal::dataset_paths(file, "/nested") == std::vector<std::string>({"/nested/a_values"}));
@@ -282,15 +694,25 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "discovery/named-reads-resolve-soft-links") {
     const auto path = directory("discovery.h5");
     create_hdf5_files_with_links_and_cycles(path);
     io::Reader reader(path);
-    CHECK(reader.read("soft_dataset").storage == io::Array::from<double>({1, 2, 3}, {3}).storage);
+    CHECK(same_bytes(reader.read("soft_dataset"), io::Array::from<double>({1, 2, 3}, {3})));
 }
 
-TEST_CASE_FIXTURE(Hdf5Fixture, "discovery/named-reads-resolve-external-links") {
+TEST_CASE_FIXTURE(Hdf5Fixture, "discovery/external-links-are-unsupported") {
     TestDirectory directory;
     const auto path = directory("discovery.h5");
     create_hdf5_files_with_links_and_cycles(path);
     io::Reader reader(path);
-    CHECK(reader.read("external_dataset").storage == io::Array::from<double>({1, 2, 3}, {3}).storage);
+    for (const auto* name : {"external_dataset", "external_group/values", "soft_external", "dangling_external"}) {
+        CAPTURE(name);
+        expect_invalid_argument([&] { reader.read(name); }, "External HDF5 links", "not supported");
+        expect_invalid_argument([&] { reader.read(name, {0, 1, 1, false}); }, "External HDF5 links");
+        expect_invalid_argument([&] { reader.read_indices(name, {0}); }, "External HDF5 links");
+        expect_invalid_argument([&] { reader.shape(name); }, "External HDF5 links");
+        expect_invalid_argument([&] { reader.type(name); }, "External HDF5 links");
+    }
+    expect_invalid_argument([&] { reader.keys("external_group"); }, "External HDF5 links");
+    expect_invalid_argument([&] { reader.columns("external_group"); }, "External HDF5 links");
+    CHECK(same_values(reader.read_indices("primal", {2, 0}), std::vector<double>{3, 1}));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "attributes/missing-optional") {
@@ -356,18 +778,27 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/combine-preserves-scalar-vector-and-e
         };
         const io::Statistics first{2, array(2), array(2)};
         const io::Statistics second{1, array(8), array(0)};
-        const auto combined = io::combine_statistics({first, second});
+        const std::vector<std::optional<io::Statistics>> batches{first, second};
+        const auto combined = io::combine_statistics(batches);
         REQUIRE(combined.has_value());
         CHECK(combined->count == 3);
         CHECK(combined->mean.shape == shape);
         CHECK(combined->squared_deviation.shape == shape);
-        CHECK(combined->mean.values<double>() == array(4).values<double>());
-        CHECK(combined->squared_deviation.values<double>() == array(26).values<double>());
+        CHECK(same_bytes(combined->mean, array(4)));
+        CHECK(same_bytes(combined->squared_deviation, array(26)));
+        CHECK(same_bytes(batches[0]->mean, first.mean));
+        CHECK(same_bytes(batches[0]->squared_deviation, first.squared_deviation));
+        CHECK(same_bytes(batches[1]->mean, second.mean));
+        CHECK(same_bytes(batches[1]->squared_deviation, second.squared_deviation));
+        if (combined->mean.size()) {
+            CHECK(combined->mean.data<double>() != batches[0]->mean.data<double>());
+            CHECK(combined->squared_deviation.data<double>() != batches[0]->squared_deviation.data<double>());
+        }
         const auto single = io::combine_statistics({first});
         REQUIRE(single.has_value());
         CHECK(single->count == first.count);
-        CHECK(single->mean.storage == first.mean.storage);
-        CHECK(single->squared_deviation.storage == first.squared_deviation.storage);
+        CHECK(same_bytes(single->mean, first.mean));
+        CHECK(same_bytes(single->squared_deviation, first.squared_deviation));
     }
 }
 
@@ -439,15 +870,15 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/accuracy/non-finite") {
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/float32-unaligned-input-accuracy") {
     const auto values = io::Array::from<float>({1e8f, -1e8f, 1, -1, -1e8f, 1e8f}, {3, 2});
-    std::vector<unsigned char> bytes(values.storage.size() + 1);
-    std::memcpy(bytes.data() + 1, values.storage.data(), values.storage.size());
+    std::vector<unsigned char> bytes(values.nbytes() + 1);
+    std::memcpy(bytes.data() + 1, values.data(), values.nbytes());
     const auto original = bytes;
     const auto stats = io::statistics({values.type, values.shape, bytes.data() + 1});
     REQUIRE(stats.has_value());
     CHECK(stats->count == 3);
     CHECK(stats->mean.shape == io::Shape{2});
-    const auto means = stats->mean.values<double>();
-    const auto deviations = stats->squared_deviation.values<double>();
+    const auto* means = stats->mean.data<double>();
+    const auto* deviations = stats->squared_deviation.data<double>();
     CHECK(close_enough(means[0], 1.0 / 3));
     CHECK(close_enough(means[1], -1.0 / 3));
     CHECK(close_enough(deviations[0], 2e16));
@@ -466,8 +897,8 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/chunked-conversion-preserves-sample-o
     REQUIRE(actual.has_value());
     CHECK(actual->count == expected->count);
     CHECK(actual->mean.shape == expected->mean.shape);
-    CHECK(actual->mean.storage == expected->mean.storage);
-    CHECK(actual->squared_deviation.storage == expected->squared_deviation.storage);
+    CHECK(same_bytes(actual->mean, expected->mean));
+    CHECK(same_bytes(actual->squared_deviation, expected->squared_deviation));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/basic-mean-and-squared-deviation") {
@@ -491,8 +922,8 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/partition-sum-overflow-cance
     for (std::size_t workers : {1, 2, 3, 4}) {
         const auto stats = io::statistics(array.view(), {workers});
         REQUIRE(stats.has_value());
-        CHECK(stats->mean.values<double>()[0] == 0);
-        CHECK(stats->squared_deviation.values<double>()[0] == std::numeric_limits<double>::infinity());
+        CHECK(stats->mean.data<double>()[0] == 0);
+        CHECK(stats->squared_deviation.data<double>()[0] == std::numeric_limits<double>::infinity());
     }
 }
 
@@ -504,7 +935,7 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/partitions-with-uneven-sizes
         for (std::size_t i = 0; i < samples.size(); ++i)
             samples[i] = 16 + (static_cast<int>((i * 17 + i / width) % 101) - 50) / 8.0;
         const auto array = io::Array::from(samples, shape);
-        const auto original = array.storage;
+        const auto original = array;
         for (const std::size_t workers : {4, 7}) {
             CAPTURE(workers);
             const auto serial = io::statistics(array.view(), {1});
@@ -514,18 +945,19 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/partitions-with-uneven-sizes
             CHECK(parallel->count == shape[0]);
             CHECK(parallel->mean.shape == serial->mean.shape);
             CHECK(parallel->squared_deviation.shape == serial->squared_deviation.shape);
-            const auto means = parallel->mean.values<double>(), expected_means = serial->mean.values<double>();
-            const auto moments = parallel->squared_deviation.values<double>();
-            const auto expected_moments = serial->squared_deviation.values<double>();
+            const auto* means = parallel->mean.data<double>();
+            const auto* expected_means = serial->mean.data<double>();
+            const auto* moments = parallel->squared_deviation.data<double>();
+            const auto* expected_moments = serial->squared_deviation.data<double>();
             for (std::size_t column = 0; column < width; ++column) {
                 CHECK(std::abs(means[column] - expected_means[column]) <= 8e-15 * std::abs(expected_means[column]));
                 CHECK(std::abs(moments[column] - expected_moments[column]) <= 8e-15 * expected_moments[column]);
             }
             const auto repeated = io::statistics(array.view(), {workers});
             REQUIRE(repeated.has_value());
-            CHECK(repeated->mean.storage == parallel->mean.storage);
-            CHECK(repeated->squared_deviation.storage == parallel->squared_deviation.storage);
-            CHECK(array.storage == original);
+            CHECK(same_bytes(repeated->mean, parallel->mean));
+            CHECK(same_bytes(repeated->squared_deviation, parallel->squared_deviation));
+            CHECK(same_bytes(array, original));
         }
     }
 }
@@ -540,11 +972,11 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/conversion-and-unaligned-inp
         CAPTURE(type.size);
         auto array = io::convert(source.view(), type);
         if (type.kind == io::Kind::boolean)
-            for (std::size_t i = 0; i < array.storage.size(); ++i)
-                array.storage[i] = i % 3 ? 255 : 0;
+            for (std::size_t i = 0; i < array.nbytes(); ++i)
+                array.data()[i] = i % 3 ? 255 : 0;
         const auto converted = io::convert(array.view(), io::dtype<double>());
-        std::vector<unsigned char> bytes(array.storage.size() + 1);
-        std::memcpy(bytes.data() + 1, array.storage.data(), array.storage.size());
+        std::vector<unsigned char> bytes(array.nbytes() + 1);
+        std::memcpy(bytes.data() + 1, array.data(), array.nbytes());
         const auto original = bytes;
         for (const std::size_t workers : {4, 7}) {
             const auto expected = io::statistics(converted.view(), {workers});
@@ -553,8 +985,8 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/conversion-and-unaligned-inp
             REQUIRE(actual.has_value());
             CHECK(actual->count == expected->count);
             CHECK(actual->mean.shape == expected->mean.shape);
-            CHECK(actual->mean.storage == expected->mean.storage);
-            CHECK(actual->squared_deviation.storage == expected->squared_deviation.storage);
+            CHECK(same_bytes(actual->mean, expected->mean));
+            CHECK(same_bytes(actual->squared_deviation, expected->squared_deviation));
             CHECK(bytes == original);
         }
     }
@@ -577,8 +1009,8 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/numerical-edge-cases") {
             const auto stats = io::statistics(array.view(), {4});
             REQUIRE(stats.has_value());
             CHECK(stats->count == samples.size());
-            const auto means = stats->mean.values<double>();
-            const auto moments = stats->squared_deviation.values<double>();
+            const auto* means = stats->mean.data<double>();
+            const auto* moments = stats->squared_deviation.data<double>();
             for (std::size_t column = 0; column < width; ++column) {
                 const double expected_mean = column % 2 ? -mean : mean;
                 CHECK(close_enough(means[column], expected_mean));
@@ -616,16 +1048,16 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/empty-singleton-and-null-dat
     CHECK(empty->count == 7);
     CHECK(empty->mean.shape == io::Shape{0});
     CHECK(empty->squared_deviation.shape == io::Shape{0});
-    CHECK(empty->mean.storage.empty());
-    CHECK(empty->squared_deviation.storage.empty());
+    CHECK(empty->mean.nbytes() == 0);
+    CHECK(empty->squared_deviation.nbytes() == 0);
     for (const auto& shape : {io::Shape{1}, io::Shape{1, 1}}) {
         const auto array = io::Array::from<double>({7}, shape);
         const auto stats = io::statistics(array.view(), options);
         REQUIRE(stats.has_value());
         CHECK(stats->count == 1);
         CHECK(stats->mean.shape == (shape.size() == 1 ? io::Shape{} : io::Shape{1}));
-        CHECK(stats->mean.values<double>() == std::vector<double>{7});
-        CHECK(stats->squared_deviation.values<double>() == std::vector<double>{0});
+        CHECK(stats->mean.data<double>()[0] == 7);
+        CHECK(stats->squared_deviation.data<double>()[0] == 0);
     }
     const auto array = io::Array::from<double>({1, 2, 3}, {3});
     CHECK_THROWS_AS(io::statistics({io::dtype<double>(), {7, 2}, nullptr}, options), std::invalid_argument);
@@ -639,8 +1071,8 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "statistics/parallel/unsupported-dtype-error-and-
     const auto valid = io::Array::from<double>({1, 2, 3, 4}, {4});
     const auto stats = io::statistics(valid.view(), {4});
     REQUIRE(stats.has_value());
-    CHECK(stats->mean.values<double>() == std::vector<double>{2.5});
-    CHECK(stats->squared_deviation.values<double>() == std::vector<double>{5});
+    CHECK(stats->mean.data<double>()[0] == 2.5);
+    CHECK(stats->squared_deviation.data<double>()[0] == 5);
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "convert/unsupported-widths-rejected") {
@@ -666,8 +1098,44 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "headers/double-dtype-works-across-cpp-files") {
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "convert/boolean-truth") {
     const auto truth = io::Array::from<std::int64_t>({-1, 0, 256}, {3});
-    CHECK(io::convert(truth.view(), io::dtype<bool>()).values<bool>() ==
-          std::vector<bool>({true, false, true}));
+    CHECK(same_values(io::convert(truth.view(), io::dtype<bool>()),
+                     std::vector<bool>({true, false, true})));
+    const auto floating = io::Array::from<double>(
+        {-0.0, std::numeric_limits<double>::denorm_min(), -2.5,
+         std::numeric_limits<double>::quiet_NaN()}, {2, 2});
+    CHECK(same_values(io::convert(floating.view(), io::dtype<bool>()),
+                     std::vector<bool>({false, true, true, true})));
+    const io::Array empty(io::dtype<double>(), {0, 2});
+    const auto empty_truth = io::convert(empty.view(), io::dtype<bool>());
+    CHECK(empty_truth.shape == empty.shape);
+    CHECK(empty_truth.nbytes() == 0);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "arrays/stack-preserves-exact-dtypes-and-borrowed-buffers") {
+    const auto large = (std::uint64_t(1) << 53) + 1;
+    const auto integers = io::Array::from<std::uint64_t>({large, large + 2}, {2});
+    const auto stacked = io::internal::stack({integers.view(), integers.view()});
+    CHECK(stacked.type == io::dtype<std::uint64_t>());
+    CHECK(stacked.shape == io::Shape{2, 2});
+    CHECK(same_values(stacked, std::vector<std::uint64_t>{large, large + 2, large, large + 2}));
+
+    const auto floats = io::Array::from<double>({0.5, 1.5}, {2});
+    const auto small_ints = io::Array::from<std::int32_t>({1, 2}, {2});
+    const auto mixed = io::internal::stack({small_ints.view(), floats.view()});
+    CHECK(mixed.type == io::dtype<double>());
+    CHECK(same_values(mixed, std::vector<double>{1, 2, 0.5, 1.5}));
+    std::vector<unsigned char> unaligned(floats.nbytes() + 1);
+    std::memcpy(unaligned.data() + 1, floats.data(), floats.nbytes());
+    const io::ArrayView borrowed{io::dtype<double>(), {2}, unaligned.data() + 1};
+    CHECK(same_values(io::internal::stack({borrowed, floats.view()}),
+                     std::vector<double>{0.5, 1.5, 0.5, 1.5}));
+
+    const io::Array empty(io::dtype<double>(), {0, 2});
+    const auto empty_stack = io::internal::stack({empty.view(), empty.view()});
+    CHECK(empty_stack.shape == io::Shape{2, 0, 2});
+    CHECK(empty_stack.nbytes() == 0);
+    const io::ArrayView missing{io::dtype<double>(), {2}, nullptr};
+    CHECK_THROWS_AS(io::internal::stack({missing, floats.view()}), std::invalid_argument);
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "dict/per-key-shapes-dtypes-and-order") {
@@ -682,15 +1150,15 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "dict/per-key-shapes-dtypes-and-order") {
     CHECK(loaded[1].first == "floats");
     CHECK(loaded[0].second.type == ints.type);
     CHECK(loaded[0].second.shape == ints.shape);
-    CHECK(loaded[0].second.storage == ints.storage);
+    CHECK(same_bytes(loaded[0].second, ints));
     CHECK(loaded[1].second.type == floats.type);
     CHECK(loaded[1].second.shape == floats.shape);
-    CHECK(loaded[1].second.storage == floats.storage);
+    CHECK(same_bytes(loaded[1].second, floats));
     const auto subset = io::HDF5Storage::open_dict(path, std::vector<std::string>{"floats"});
     REQUIRE(subset.size() == 1);
     CHECK(subset[0].first == "floats");
-    CHECK(subset[0].second.storage == floats.storage);
-    CHECK(io::at(loaded, "ints").storage == ints.storage);
+    CHECK(same_bytes(subset[0].second, floats));
+    CHECK(same_bytes(io::at(loaded, "ints"), ints));
     CHECK_THROWS_AS(io::at(loaded, "missing"), io::KeyError);
     const auto shapes = io::HDF5Storage::dict_shape_from_path(path);
     REQUIRE(shapes.size() == 2);
@@ -711,7 +1179,7 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "dict/tangents-preserve-key-subsets") {
     REQUIRE(tangent.has_value());
     REQUIRE(tangent->size() == 1);
     CHECK((*tangent)[0].first == "ints");
-    CHECK((*tangent)[0].second.storage == ints.storage);
+    CHECK(same_bytes((*tangent)[0].second, ints));
     const auto subset = io::HDF5Storage::open_dict_tangent(path, std::vector<std::string>{"floats"});
     REQUIRE(subset.first.size() == 1);
     CHECK(subset.first[0].first == "floats");
@@ -733,7 +1201,7 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/dict-preserves-zero-values-and-dtype") 
     const auto backward = io::HDF5Storage::load_backward_dict_gradient(primal_path, gradient_path);
     REQUIRE(backward.size() == 1);
     CHECK(backward[0].first == "ints");
-    CHECK(backward[0].second.values<float>() == std::vector<float>({0, 0, 0, 0}));
+    CHECK(same_values(backward[0].second, std::vector<float>({0, 0, 0, 0})));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/dict-rejects-incompatible-shapes-and-unknown-keys") {
@@ -766,18 +1234,18 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/dict-aggregation-and-key-replacement") 
     CHECK(sum[0].first == "a");
     CHECK(sum[1].first == "b");
     CHECK(sum[0].second.type == io::dtype<double>());
-    CHECK(sum[0].second.values<double>() == std::vector<double>({2, 3}));
+    CHECK(same_values(sum[0].second, std::vector<double>({2, 3})));
     CHECK(sum[1].second.type == io::dtype<std::int32_t>());
-    CHECK(sum[1].second.values<std::int32_t>() == std::vector<std::int32_t>({3, 4, 5}));
+    CHECK(same_values(sum[1].second, std::vector<std::int32_t>({3, 4, 5})));
     const auto replacement = io::Array::from<float>({9, 10}, {2});
     io::HDF5Storage::write_gradient(sum_path, io::NamedArrays{{"a", replacement.view()}}, true);
     const auto merged = io::HDF5Storage::load_dict_gradient(sum_path);
     REQUIRE(merged.size() == 2);
     CHECK(merged[0].first == "a");
     CHECK(merged[0].second.type == io::dtype<float>());
-    CHECK(merged[0].second.values<float>() == std::vector<float>({9, 10}));
+    CHECK(same_values(merged[0].second, std::vector<float>({9, 10})));
     CHECK(merged[1].first == "b");
-    CHECK(merged[1].second.values<std::int32_t>() == std::vector<std::int32_t>({3, 4, 5}));
+    CHECK(same_values(merged[1].second, std::vector<std::int32_t>({3, 4, 5})));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/dict-concatenates-each-key-independently") {
@@ -795,9 +1263,9 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/dict-concatenates-each-key-independently"
     const auto loaded = io::HDF5Storage::open_dict(target);
     REQUIRE(loaded.size() == 2);
     CHECK(loaded[0].first == "a");
-    CHECK(loaded[0].second.values<float>() == std::vector<float>({1, 2, 3}));
+    CHECK(same_values(loaded[0].second, std::vector<float>({1, 2, 3})));
     CHECK(loaded[1].first == "b");
-    CHECK(loaded[1].second.values<std::int32_t>() == std::vector<std::int32_t>({10, 20, 30, 40, 50}));
+    CHECK(same_values(loaded[1].second, std::vector<std::int32_t>({10, 20, 30, 40, 50})));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/dict-rejects-incompatible-dtypes") {
@@ -825,7 +1293,7 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/scalar-dict-vds-and-adjoint") {
     REQUIRE(loaded.size() == 1);
     CHECK(loaded[0].first == "value");
     CHECK(loaded[0].second.shape == io::Shape({2}));
-    CHECK(loaded[0].second.values<double>() == std::vector<double>({1.5, 1.5}));
+    CHECK(same_values(loaded[0].second, std::vector<double>({1.5, 1.5})));
     const auto gradient = io::Array::from<double>({2, 3}, {2});
     io::HDF5Storage::write_gradient(gradient_path, io::NamedArrays{{"value", gradient.view()}});
     const auto contributions = io::HDF5Storage::gradient_file_contributions(target, gradient_path);
@@ -835,7 +1303,7 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/scalar-dict-vds-and-adjoint") {
         const auto& values = std::get<io::NamedArrayValues>(contributions[i].source);
         REQUIRE(values.size() == 1);
         CHECK(values[0].second.shape.empty());
-        CHECK(values[0].second.values<double>() == std::vector<double>({2.0 + i}));
+        CHECK(values[0].second.data<double>()[0] == 2.0 + i);
     }
 }
 
@@ -886,8 +1354,8 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "headers/conversion-and-statistics-work-across-cp
     const auto values = io::Array::from<double>({1, 2, 3, 4, 5, 6}, {3, 2});
     const auto stats = double_statistics_from_separate_cpp_file(values.view());
     CHECK(stats.count == 3);
-    CHECK(stats.mean.values<double>() == std::vector<double>({3, 4}));
-    CHECK(stats.squared_deviation.values<double>() == std::vector<double>({8, 8}));
+    CHECK(same_values(stats.mean, std::vector<double>({3, 4})));
+    CHECK(same_values(stats.squared_deviation, std::vector<double>({8, 8})));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "io/primal-tangent-round-trip") {
@@ -896,23 +1364,87 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "io/primal-tangent-round-trip") {
     const auto values = io::Array::from<double>({1, 2, 3, 4, 5, 6}, {3, 2});
     io::HDF5Storage::write_primal_tangent(path, values.view(), values.view());
     const auto [primal, tangent] = io::HDF5Storage::open_primal_tangent(path);
-    CHECK(primal.storage == values.storage);
+    CHECK(same_bytes(primal, values));
     REQUIRE(tangent.has_value());
-    CHECK(tangent->storage == values.storage);
+    CHECK(same_bytes(*tangent, values));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "io/reverse-hyperslab") {
     TestDirectory directory;
     io::Reader reader(create_rectangular_file(directory));
-    CHECK(reader.read("primal", {2, -1, 3, false}).values<double>() ==
-          std::vector<double>({5, 6, 3, 4, 1, 2}));
+    CHECK(same_values(reader.read("primal", {2, -1, 3, false}),
+                     std::vector<double>({5, 6, 3, 4, 1, 2})));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "io/strided-row-selections") {
+    TestDirectory directory;
+    io::Reader reader(create_rectangular_file(directory));
+    CHECK(same_values(reader.read("primal", {0, 2, 2, false}),
+                     std::vector<double>({1, 2, 5, 6})));
+    CHECK(same_values(reader.read("primal", {2, -1, 2, false}),
+                     std::vector<double>({5, 6, 3, 4})));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "io/indexed-rows-preserve-order-and-duplicates") {
     TestDirectory directory;
     io::Reader reader(create_rectangular_file(directory));
-    CHECK(reader.read_indices("primal", {2, 0, 2, -2}).values<double>() ==
-          std::vector<double>({5, 6, 1, 2, 5, 6, 3, 4}));
+    CHECK(same_values(reader.read_indices("primal", {2, 0, 2, -2}),
+                     std::vector<double>({5, 6, 1, 2, 5, 6, 3, 4})));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "io/indexed-rows-unique-unsorted-and-empty") {
+    TestDirectory directory;
+    io::Reader reader(create_rectangular_file(directory));
+    CHECK(same_values(reader.read_indices("primal", {2, 0, 1}),
+                     std::vector<double>({5, 6, 1, 2, 3, 4})));
+    CHECK(same_values(reader.read_indices("primal", {1}),
+                     std::vector<double>({3, 4})));
+    CHECK(reader.read_indices("primal", {}).size() == 0);
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "io/indexed-rows-sorted-unique-fallback") {
+    TestDirectory directory;
+    const auto path = directory("bool.h5");
+    std::array<bool, 40> flags{};
+    for (std::size_t i = 0; i < flags.size(); ++i) flags[i] = (i % 2) == 0;
+    io::write_primal(path, flags);
+    io::Reader reader(path);
+
+    const std::vector<std::int64_t> even{0, 2, 4, 6, 8, 10, 12, 14, 16, 18,
+                                         20, 22, 24, 26, 28, 30, 32, 34, 36, 38};
+    CHECK(same_values(reader.read_indices("primal", even), std::vector<bool>(20, true)));
+
+    const std::vector<std::int64_t> odd{1, 3, 5, 7, 9, 11, 13, 15, 17, 19,
+                                        21, 23, 25, 27, 29, 31, 33, 35, 37, 39};
+    CHECK(same_values(reader.read_indices("primal", odd), std::vector<bool>(20, false)));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "io/indexed-rows-rank-one-and-rank-three") {
+    TestDirectory directory;
+    const auto vector_path = directory("vector.h5");
+    const auto vector_values = io::Array::from<double>({10, 20, 30, 40}, {4});
+    io::HDF5Storage::write_primal(vector_path, vector_values.view());
+    io::Reader vector_reader(vector_path);
+    CHECK(same_values(vector_reader.read_indices("primal", {2, 0, 3}),
+                     std::vector<double>({30, 10, 40})));
+    CHECK(same_values(vector_reader.read_indices("primal", {1, 1, 0}),
+                     std::vector<double>({20, 20, 10})));
+
+    const auto cube_path = directory("cube.h5");
+    std::vector<double> values(24);
+    for (std::size_t i = 0; i < values.size(); ++i) values[i] = static_cast<double>(i);
+    const auto cube_values = io::Array::from(values, {4, 3, 2});
+    io::HDF5Storage::write_primal(cube_path, cube_values.view());
+    io::Reader cube_reader(cube_path);
+    CHECK(same_values(cube_reader.read_indices("primal", {3, 0, 2, 1}),
+                     std::vector<double>({18, 19, 20, 21, 22, 23,
+                                          0, 1, 2, 3, 4, 5,
+                                          12, 13, 14, 15, 16, 17,
+                                          6, 7, 8, 9, 10, 11})));
+    CHECK(same_values(cube_reader.read_indices("primal", {2, -1, 2}),
+                     std::vector<double>({12, 13, 14, 15, 16, 17,
+                                          18, 19, 20, 21, 22, 23,
+                                          12, 13, 14, 15, 16, 17})));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "io/persisted-statistics") {
@@ -921,7 +1453,7 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "io/persisted-statistics") {
     const auto stats = reader.statistics("primal");
     REQUIRE(stats.has_value());
     CHECK(stats->count == 3);
-    CHECK(stats->mean.values<double>() == std::vector<double>({3, 4}));
+    CHECK(same_values(stats->mean, std::vector<double>({3, 4})));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "io/reader-close-is-idempotent-and-rejects-access") {
@@ -938,6 +1470,9 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/vds-concatenation") {
     const auto target = directory("vds.h5");
     io::HDF5Storage::reduce({source, source}, target);
     CHECK(io::HDF5Storage::open_primal(target).shape == io::Shape({6, 2}));
+    io::Reader reader(target);
+    CHECK(same_values(reader.read_indices("primal", {5, 0, 3}), std::vector<double>{5, 6, 1, 2, 1, 2}));
+    CHECK(same_values(reader.read("primal", {4, -2, 3, false}), std::vector<double>{3, 4, 5, 6, 1, 2}));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/vds-statistics") {
@@ -982,7 +1517,7 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/missing-keys-omitted") {
     const auto backward = io::HDF5Storage::load_backward_dict_gradient(primal_path, gradient_path);
     REQUIRE(backward.size() == 1);
     CHECK(backward[0].first == "first");
-    CHECK(backward[0].second.values<float>() == std::vector<float>({7, 8, 9}));
+    CHECK(same_values(backward[0].second, std::vector<float>({7, 8, 9})));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/physical-source-contribution-is-a-file-path") {
@@ -1006,8 +1541,33 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "row-store/keys-and-promotion") {
     io::HDF5Storage::write_row_store(path, {{"feature/key", feature.view()}, {"energy", other.view()}});
     io::Reader rows(path);
     CHECK(rows.row_keys() == std::vector<std::string>({"feature/key", "energy"}));
-    CHECK(rows.read(io::row_store_dataset).values<double>() ==
-          std::vector<double>({1, 0.5, 2, 1.5, 3, 2.5}));
+    CHECK(same_values(rows.read(io::row_store_dataset),
+                     std::vector<double>({1, 0.5, 2, 1.5, 3, 2.5})));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "row-store/exact-dtype-packing-and-empty-buffers") {
+    TestDirectory directory;
+    const auto large = (std::uint64_t(1) << 53) + 1;
+    const std::uint64_t first[]{large, large + 2}, second[]{large + 4, large + 6};
+    const auto path = directory("exact-rows.h5");
+    io::HDF5Storage::write_row_store(path, {io::field("first", first), io::field("second", second)});
+    io::Reader reader(path);
+    const auto result = reader.read(io::row_store_dataset);
+    CHECK(result.type == io::dtype<std::uint64_t>());
+    CHECK(result.shape == io::Shape{2, 2});
+    CHECK(same_values(result, std::vector<std::uint64_t>{large, large + 4, large + 2, large + 6}));
+
+    const std::vector<float> empty;
+    const auto empty_path = directory("empty-rows.h5");
+    io::HDF5Storage::write_row_store(empty_path, {io::field("first", empty), io::field("second", empty)});
+    const auto empty_result = io::Reader(empty_path).read(io::row_store_dataset);
+    CHECK(empty_result.shape == io::Shape{0, 2});
+    CHECK(empty_result.type == io::dtype<float>());
+    CHECK(empty_result.nbytes() == 0);
+    const io::ArrayView missing{io::dtype<float>(), {2}, nullptr};
+    const auto invalid_path = directory("invalid-rows.h5");
+    CHECK_THROWS_AS(io::HDF5Storage::write_row_store(invalid_path, {{"missing", missing}}), std::invalid_argument);
+    CHECK_FALSE(fs::exists(invalid_path));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/scalar-vds") {
@@ -1017,7 +1577,22 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/scalar-vds") {
     const auto scalar = io::Array::from<double>({3.5}, {});
     io::HDF5Storage::write_primal(path, scalar.view());
     io::HDF5Storage::reduce({path, path}, target);
-    CHECK(io::HDF5Storage::open_primal(target).values<double>() == std::vector<double>({3.5, 3.5}));
+    CHECK(same_values(io::HDF5Storage::open_primal(target), std::vector<double>({3.5, 3.5})));
+}
+
+TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/vds-reader-mmap-skips-empty-partitions") {
+    TestDirectory directory;
+    const auto empty_source = directory("empty.h5");
+    const auto full_source = directory("full.h5");
+    const io::Array empty(io::dtype<double>(), {0, 2});
+    const auto values = io::Array::from<double>({1, 2, 3, 4}, {2, 2});
+    io::HDF5Storage::write_primal(empty_source, empty.view());
+    io::HDF5Storage::write_primal(full_source, values.view());
+    const auto target = directory("vds.h5");
+    io::HDF5Storage::reduce({empty_source, full_source}, target);
+    io::Reader reader(target);
+    CHECK(same_values(reader.read_indices("primal", {1, 0}), std::vector<double>{3, 4, 1, 2}));
+    CHECK(same_values(reader.read("primal"), std::vector<double>{1, 2, 3, 4}));
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "reduce/empty-vds") {
@@ -1040,9 +1615,9 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "gradient/integer-wrap") {
     io::HDF5Storage::write_gradient(maximum_path, maximum.view());
     io::HDF5Storage::write_gradient(one_path, one.view());
     io::HDF5Storage::aggregate_gradients({maximum_path, one_path}, sum_path);
-    const auto sum = io::HDF5Storage::load_gradient(sum_path).values<std::uint64_t>();
+    const auto sum = io::HDF5Storage::load_gradient(sum_path);
     REQUIRE(sum.size() == 1);
-    CHECK(sum[0] == 0);
+    CHECK(sum.data<std::uint64_t>()[0] == 0);
 }
 
 TEST_CASE_FIXTURE(Hdf5Fixture, "concurrency/parallel-file-io") {
@@ -1054,7 +1629,7 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "concurrency/parallel-file-io") {
             const auto path = directory("thread-" + std::to_string(i) + ".h5");
             for (int j = 0; j < 8; ++j) {
                 io::HDF5Storage::write_primal(path, values.view());
-                if (io::HDF5Storage::open_primal(path).storage != values.storage)
+                if (!same_bytes(io::HDF5Storage::open_primal(path), values))
                     throw std::runtime_error("Concurrent HDF5 calls returned different values");
             }
         }));

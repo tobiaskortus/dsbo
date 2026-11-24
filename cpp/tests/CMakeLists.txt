@@ -33,6 +33,11 @@ target_link_libraries(dsbo_environment_tests PRIVATE dsbo::io)
 add_test(NAME native_environment COMMAND dsbo_environment_tests)
 set_tests_properties(native_environment PROPERTIES TIMEOUT 30)
 
+add_executable(dsbo_reader_mapping_tests reader_mapping.cpp)
+target_link_libraries(dsbo_reader_mapping_tests PRIVATE dsbo::io)
+add_test(NAME native_reader_mapping COMMAND dsbo_reader_mapping_tests)
+set_tests_properties(native_reader_mapping PROPERTIES TIMEOUT 30)
+
 add_executable(dsbo_workflow_step_tests workflow_step.cpp)
 target_link_libraries(dsbo_workflow_step_tests PRIVATE dsbo::io)
 add_dependencies(dsbo_workflow_step_tests dsbo_native_step)
@@ -42,7 +47,7 @@ set_tests_properties(native_hdf5 native_copied_sdk native_workflow_backward PROP
 add_custom_target(check
   COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure -C "$<CONFIG>"
   DEPENDS dsbo_header_checks dsbo_native_tests dsbo_copied_sdk_tests
-          dsbo_environment_tests dsbo_workflow_step_tests dsbo_native_step
+          dsbo_environment_tests dsbo_reader_mapping_tests dsbo_workflow_step_tests dsbo_native_step
   WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
   USES_TERMINAL
   VERBATIM)

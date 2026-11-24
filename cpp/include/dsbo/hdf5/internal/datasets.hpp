@@ -75,9 +75,9 @@ inline void write_statistics(hid_t value, const Statistics& stats) {
 inline std::optional<Statistics> read_statistics(hid_t value) {
     if (H5Aexists(value, count_attribute) <= 0 || H5Aexists(value, mean_attribute) <= 0 || H5Aexists(value, deviation_attribute) <= 0)
         return std::nullopt;
-    const auto count = read_array_attribute(value, count_attribute, dtype<std::uint64_t>()).values<std::uint64_t>();
+    const auto count = read_array_attribute(value, count_attribute, dtype<std::uint64_t>());
     if (count.size() != 1) throw std::invalid_argument("Invalid HDF5 statistics count.");
-    Statistics result{count[0], read_array_attribute(value, mean_attribute, dtype<double>()),
+    Statistics result{count.data<std::uint64_t>()[0], read_array_attribute(value, mean_attribute, dtype<double>()),
                       read_array_attribute(value, deviation_attribute, dtype<double>())};
     validate_statistics(result);
     return result;
@@ -98,9 +98,18 @@ inline void create_dsbo_dataset(hid_t parent, const std::string& name, ArrayView
 }
 
 inline Array read_dataset(hid_t value) {
-    Array result(dataset_dtype(value), dataset_shape(value));
+    auto initialization = internal::Initialization::zero;
+    Handle properties(H5Dget_create_plist(value), H5Pclose);
+    const auto layout = H5Pget_layout(properties);
+    check(layout, "Cannot inspect HDF5 dataset layout.");
+    if (layout == H5D_CONTIGUOUS) {
+        H5D_space_status_t status;
+        check(H5Dget_space_status(value, &status), "Cannot inspect HDF5 dataset allocation.");
+        if (status == H5D_SPACE_STATUS_ALLOCATED) initialization = internal::Initialization::uninitialized;
+    }
+    Array result(dataset_dtype(value), dataset_shape(value), initialization);
     auto memory_type = datatype(result.type);
-    if (result.size()) check(H5Dread(value, memory_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, result.storage.data()), "Cannot read HDF5 dataset.");
+    if (result.size()) check(H5Dread(value, memory_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, result.data()), "Cannot read HDF5 dataset.");
     return result;
 }
 
@@ -115,7 +124,8 @@ inline std::vector<hsize_t> partition_sizes(hid_t value) {
         for (std::size_t i = 0; i < count; ++i) {
             Handle space(H5Pget_virtual_vspace(properties, i), H5Sclose);
             const auto rank = H5Sget_simple_extent_ndims(space);
-            Shape start(rank), end(rank);
+            Shape start(std::vector<hsize_t>(static_cast<std::size_t>(rank)));
+            Shape end(std::vector<hsize_t>(static_cast<std::size_t>(rank)));
             if (H5Sget_select_npoints(space) == 0) sizes.push_back(0);
             else {
                 check(H5Sget_select_bounds(space, start.data(), end.data()), "Cannot inspect virtual selection.");

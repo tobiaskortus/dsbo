@@ -15,9 +15,9 @@ namespace internal {
 
 inline Array copy(ArrayView value) {
     Array result(value.type, value.shape);
-    if (!result.storage.empty()) {
+    if (result.nbytes()) {
         if (!value.data) throw std::invalid_argument("Non-empty array has no data buffer.");
-        std::memcpy(result.storage.data(), value.data, result.storage.size());
+        std::memcpy(result.data(), value.data, result.nbytes());
     }
     return result;
 }
@@ -49,14 +49,17 @@ inline Array cast(ArrayView value, DType target) {
     if (value.type.kind == Kind::boolean) {
         auto normalized = copy(value);
         normalized.type = dtype<std::uint8_t>();
-        for (auto& byte : normalized.storage) byte = byte != 0;
+        auto* bytes = normalized.data();
+        for (std::size_t i = 0; i < normalized.nbytes(); ++i) bytes[i] = bytes[i] != 0;
         return cast(normalized.view(), target);
     }
     if (target.kind == Kind::boolean) {
-        const auto numbers = cast(value, dtype<double>()).values<double>();
+        const auto numbers = cast(value, dtype<double>());
+        const auto* data = numbers.data<double>();
         Array result(target, value.shape);
-        for (std::size_t i = 0; i < value.size(); ++i)
-            result.storage[i] = numbers[i] != 0;
+        auto* bytes = result.data();
+        const auto count = result.size();
+        for (std::size_t i = 0; i < count; ++i) bytes[i] = data[i] != 0;
         return result;
     }
     auto source_type = datatype(value.type);
@@ -67,7 +70,7 @@ inline Array cast(ArrayView value, DType target) {
         check(H5Tconvert(source_type, target_type, value.size(), buffer.data(), nullptr, H5P_DEFAULT), "Cannot convert numeric array dtype.");
     }
     Array result(target, value.shape);
-    if (!result.storage.empty()) std::memcpy(result.storage.data(), buffer.data(), result.storage.size());
+    if (result.nbytes()) std::memcpy(result.data(), buffer.data(), result.nbytes());
     return result;
 }
 
@@ -81,31 +84,44 @@ inline Array stack(const std::vector<ArrayView>& arrays) {
     Shape shape{static_cast<hsize_t>(arrays.size())};
     shape.insert(shape.end(), arrays.front().shape.begin(), arrays.front().shape.end());
     Array result(type, std::move(shape));
+    auto* output = result.data();
     std::size_t offset = 0;
     for (const auto& value : arrays) {
-        auto converted = cast(value, type);
-        if (!converted.storage.empty()) std::memcpy(result.storage.data() + offset, converted.storage.data(), converted.storage.size());
-        offset += converted.storage.size();
+        auto source = value;
+        std::optional<Array> converted;
+        if (source.type != type) {
+            converted = cast(source, type);
+            source = converted->view();
+        }
+        const auto bytes = source.nbytes();
+        if (bytes) {
+            if (!source.data) throw std::invalid_argument("Non-empty array has no data buffer.");
+            std::memcpy(output + offset, source.data, bytes);
+        }
+        offset += bytes;
     }
     return result;
 }
 
 template<class T> inline void add_values(Array& left, const Array& right) {
-    for (std::size_t i = 0; i < left.size(); ++i) {
+    auto* output = left.data();
+    const auto* input = right.data();
+    const auto count = left.size();
+    for (std::size_t i = 0; i < count; ++i) {
         T a, b;
-        std::memcpy(&a, left.storage.data() + i * sizeof(T), sizeof(T));
-        std::memcpy(&b, right.storage.data() + i * sizeof(T), sizeof(T));
+        std::memcpy(&a, output + i * sizeof(T), sizeof(T));
+        std::memcpy(&b, input + i * sizeof(T), sizeof(T));
         if constexpr (std::is_integral_v<T>) {
             using Unsigned = std::make_unsigned_t<T>;
             const auto sum = static_cast<Unsigned>(a) + static_cast<Unsigned>(b);
             a = static_cast<T>(sum);
         } else a += b;
-        std::memcpy(left.storage.data() + i * sizeof(T), &a, sizeof(T));
+        std::memcpy(output + i * sizeof(T), &a, sizeof(T));
     }
 }
 
 inline Shape broadcast_shape(const Shape& left, const Shape& right) {
-    Shape result(std::max(left.size(), right.size()), 1);
+    Shape result(std::vector<hsize_t>(std::max(left.size(), right.size()), 1));
     for (std::size_t i = 0; i < result.size(); ++i) {
         const auto a = i < left.size() ? left[left.size() - i - 1] : 1;
         const auto b = i < right.size() ? right[right.size() - i - 1] : 1;
@@ -119,7 +135,9 @@ inline Array broadcast(ArrayView value, const Shape& shape) {
     if (value.shape == shape) return copy(value);
     Array output(value.type, shape);
     const auto* bytes = static_cast<const unsigned char*>(value.data);
-    for (std::size_t i = 0; i < output.size(); ++i) {
+    auto* destination = output.data();
+    const auto count = output.size();
+    for (std::size_t i = 0; i < count; ++i) {
         std::size_t remaining = i, source = 0, stride = 1;
         for (std::size_t j = 0; j < shape.size(); ++j) {
             const auto coordinate = remaining % shape[shape.size() - j - 1];
@@ -130,7 +148,7 @@ inline Array broadcast(ArrayView value, const Shape& shape) {
                 stride *= width;
             }
         }
-        std::memcpy(output.storage.data() + i * value.type.size, bytes + source * value.type.size, value.type.size);
+        std::memcpy(destination + i * value.type.size, bytes + source * value.type.size, value.type.size);
     }
     return output;
 }
@@ -143,7 +161,10 @@ inline Array add(ArrayView left, ArrayView right) {
     if (result.shape != shape) result = broadcast(result.view(), shape);
     if (other.shape != shape) other = broadcast(other.view(), shape);
     if (type.kind == Kind::boolean) {
-        for (std::size_t i = 0; i < result.size(); ++i) result.storage[i] = result.storage[i] || other.storage[i];
+        auto* output = result.data();
+        const auto* input = other.data();
+        const auto count = result.size();
+        for (std::size_t i = 0; i < count; ++i) output[i] = output[i] || input[i];
     } else if (type.kind == Kind::signed_integer || type.kind == Kind::unsigned_integer) {
         switch (type.size) {
             case 1: add_values<std::uint8_t>(result, other); break;

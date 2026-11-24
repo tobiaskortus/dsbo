@@ -125,10 +125,18 @@ public:
             type = internal::promote(type, value.type);
         }
         Array combined(type, {static_cast<hsize_t>(rows), static_cast<hsize_t>(features.size())});
+        auto* output = combined.data();
         for (std::size_t column = 0; column < features.size(); ++column) {
-            const auto converted = internal::cast(features[column].second, type);
+            auto source = features[column].second;
+            std::optional<Array> converted;
+            if (source.type != type) {
+                converted = internal::cast(source, type);
+                source = converted->view();
+            }
+            if (rows && !source.data) throw std::invalid_argument("Non-empty array has no data buffer.");
+            const auto* bytes = static_cast<const unsigned char*>(source.data);
             for (std::size_t row = 0; row < rows; ++row)
-                std::memcpy(combined.storage.data() + (row * features.size() + column) * type.size, converted.storage.data() + row * type.size, type.size);
+                std::memcpy(output + (row * features.size() + column) * type.size, bytes + row * type.size, type.size);
         }
         auto file = internal::open_file(path, true);
         internal::set_string(file, store_attribute, "row");
@@ -648,7 +656,8 @@ private:
             stats.push_back(batch.stats);
             if (elements(batch.shape)) {
                 auto source_space = internal::dataspace(batch.shape);
-                Shape start(dimensions.size(), 0), selection = batch.shape.empty() ? Shape{1} : batch.shape;
+                Shape start(std::vector<hsize_t>(dimensions.size(), 0));
+                Shape selection = batch.shape.empty() ? Shape{1} : batch.shape;
                 start[0] = offset;
                 internal::check(H5Sselect_hyperslab(space, H5S_SELECT_SET, start.data(), nullptr, selection.data(), nullptr), "Cannot select virtual partition.");
                 internal::check(H5Pset_virtual(properties, space, input.relative_path.c_str(), name.c_str(), source_space), "Cannot map virtual HDF5 source.");
@@ -665,5 +674,141 @@ private:
         if (first.keys) internal::set_string(value, keys_attribute, internal::Json(*first.keys).dump());
     }
 };
+
+// Namespace-level reads preserve stored shapes and dtypes. Use Array::data<T>()
+// for checked, borrowed access; numeric conversion is explicit.
+inline Array open_primal(const std::string& path) {
+    return HDF5Storage::open_primal(path);
+}
+
+inline NamedArrayValues open_dict(const std::string& path, Columns columns = std::nullopt) {
+    return HDF5Storage::open_dict(path, std::move(columns));
+}
+
+inline std::pair<Array, std::optional<Array>> open_primal_tangent(const std::string& path) {
+    return HDF5Storage::open_primal_tangent(path);
+}
+
+inline std::pair<NamedArrayValues, std::optional<NamedArrayValues>> open_dict_tangent(
+    const std::string& path, Columns columns = std::nullopt) {
+    return HDF5Storage::open_dict_tangent(path, std::move(columns));
+}
+
+inline std::vector<std::string> columns(const std::string& path) {
+    return HDF5Storage::columns(path);
+}
+
+inline Shape shape_from_path(const std::string& path) {
+    return HDF5Storage::shape_from_path(path);
+}
+
+inline std::vector<std::pair<std::string, Shape>> dict_shape_from_path(const std::string& path) {
+    return HDF5Storage::dict_shape_from_path(path);
+}
+
+inline Array load_gradient(const std::string& path) {
+    return HDF5Storage::load_gradient(path);
+}
+
+inline NamedArrayValues load_dict_gradient(const std::string& path, Columns columns = std::nullopt) {
+    return HDF5Storage::load_dict_gradient(path, std::move(columns));
+}
+
+inline Array load_backward_gradient(const std::string& primal_path, const std::string& gradient_path) {
+    return HDF5Storage::load_backward_gradient(primal_path, gradient_path);
+}
+
+inline NamedArrayValues load_backward_dict_gradient(const std::string& primal_path, const std::string& gradient_path) {
+    return HDF5Storage::load_backward_dict_gradient(primal_path, gradient_path);
+}
+
+// Typed synchronous writes borrow existing memory and preserve each source
+// dtype. HDF5Storage also accepts low-level descriptors used by the bindings.
+template<class Buffer>
+auto write_primal(const std::string& path, const Buffer& values)
+    -> decltype(view_of(values), void()) {
+    HDF5Storage::write_primal(path, view_of(values));
+}
+
+template<class Buffer>
+auto write_primal(const std::string& path, const Buffer& values, Shape shape)
+    -> decltype(view_of(values, std::move(shape)), void()) {
+    HDF5Storage::write_primal(path, view_of(values, std::move(shape)));
+}
+
+template<class T, class Count>
+auto write_primal(const std::string& path, const T* values, Count count)
+    -> decltype(view_of(values, count), void()) {
+    HDF5Storage::write_primal(path, view_of(values, count));
+}
+
+template<class T, class Count>
+auto write_primal(const std::string& path, const T* values, Count count, Shape shape)
+    -> decltype(view_of(values, count, std::move(shape)), void()) {
+    HDF5Storage::write_primal(path, view_of(values, count, std::move(shape)));
+}
+
+inline void write_primal(const std::string& path, const NamedArrays& fields) {
+    HDF5Storage::write_primal(path, fields);
+}
+
+template<class Primal, class Tangent>
+auto write_primal_tangent(const std::string& path, const Primal& primal, const Tangent& tangent)
+    -> decltype(view_of(primal), view_of(tangent), void()) {
+    HDF5Storage::write_primal_tangent(path, view_of(primal), view_of(tangent));
+}
+
+template<class Primal, class Tangent>
+auto write_primal_tangent(const std::string& path, const Primal& primal, const Tangent& tangent,
+                         Shape shape)
+    -> decltype(view_of(primal, shape), view_of(tangent, shape), void()) {
+    HDF5Storage::write_primal_tangent(path, view_of(primal, shape), view_of(tangent, shape));
+}
+
+inline void write_primal_tangent(const std::string& path, const NamedArrays& primal, const NamedArrays& tangent) {
+    HDF5Storage::write_primal_tangent(path, primal, tangent);
+}
+
+template<class Primal, class Tangent, class Count>
+auto write_primal_tangent(const std::string& path, const Primal* primal, const Tangent* tangent, Count count)
+    -> decltype(view_of(primal, count), view_of(tangent, count), void()) {
+    HDF5Storage::write_primal_tangent(path, view_of(primal, count), view_of(tangent, count));
+}
+
+template<class Primal, class Tangent, class Count>
+auto write_primal_tangent(const std::string& path, const Primal* primal, const Tangent* tangent,
+                          Count count, Shape shape)
+    -> decltype(view_of(primal, count, shape), view_of(tangent, count, shape), void()) {
+    HDF5Storage::write_primal_tangent(path, view_of(primal, count, shape), view_of(tangent, count, shape));
+}
+
+template<class Buffer>
+auto write_gradient(const std::string& path, const Buffer& values)
+    -> decltype(view_of(values), void()) {
+    HDF5Storage::write_gradient(path, view_of(values));
+}
+
+template<class Buffer>
+auto write_gradient(const std::string& path, const Buffer& values, Shape shape)
+    -> decltype(view_of(values, std::move(shape)), void()) {
+    HDF5Storage::write_gradient(path, view_of(values, std::move(shape)));
+}
+
+template<class T, class Count>
+auto write_gradient(const std::string& path, const T* values, Count count)
+    -> decltype(view_of(values, count), void()) {
+    HDF5Storage::write_gradient(path, view_of(values, count));
+}
+
+template<class T, class Count>
+auto write_gradient(const std::string& path, const T* values, Count count,
+                    Shape shape)
+    -> decltype(view_of(values, count, std::move(shape)), void()) {
+    HDF5Storage::write_gradient(path, view_of(values, count, std::move(shape)));
+}
+
+inline void write_gradient(const std::string& path, const NamedArrays& fields, bool merge = false) {
+    HDF5Storage::write_gradient(path, fields, merge);
+}
 
 } // namespace dsbo::io

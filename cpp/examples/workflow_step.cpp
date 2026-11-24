@@ -1,14 +1,23 @@
-// A Python-free executable used both standalone and in the container example.
+// A Python-free float32 workflow step used standalone and in the container example.
 #include <dsbo/hdf5.hpp>
+
+#include <cstddef>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 
 namespace io = dsbo::io;
 
-static io::Array twice(io::ArrayView input) {
-    auto values = io::convert(input, io::dtype<double>()).values<double>();
-    for (auto& value : values) value *= 2;
-    const auto result = io::Array::from(values, input.shape);
-    return io::convert(result.view(), input.type);
+static io::NamedArrays twice(io::NamedArrayValues& values) {
+    io::NamedArrays fields;
+    fields.reserve(values.size());
+    for (auto& [key, array] : values) {
+        auto* data = array.data<float>();
+        const auto count = array.size();
+        for (std::size_t i = 0; i < count; ++i) data[i] *= 2;
+        fields.push_back(io::field(key, array));
+    }
+    return fields;
 }
 
 int main(int argc, char** argv) {
@@ -19,40 +28,41 @@ int main(int argc, char** argv) {
         io::Reader reader(input);
         if (mode == "forward") {
             if (!reader.columns("primal").empty()) {
-                auto [primal_values, tangent_values] = io::HDF5Storage::open_dict_tangent(input);
-                io::NamedArrayValues result_values;
-                for (const auto& [key, value] : primal_values) result_values.emplace_back(key, twice(value.view()));
-                io::NamedArrays result_views;
-                for (const auto& [key, value] : result_values) result_views.emplace_back(key, value.view());
-                if (tangent_values) {
-                    io::NamedArrayValues derivative_values;
-                    for (const auto& [key, value] : *tangent_values) derivative_values.emplace_back(key, twice(value.view()));
-                    io::NamedArrays derivative_views;
-                    for (const auto& [key, value] : derivative_values) derivative_views.emplace_back(key, value.view());
-                    io::HDF5Storage::write_primal_tangent(output, result_views, derivative_views);
-                } else io::HDF5Storage::write_primal(output, result_views);
-            } else {
-                auto [primal, tangent] = io::HDF5Storage::open_primal_tangent(input);
-                const auto result = twice(primal.view());
+                auto [primal, tangent] = io::open_dict_tangent(input);
+                const auto fields = twice(primal);
                 if (tangent) {
-                    const auto derivative = twice(tangent->view());
-                    io::HDF5Storage::write_primal_tangent(output, result.view(), derivative.view());
-                } else io::HDF5Storage::write_primal(output, result.view());
+                    io::write_primal_tangent(output, fields, twice(*tangent));
+                } else {
+                    io::write_primal(output, fields);
+                }
+            } else {
+                auto [primal, tangent] = io::open_primal_tangent(input);
+                auto* data = primal.data<float>();
+                const auto count = primal.size();
+                for (std::size_t i = 0; i < count; ++i) data[i] *= 2;
+                if (tangent) {
+                    auto* tangent_data = tangent->data<float>();
+                    const auto tangent_count = tangent->size();
+                    for (std::size_t i = 0; i < tangent_count; ++i) tangent_data[i] *= 2;
+                    io::write_primal_tangent(output, primal, *tangent);
+                } else {
+                    io::write_primal(output, primal);
+                }
             }
         } else if (mode == "backward") {
             if (!reader.columns("gradient").empty()) {
-                auto gradient_values = io::HDF5Storage::load_dict_gradient(input);
-                io::NamedArrayValues derivative_values;
-                for (const auto& [key, value] : gradient_values) derivative_values.emplace_back(key, twice(value.view()));
-                io::NamedArrays derivative_views;
-                for (const auto& [key, value] : derivative_values) derivative_views.emplace_back(key, value.view());
-                io::HDF5Storage::write_gradient(output, derivative_views);
+                auto gradient = io::load_dict_gradient(input);
+                io::write_gradient(output, twice(gradient));
             } else {
-                const auto gradient = io::HDF5Storage::load_gradient(input);
-                const auto derivative = twice(gradient.view());
-                io::HDF5Storage::write_gradient(output, derivative.view());
+                auto gradient = io::load_gradient(input);
+                auto* data = gradient.data<float>();
+                const auto count = gradient.size();
+                for (std::size_t i = 0; i < count; ++i) data[i] *= 2;
+                io::write_gradient(output, gradient);
             }
-        } else throw std::invalid_argument("Unknown native workflow mode: " + mode);
+        } else {
+            throw std::invalid_argument("Unknown native workflow mode: " + mode);
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

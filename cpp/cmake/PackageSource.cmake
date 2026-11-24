@@ -21,7 +21,7 @@ set(inputs
   cpp/cmake/BundledHDF5.cmake cpp/cmake/PackageSource.cmake
   cpp/examples/CMakeLists.txt cpp/examples/workflow_step.cpp
   cpp/tests/CMakeLists.txt cpp/tests/doctest.h cpp/tests/environment.cpp cpp/tests/hdf5.cpp
-  cpp/tests/header_linkage_check.cpp cpp/tests/test_support.hpp cpp/tests/workflow_step.cpp
+  cpp/tests/header_linkage_check.cpp cpp/tests/reader_mapping.cpp cpp/tests/test_support.hpp cpp/tests/workflow_step.cpp
   docs/guide/native_io.md)
 file(GLOB_RECURSE headers RELATIVE "${source_root}" "${source_root}/cpp/include/*.hpp")
 file(GLOB archives LIST_DIRECTORIES FALSE RELATIVE "${source_root}" "${source_root}/cpp/vendor/*.tar.gz")

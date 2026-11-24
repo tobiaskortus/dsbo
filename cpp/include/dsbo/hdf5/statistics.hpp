@@ -179,7 +179,7 @@ inline std::optional<Statistics> statistics(ArrayView value, StatisticsOptions o
             }
         } else {
             const auto converted = internal::cast({value.type, {count}, bytes + column * value.type.size}, dtype<double>());
-            std::memcpy(origins.data() + column, converted.storage.data(), count * sizeof(double));
+            std::memcpy(origins.data() + column, converted.data(), count * sizeof(double));
         }
         column += count;
     }
@@ -214,11 +214,12 @@ inline std::optional<Statistics> statistics(ArrayView value, StatisticsOptions o
                 const std::size_t count = std::min(row_step, row_end - first);
                 const auto converted = internal::cast(
                     {value.type, {count, width}, bytes + first * width * value.type.size}, dtype<double>());
+                const auto* data = converted.data();
                 for (std::size_t row = 0; row < count; ++row) {
                     const double weight = 1.0 / static_cast<double>(first - row_begin + row + 1);
                     for (std::size_t column = 0; column < width; ++column)
                         partition.columns[column].add(
-                            internal::load_statistic<double>(converted.storage.data() + (row * width + column) * sizeof(double)),
+                            internal::load_statistic<double>(data + (row * width + column) * sizeof(double)),
                             origins[column], weight);
                 }
                 first += count;
@@ -231,9 +232,10 @@ inline std::optional<Statistics> statistics(ArrayView value, StatisticsOptions o
                     const std::size_t count = std::min(conversion_elements, width - column);
                     const auto converted = internal::cast(
                         {value.type, {count}, bytes + (row * width + column) * value.type.size}, dtype<double>());
+                    const auto* data = converted.data();
                     for (std::size_t offset = 0; offset < count; ++offset)
                         partition.columns[column + offset].add(
-                            internal::load_statistic<double>(converted.storage.data() + offset * sizeof(double)),
+                            internal::load_statistic<double>(data + offset * sizeof(double)),
                             origins[column + offset], weight);
                 }
             }
@@ -289,22 +291,23 @@ inline std::optional<Statistics> combine_statistics(const std::vector<std::optio
     if (values.empty() || std::any_of(values.begin(), values.end(), [](const auto& value) { return !value; })) return std::nullopt;
     for (const auto& value : values) internal::validate_statistics(*value);
     auto result = *values.front();
-    auto mean = result.mean.values<double>(), deviation = result.squared_deviation.values<double>();
+    auto* mean = result.mean.data<double>();
+    auto* deviation = result.squared_deviation.data<double>();
+    const auto width = result.mean.size();
     for (std::size_t i = 1; i < values.size(); ++i) {
         const auto& batch = *values[i];
         if (batch.mean.shape != result.mean.shape) throw std::invalid_argument("Incompatible HDF5 statistics shapes.");
-        const auto batch_mean = batch.mean.values<double>(), batch_deviation = batch.squared_deviation.values<double>();
+        const auto* batch_mean = batch.mean.data<double>();
+        const auto* batch_deviation = batch.squared_deviation.data<double>();
         const auto total = result.count + batch.count;
         if (!total) return std::nullopt;
-        for (std::size_t j = 0; j < mean.size(); ++j) {
+        for (std::size_t j = 0; j < width; ++j) {
             const double delta = batch_mean[j] - mean[j];
             mean[j] += delta * static_cast<double>(batch.count) / total;
             deviation[j] += batch_deviation[j] + delta * delta * static_cast<double>(result.count) * batch.count / total;
         }
         result.count = total;
     }
-    result.mean = Array::from(mean, result.mean.shape);
-    result.squared_deviation = Array::from(deviation, result.squared_deviation.shape);
     return result;
 }
 

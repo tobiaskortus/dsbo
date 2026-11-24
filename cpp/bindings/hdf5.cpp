@@ -120,7 +120,7 @@ nb::object array(io::Array value) {
     nb::capsule lifetime(owner, [](void* pointer) noexcept { delete static_cast<io::Array*>(pointer); });
     std::vector<std::size_t> shape(owner->shape.begin(), owner->shape.end());
     nb::ndarray<nb::numpy> result(
-        owner->storage.data(), shape.size(), shape.data(), lifetime,
+        owner->data(), shape.size(), shape.data(), lifetime,
         nullptr, dlpack_dtype(owner->type));
     return nb::cast(result);
 }
@@ -131,12 +131,29 @@ nb::dict arrays(io::NamedArrayValues values) {
     return result;
 }
 
+nb::dict array_views(io::NamedArrayViews value) {
+    auto* owner = new io::NamedArrayViews(std::move(value));
+    nb::capsule lifetime(owner, [](void* pointer) noexcept { delete static_cast<io::NamedArrayViews*>(pointer); });
+    nb::dict result;
+    for (auto& [key, view] : owner->views) {
+        std::vector<std::size_t> shape(view.shape.begin(), view.shape.end());
+        nb::ndarray<nb::numpy> array(
+            const_cast<void*>(view.data), shape.size(), shape.data(), lifetime,
+            nullptr, dlpack_dtype(view.type));
+        result[nb::cast(key)] = nb::cast(array);
+    }
+    return result;
+}
+
 nb::object to_python(io::Array value) { return array(std::move(value)); }
 nb::object to_python(io::NamedArrayValues value) { return arrays(std::move(value)); }
-nb::object to_python(io::Shape value) { return nb::cast(std::move(value)); }
+nb::object to_python(io::Shape value) {
+    return nb::cast(std::vector<hsize_t>(std::move(value)));
+}
 nb::dict to_python(std::vector<std::pair<std::string, io::Shape>> values) {
     nb::dict result;
-    for (auto& [key, shape] : values) result[nb::cast(key)] = nb::cast(shape);
+    for (auto& [key, shape] : values)
+        result[nb::cast(key)] = nb::cast(std::vector<hsize_t>(std::move(shape)));
     return result;
 }
 
@@ -416,7 +433,9 @@ NB_MODULE(_hdf5, module) {
         .def("keys", &io::Reader::keys, nb::arg("root") = "", nb::call_guard<nb::gil_scoped_release>())
         .def("columns", &io::Reader::columns, nb::arg("name") = "primal", nb::call_guard<nb::gil_scoped_release>())
         .def("row_keys", &io::Reader::row_keys, nb::call_guard<nb::gil_scoped_release>())
-        .def("shape", &io::Reader::shape, nb::call_guard<nb::gil_scoped_release>())
+        .def("shape", [](io::Reader& reader, const std::string& name) {
+            return to_python(native([&] { return reader.shape(name); }));
+        }, nb::arg("name"))
         .def("dtype", [](io::Reader& reader, const std::string& name) {
             return numpy_dtype(native([&] { return reader.type(name); }));
         })
@@ -432,6 +451,10 @@ NB_MODULE(_hdf5, module) {
         }, nb::arg("name"), nb::arg("index") = nb::none())
         .def("read_indices", [](io::Reader& reader, const std::string& name, const std::vector<std::int64_t>& indices) {
             return array(native([&] { return reader.read_indices(name, indices); }));
+        })
+        .def("read_indices_many", [](io::Reader& reader, const std::vector<std::string>& names,
+                                     const std::vector<std::int64_t>& indices) {
+            return array_views(native([&] { return reader.read_indices_many(names, indices); }));
         })
         .def("close", &io::Reader::close, nb::call_guard<nb::gil_scoped_release>());
 }

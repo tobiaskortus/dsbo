@@ -14,6 +14,7 @@ from dsbo.utils.io.gradient import gradient_path
 from dsbo.utils.io.datasets import ModuleSurrogateDataset, WorkflowSurrogateDataset
 from dsbo.utils.io.storage.hdf5 import HDF5File, HDF5Writer
 from dsbo.utils.io.storage.utils import to_tensordict
+from dsbo.utils.io.workdir import Workdir
 
 
 @pytest.fixture(
@@ -75,6 +76,35 @@ def test_file_backend_backward_gradient(file_backend):
         assert os.path.exists(os.path.join(tempdir, f"x_gradient{extension}"))
         grad = backend.read_backward_gradient(file_path)
         torch.testing.assert_close(grad, 2.0 * primal)
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["flat", "keyed"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(np.array(1.0000000000000002, dtype=np.float64), id="float64-scalar"),
+        pytest.param(np.full((2, 3), 1.0000000000000002, dtype=np.float64), id="float64-matrix"),
+        pytest.param(np.array([[0.5, 1.5], [-2.0, 3.0]], dtype=np.float16), id="float16-matrix"),
+    ],
+)
+def test_file_backend_backward_gradient_preserves_dtype_and_shape(file_backend, value, keyed):
+    backend, extension = file_backend
+    with TemporaryDirectory() as tempdir, Workdir.create(tempdir, keep=True, error_if_exists=False):
+        file_path = os.path.join(tempdir, f"x{extension}")
+        stored = {"value": value} if keyed else value
+        backend.write(file_path, {"value": torch.from_numpy(value)} if keyed else torch.from_numpy(value))
+        backend.writer.write_gradient(gradient_path(file_path), stored)
+
+        gradient = backend.read_backward_gradient(file_path)
+
+        if keyed:
+            assert isinstance(gradient, TensorDict)
+            assert set(gradient.keys()) == {"value"}
+            gradient = gradient["value"]
+        assert isinstance(gradient, torch.Tensor)
+        assert gradient.shape == value.shape
+        assert gradient.numpy().dtype == value.dtype
+        np.testing.assert_array_equal(gradient.numpy(), value)
 
 
 @pytest.mark.parametrize("reversed_order", [False, True])

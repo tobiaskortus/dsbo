@@ -20,6 +20,10 @@ from setuptools.command.build_py import build_py
 from setuptools.errors import CompileError
 
 
+if sys.platform == "win32":
+    raise CompileError("dsbo currently supports Linux and macOS only. On Windows, use WSL2")
+
+
 ROOT = Path(__file__).resolve().parent
 INCLUDE = Path("cpp/include")
 
@@ -86,7 +90,7 @@ class BundledBuildExt(build_ext):
             subprocess.run([*build, "--target", "dsbo_check_hdf5", "_hdf5"], check=True)
             # Cross-builds cannot necessarily execute target binaries on the host.
             if os.environ.get("DSBO_CROSS_COMPILE") != "1":
-                probe = temporary / ("dsbo_check_hdf5.exe" if sys.platform == "win32" else "dsbo_check_hdf5")
+                probe = temporary / "dsbo_check_hdf5"
                 subprocess.run([str(probe)], check=True)
         except (OSError, subprocess.CalledProcessError) as error:
             raise CompileError(

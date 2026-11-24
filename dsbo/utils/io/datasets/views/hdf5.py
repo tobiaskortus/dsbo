@@ -49,7 +49,11 @@ class HDF5DatasetView(DatasetView):
 
     def read_indices(self, keys: list[str], indices: list[int]) -> TensorDict:
         from dsbo.utils.io.storage.utils import to_tensordict
-        return to_tensordict({key: torch.from_numpy(self._file.read_indices(key, indices)) for key in keys})
+        if len(keys) == 1:
+            arrays = {keys[0]: self._file.read_indices(keys[0], indices)}
+        else:
+            arrays = self._file.read_indices_many(keys, indices)
+        return to_tensordict(arrays)
 
     def partition_sizes(self, key: str) -> tuple[int, ...]:
         return tuple(self._file.partition_sizes(key))
@@ -125,7 +129,13 @@ class HDF5ColumnStoreDatasetView(ColumnStoreDatasetView):
 
     def read_indices(self, keys: list[str], indices: list[int]) -> TensorDict:
         from dsbo.utils.io.storage.utils import to_tensordict
-        return to_tensordict({key: torch.from_numpy(self._read_indices(key, indices)) for key in keys})
+        names = [f"{self._group_name}/{key}" for key in keys]
+        if len(keys) == 1:
+            arrays = {keys[0]: self._file.read_indices(names[0], indices)}
+        else:
+            raw = self._file.read_indices_many(names, indices)
+            arrays = {key: raw[name] for key, name in zip(keys, names)}
+        return to_tensordict(arrays)
 
     def _read_indices(self, key: str, indices: list[int]) -> np.ndarray:
         return self._file.read_indices(f"{self._group_name}/{key}", indices)

@@ -626,6 +626,52 @@ def test_lazy_slices_indices_and_close(tmp_path, store):
         view.read(keys[0], 0)
 
 
+def test_multi_read_preserves_variable_key_shapes(tmp_path):
+    path = tmp_path / "columns.h5"
+    values = np.arange(30, dtype=np.float64).reshape(6, 5)
+    W.write_primal(path, {"a": values[:, :2], "b": values[:, 2:4], "c": values[:, 4]})
+    keys = ["a", "b", "c"]
+    expected = {"a": values[:, :2], "b": values[:, 2:4], "c": values[:, 4]}
+    reader = _hdf5.Reader(os.fsdecode(path))
+    view = W.open_dataset(path)
+    try:
+        for indices in ([4, 1, 4, -1], [], [0, 2, 5]):
+            raw = reader.read_indices_many([f"primal/{key}" for key in keys], indices)
+            actual = view.read_indices(keys, indices)
+            for key in keys:
+                np.testing.assert_array_equal(raw[f"primal/{key}"], expected[key][indices])
+                assert raw[f"primal/{key}"].shape == expected[key][indices].shape
+                np.testing.assert_array_equal(actual[key].numpy(), expected[key][indices])
+                assert tuple(actual[key].shape) == expected[key][indices].shape
+    finally:
+        view.close()
+        reader.close()
+
+
+def test_multi_read_preserves_variable_dtypes_and_alignment(tmp_path):
+    path = tmp_path / "mixed.h5"
+    W.write_primal(path, {
+        "a": np.arange(6, dtype=np.int8),
+        "b": np.arange(6, dtype=np.float64),
+        "c": np.arange(12, dtype=np.int32).reshape(6, 2),
+    })
+    reader = _hdf5.Reader(os.fsdecode(path))
+    try:
+        indices = np.array([4, 1, 4, -1], dtype=np.int64)
+        raw = reader.read_indices_many(["primal/a", "primal/b", "primal/c"], indices)
+        expected = {
+            "primal/a": np.arange(6, dtype=np.int8)[indices],
+            "primal/b": np.arange(6, dtype=np.float64)[indices],
+            "primal/c": np.arange(12, dtype=np.int32).reshape(6, 2)[indices],
+        }
+        for key, value in expected.items():
+            np.testing.assert_array_equal(raw[key], value)
+            assert raw[key].dtype == value.dtype
+            assert raw[key].flags.aligned
+    finally:
+        reader.close()
+
+
 def test_dataset_discovery_handles_cycles(tmp_path):
     path = tmp_path / "links.h5"
     with h5py.File(path, "w") as file:

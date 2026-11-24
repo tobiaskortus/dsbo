@@ -1,12 +1,31 @@
 #pragma once
 
+#include <dsbo/hdf5/types.hpp>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <random>
 #include <string>
+#include <vector>
 
 namespace dsbo::test {
+
+inline bool same_bytes(const io::Array& left, const io::Array& right) {
+    return left.nbytes() == right.nbytes() &&
+           (!left.nbytes() || std::memcmp(left.data(), right.data(), left.nbytes()) == 0);
+}
+
+template<class T> bool same_values(const io::Array& actual, const std::vector<T>& expected) {
+    if (actual.type != io::dtype<T>() || actual.size() != expected.size()) return false;
+    if (expected.empty()) return true;
+    if constexpr (std::is_same_v<T, bool>)
+        return std::equal(expected.begin(), expected.end(), actual.data(),
+                          [](bool value, unsigned char byte) { return value == (byte != 0); });
+    else return std::equal(expected.begin(), expected.end(), actual.data<T>());
+}
 
 class TestDirectory {
 public:

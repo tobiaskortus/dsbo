@@ -196,7 +196,7 @@ class AutogradFileInterface:
         gradient = cls.writer.load_backward_gradient(fpath, grad_path)
         if isinstance(gradient, TensorDict):
             return gradient
-        return torch.from_numpy(gradient).float()
+        return torch.from_numpy(gradient)
 
     @classmethod
     def write_gradient_contribution(

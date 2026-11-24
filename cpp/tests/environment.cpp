@@ -10,13 +10,9 @@
 
 #include "test_support.hpp"
 
-#ifdef _WIN32
-#include <process.h>
-#else
 #include <spawn.h>
 #include <sys/wait.h>
 extern char** environ;
-#endif
 
 namespace {
 struct Environment {
@@ -65,11 +61,6 @@ static bool run_in_isolated_process() {
     const auto output = "--out=" + log_path;
     const char* arguments[] = {executable.c_str(), "--dsbo-isolated", filter.c_str(),
                                "--no-colors", "--no-breaks", output.c_str(), nullptr};
-#ifdef _WIN32
-    const auto status = _spawnvp(_P_WAIT, executable.c_str(), arguments);
-    REQUIRE_MESSAGE(status != -1, "Cannot start isolated test: ", std::strerror(errno));
-    const bool passed = status == 0;
-#else
     pid_t child;
     const int error = posix_spawnp(&child, executable.c_str(), nullptr, nullptr,
                                    const_cast<char* const*>(arguments), environ);
@@ -79,7 +70,6 @@ static bool run_in_isolated_process() {
     do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
     REQUIRE_MESSAGE(waited == child, "Cannot wait for isolated test: ", std::strerror(errno));
     const bool passed = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-#endif
     std::ifstream log(log_path);
     const std::string details((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
     CHECK_MESSAGE(passed, "Isolated test failed (status ", status, "):\n", details);

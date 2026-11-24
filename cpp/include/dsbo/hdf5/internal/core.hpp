@@ -73,9 +73,25 @@ inline bool exists(hid_t parent, const std::string& name) {
 }
 
 inline H5O_type_t object_type(hid_t parent, const std::string& name) {
-    if (!exists(parent, name)) throw KeyError("HDF5 object '" + name + "' does not exist.");
+    Handle access(H5Pcreate(H5P_LINK_ACCESS), H5Pclose);
+    bool external = false;
+    // Reject external links at any path component, including through soft links.
+    const auto reject_external = [](const char*, const char*, const char*, const char*,
+                                    unsigned*, hid_t, void* pointer) -> herr_t {
+        *static_cast<bool*>(pointer) = true;
+        return -1;
+    };
+    check(H5Pset_elink_cb(access, reject_external, &external), "Cannot install external-link rejection callback.");
     H5O_info2_t info{};
-    check(H5Oget_info_by_name3(parent, name.c_str(), &info, H5O_INFO_BASIC, H5P_DEFAULT), "Cannot inspect HDF5 object '" + name + "'.");
+    htri_t found;
+    herr_t status;
+    H5E_BEGIN_TRY {
+        found = H5Lexists(parent, name.c_str(), access);
+        status = H5Oget_info_by_name3(parent, name.c_str(), &info, H5O_INFO_BASIC, access);
+    } H5E_END_TRY;
+    if (external) throw std::invalid_argument("External HDF5 links are not supported: '" + name + "'.");
+    if (found <= 0) throw KeyError("HDF5 object '" + name + "' does not exist.");
+    check(status, "Cannot inspect HDF5 object '" + name + "'.");
     return info.type;
 }
 
@@ -135,7 +151,7 @@ inline Shape shape(hid_t space) {
     }
     const int rank = H5Sget_simple_extent_ndims(space);
     if (rank < 0) throw IOError("Cannot inspect HDF5 shape.");
-    Shape result(static_cast<std::size_t>(rank));
+    Shape result(std::vector<hsize_t>(static_cast<std::size_t>(rank)));
     check(H5Sget_simple_extent_dims(space, result.data(), nullptr), "Cannot inspect HDF5 dimensions.");
     return result;
 }
@@ -262,7 +278,7 @@ inline Array read_array_attribute(hid_t parent, const char* name, DType type) {
     Handle space(H5Aget_space(attribute), H5Sclose);
     Array result(type, shape(space));
     auto memory_type = datatype(type);
-    if (result.size()) check(H5Aread(attribute, memory_type, result.storage.data()), "Cannot read HDF5 numeric attribute.");
+    if (result.size()) check(H5Aread(attribute, memory_type, result.data()), "Cannot read HDF5 numeric attribute.");
     return result;
 }
 

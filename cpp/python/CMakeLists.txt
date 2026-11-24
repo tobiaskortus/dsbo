@@ -25,8 +25,7 @@ nanobind_add_module(_hdf5 ../bindings/hdf5.cpp)
 target_compile_features(_hdf5 PRIVATE cxx_std_17)
 # nanobind defaults to -Os; use speed optimization for Release builds.
 target_compile_options(_hdf5 PRIVATE
-    $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:MSVC>>:/O2>
-    $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-O3>)
+    $<$<CONFIG:Release>:-O3>)
 target_include_directories(_hdf5 PRIVATE ../include)
 target_link_libraries(_hdf5 PRIVATE hdf5-static)
 set_target_properties(_hdf5 PROPERTIES
@@ -43,5 +42,3 @@ elseif(UNIX)
         "LINKER:--version-script,${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
     set_property(TARGET _hdf5 APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
 endif()
-# On Windows, static HDF5/zlib have no dllexport decorations; nanobind exports
-# PyInit__hdf5 explicitly. Neither dependency is built as a DLL.
