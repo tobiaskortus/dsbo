@@ -36,8 +36,30 @@ struct TypeError : std::runtime_error { using std::runtime_error::runtime_error;
 using Columns = std::optional<std::vector<std::string>>;
 
 struct Shape : std::vector<hsize_t> {
+private:
+    struct Dim {
+        hsize_t value;
+
+        template<class Integer>
+        using EnableSizeInteger = std::enable_if_t<
+            std::is_integral_v<Integer> &&
+            std::numeric_limits<Integer>::digits <= std::numeric_limits<hsize_t>::digits,
+            int>;
+
+        template<class Integer, EnableSizeInteger<Integer> = 0>
+        Dim(Integer size) : value(static_cast<hsize_t>(size)) {
+            if constexpr (std::is_signed_v<Integer>)
+                if (size < 0) throw std::invalid_argument("Shape axis sizes must be non-negative.");
+        }
+        operator hsize_t() const { return value; }
+    };
+
+public:
     Shape() = default;
-    Shape(std::initializer_list<hsize_t> values) : std::vector<hsize_t>(values) {}
+    Shape(std::initializer_list<Dim> sizes) : Shape(sizes.begin(), sizes.end()) {}
+    // Preserve typed hsize_t lists without forcing braced ints to narrow.
+    template<class Integer, std::enable_if_t<std::is_same_v<Integer, hsize_t>, int> = 0>
+    Shape(std::initializer_list<Integer> sizes) : Shape(sizes.begin(), sizes.end()) {}
     Shape(const std::vector<hsize_t>& values) : std::vector<hsize_t>(values) {}
     Shape(std::vector<hsize_t>&& values) : std::vector<hsize_t>(std::move(values)) {}
     template<class Iterator, std::enable_if_t<!std::is_integral_v<Iterator>, int> = 0>

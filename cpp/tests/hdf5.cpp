@@ -450,8 +450,11 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "array-data/nd-hdf5-read-and-write") {
 TEST_CASE_FIXTURE(Hdf5Fixture, "typed-writes/borrow-containers-and-preserve-dtypes") {
     TestDirectory directory;
     const std::vector<double> values{1.0000000000000002, -2.25, 3.5, 4.0};
-    const int rows = 2;
-    const std::size_t columns = 2;
+    const int count = static_cast<int>(values.size());
+    const int rows = count / 2;
+    const std::size_t columns = values.size() / 2;
+    io::write_primal(directory("flat-double.h5"), values, {count});
+    CHECK(io::HDF5Storage::shape_from_path(directory("flat-double.h5")) == io::Shape{4});
     const auto view = io::view_of(values, {rows, columns});
     CHECK(view.data == values.data());
     CHECK(view.type == io::dtype<double>());
@@ -483,9 +486,10 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "typed-writes/borrow-containers-and-preserve-dtyp
     io::write_primal(directory("inferred-pointer.h5"), values.data(), values.size());
     CHECK(io::HDF5Storage::shape_from_path(directory("inferred-pointer.h5")) == io::Shape{4});
 
-    const io::Shape dynamic_shape{2, 2};
+    const std::initializer_list<hsize_t> dims{2, 2};
+    const io::Shape dynamic_shape = dims;
     CHECK(io::view_of(values, dynamic_shape).shape == dynamic_shape);
-    CHECK(io::field("matrix", values, dynamic_shape).second.shape == dynamic_shape);
+    CHECK(io::field("matrix", values, {rows, columns}).second.shape == dynamic_shape);
     io::write_primal(directory("owned.h5"), result);
     CHECK(same_values(io::HDF5Storage::open_primal(directory("owned.h5")), values));
 }
@@ -509,6 +513,9 @@ TEST_CASE_FIXTURE(Hdf5Fixture, "typed-writes/scalars-empty-and-invalid-shapes") 
     const auto invalid_path = directory("invalid.h5");
     CHECK_THROWS_AS(io::write_primal(invalid_path, scalar, {2}), std::invalid_argument);
     CHECK_THROWS_AS(io::write_primal(invalid_path, scalar, {0}), std::invalid_argument);
+    const int negative = -static_cast<int>(scalar.size());
+    CHECK_THROWS_AS(io::write_primal(invalid_path, scalar, {negative}), std::invalid_argument);
+    CHECK_THROWS_AS(io::write_primal(invalid_path, scalar, {scalar.size(), negative}), std::invalid_argument);
     const double c_array[]{1, 2};
     CHECK_THROWS_AS(io::view_of(c_array, {3}), std::invalid_argument);
     CHECK_THROWS_AS(io::view_of(c_array, {}), std::invalid_argument);
