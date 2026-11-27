@@ -4,7 +4,7 @@ site_author: Tobias Kortus
 repo_url: https://github.com/tobiaskortus/dsbo
 repo_name: tobiaskortus/dsbo
 edit_uri: edit/main/docs/
-copyright: "&copy; 2026 Tobias Kortus"
+copyright: "&copy; 2026 dsbo Team"
 
 theme:
   name: readthedocs
