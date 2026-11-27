@@ -1,0 +1,80 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+%files
+    ../../../cpp/include /tmp/dsbo-include
+    ../../../LICENSES /tmp/dsbo-licenses
+    ../data/hepem_data_fe_pbwo4.json /tmp/hepem_data_fe_pbwo4.json
+    runscript.sh /usr/local/bin/hepemshow-native
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        pkg-config \
+        zlib1g-dev
+    rm -rf /var/lib/apt/lists/*
+
+    mkdir -p /opt/dsbo /opt/hepemshow/data /usr/share/licenses
+    mv /tmp/dsbo-include /opt/dsbo/include
+    mv /tmp/dsbo-licenses /usr/share/licenses/dsbo
+    mv /tmp/hepem_data_fe_pbwo4.json /opt/hepemshow/data/hepem_data_fe_pbwo4.json
+    chmod 0755 /usr/local/bin/hepemshow-native
+
+    HDF5_VERSION=2.0.0
+    HDF5_SHA256=f4c2edc5668fb846627182708dbe1e16c60c467e63177a75b0b9f12c19d7efed
+    cd /tmp
+    curl -fL "https://github.com/HDFGroup/hdf5/releases/download/${HDF5_VERSION}/hdf5-${HDF5_VERSION}.tar.gz" -o hdf5.tar.gz
+    echo "${HDF5_SHA256}  hdf5.tar.gz" | sha256sum -c -
+    tar -xzf hdf5.tar.gz
+    cmake -S "hdf5-${HDF5_VERSION}" -B hdf5-build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/hdf5 \
+        -DHDF5_ENABLE_THREADSAFE=ON \
+        -DHDF5_BUILD_CPP_LIB=OFF \
+        -DHDF5_BUILD_FORTRAN=OFF \
+        -DHDF5_BUILD_HL_LIB=OFF \
+        -DHDF5_ENABLE_PARALLEL=OFF \
+        -DBUILD_SHARED_LIBS=ON \
+        -DBUILD_STATIC_LIBS=OFF \
+        -DBUILD_TESTING=OFF \
+        -DHDF5_BUILD_EXAMPLES=OFF \
+        -DHDF5_BUILD_TOOLS=OFF \
+        -DHDF5_ENABLE_ZLIB_SUPPORT=ON \
+        -DHDF5_ENABLE_SZIP_SUPPORT=OFF
+    cmake --build hdf5-build --parallel 2 --target install
+    mkdir -p /usr/share/licenses/hdf5
+    cp /opt/hdf5/share/LICENSE /usr/share/licenses/hdf5/LICENSE
+    rm -rf /tmp/hdf5*
+
+    PYHEPEMSHOW_REPO=https://github.com/tobiaskortus/pyHepEmShow.git
+    PYHEPEMSHOW_REF=example/dsbo-native-cli
+    git clone "${PYHEPEMSHOW_REPO}" /opt/pyHepEmShow
+    git -C /opt/pyHepEmShow checkout "${PYHEPEMSHOW_REF}"
+    git -C /opt/pyHepEmShow submodule update --init --recursive
+
+    bash /opt/pyHepEmShow/externals/configure_native.sh forward /opt/dsbo/include /opt/hdf5 Release
+    bash /opt/pyHepEmShow/externals/configure_native.sh backward /opt/dsbo/include /opt/hdf5 Release
+
+    install -m 0755 /opt/pyHepEmShow/hepemshow/build_native_forward/HepEmShowNative /usr/local/bin/hepemshow-forward
+    install -m 0755 /opt/pyHepEmShow/hepemshow/build_native_backward/HepEmShowNative /usr/local/bin/hepemshow-backward
+
+    rm -rf /opt/dsbo /opt/pyHepEmShow/.git
+
+%environment
+    export LD_LIBRARY_PATH=/opt/hdf5/lib
+
+%runscript
+    exec /usr/local/bin/hepemshow-native "$@"
+
+%test
+    test -x /usr/local/bin/hepemshow-forward
+    test -x /usr/local/bin/hepemshow-backward
+    test -f /opt/hepemshow/data/hepem_data_fe_pbwo4.json

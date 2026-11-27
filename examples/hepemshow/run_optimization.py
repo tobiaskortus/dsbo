@@ -1,29 +1,44 @@
-import numpy as np
-import torch
+import argparse
 from datetime import datetime
 
-from dsbo.utils.io import Workdir
-from dsbo.worker.spec import SLURMWorkerSpec
+import torch
+
 from dsbo.storage.sqlmodel import StudyStorage
+from dsbo.utils.io import Workdir
 from dsbo.worker.dask import HeterogeneousDaskWorker, WorkerContext
-
-from examples.hepemshow.problem import HepEmShowCalorimeterProblem
-from examples.hepemshow.modules.simulation import HepEmShowSimulation
+from dsbo.worker.spec import SLURMWorkerSpec
 from examples.hepemshow.modules.reconstruction import ParticleEnergyRegression
+from examples.hepemshow.problem import HepEmShowCalorimeterProblem
 
-spec = SLURMWorkerSpec(10, 1, "16GB", "1:00:00", partition="epyc-256").adapt(0, 5)
 
-problem = HepEmShowCalorimeterProblem("calorimeter_problem", None)
-problem.to({HepEmShowSimulation: spec, ParticleEnergyRegression: spec})
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Direct HepEmShow calorimeter optimization.")
+    parser.add_argument(
+        "--simulation",
+        choices=("python", "container"),
+        default="python",
+        help="Simulation backend: the Python extension or the native container.",
+    )
+    return parser.parse_args()
 
-workflow = problem.default_workflow
-candidate = problem.initial_guess(requires_grad=True)
 
-optimizer = torch.optim.RMSprop([candidate.tensor], lr=1)
-study_path = f"example_hepemshow_{datetime.now():%Y%m%d-%H%M%S-%f}.db"
+def main() -> None:
+    args = parse_arguments()
 
-with StudyStorage.create(study_path) as study, HeterogeneousDaskWorker.from_workflow(workflow) as worker:
-    with WorkerContext.use_worker(worker):
+    spec = SLURMWorkerSpec(10, 1, "16GB", "1:00:00", partition="epyc-256").adapt(0, 5)
+
+    problem = HepEmShowCalorimeterProblem("calorimeter_problem", None, backend=args.simulation)
+    problem.to({problem.simulation_cls: spec, ParticleEnergyRegression: spec})
+
+    workflow = problem.default_workflow
+    candidate = problem.initial_guess(requires_grad=True)
+
+    optimizer = torch.optim.RMSprop([candidate.tensor], lr=1)
+    study_path = f"example_hepemshow_{args.simulation}_{datetime.now():%Y%m%d-%H%M%S-%f}.db"
+
+    with StudyStorage.create(study_path) as study, \
+         HeterogeneousDaskWorker.from_workflow(workflow) as worker, \
+         WorkerContext.use_worker(worker):
         for step in range(100):
             with Workdir.create(f"files/example_hepemshow/step={step}", error_if_exists=False):
                 optimizer.zero_grad()
@@ -46,3 +61,7 @@ with StudyStorage.create(study_path) as study, HeterogeneousDaskWorker.from_work
                 optimizer.step()
                 with torch.no_grad():
                     candidate.tensor.clamp_(min=problem.LOWER_BOUND, max=problem.UPPER_BOUND)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,14 +1,13 @@
 import math
+from typing import Any
 
-import torch
-
+from dsbo.modules import batch_fuse, with_no_grad
 from dsbo.parameters import Candidate, ParameterSpace, Vector
 from dsbo.problem import Problem
 from dsbo.workflow import Workflow
-from dsbo.modules import batch_fuse, with_no_grad
-
-from examples.hepemshow.modules.simulation import HepEmShowSimulation
 from examples.hepemshow.modules.reconstruction import ParticleEnergyRegression
+from examples.hepemshow.modules.simulation import HepEmShowSimulation
+from examples.hepemshow.modules.simulation_container import HepEmShowContainerSimulation
 
 
 class HepEmShowCalorimeterProblem(Problem):
@@ -18,19 +17,35 @@ class HepEmShowCalorimeterProblem(Problem):
     INITIAL_ABSORBER_THICKNESSES = (9.030052185058594, 10.446663856506348, 36.0)
     INITIAL_SCINTILLATOR_THICKNESSES = (37.155208587646484, 29.665525436401367, 27.5)
 
-    def _training_simulation(self, num_simulations: int, num_events: int) -> HepEmShowSimulation:
-        return HepEmShowSimulation(
+    CONTAINER_IMAGE = HepEmShowContainerSimulation.CONTAINER_IMAGE
+
+    
+    def __init__(self, name: str, workdir: str | None, backend: str = "python") -> None:
+        self.simulation_cls, self.simulation_kwargs = self.simulation_config(backend)
+        super().__init__(name, workdir)
+
+    def _training_simulation(self, num_simulations: int, num_events: int):
+        return self.simulation_cls(
             num_events=math.ceil(num_events / num_simulations),
             absorber_passive=True,
             file_prefix="training",
+            **self.simulation_kwargs,
         )
 
-    def _evaluation_simulation(self, num_simulations: int, num_events: int,) -> HepEmShowSimulation:
-        return HepEmShowSimulation(
+    def _evaluation_simulation(self, num_simulations: int, num_events: int):
+        return self.simulation_cls(
             num_events=math.ceil(num_events / num_simulations),
             absorber_passive=True,
             file_prefix="evaluation",
+            **self.simulation_kwargs,
         )
+
+    def simulation_config(cls, backend: str) -> tuple[type, dict[str, Any]]:
+        if backend == "python":
+            return HepEmShowSimulation, {}
+        if backend == "container":
+            return HepEmShowContainerSimulation, {"image": cls.CONTAINER_IMAGE}
+        raise ValueError(f"Unknown simulation backend: {backend!r}")
 
     def create_batch_reduced_workflow(self):
         training_simulation = self._training_simulation(10, 400)

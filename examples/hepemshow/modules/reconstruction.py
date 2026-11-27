@@ -140,6 +140,8 @@ def train_particle_energy_regressor(
     record_tag: str | None = None,
     run_id: int = 0,
 ) -> tuple[ParticleEnergyMLP, dict[str, float | int | dict]]:
+    edep_per_cell = edep_per_cell.float()
+    energies = energies.float()
     device = torch.device(resolve_device())
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(edep_per_cell.shape[0], generator=generator)
@@ -369,17 +371,17 @@ class ParticleEnergyRegression(Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         device = resolve_device()
         storage = get_active_file_backend()
-        edep = storage.open(self.evaluation_edep(), "cpu").to(device)
-        design_vector = torch.cat(
+        edep = storage.open(self.evaluation_edep(), "cpu").float().to(device)
+        design_tensor = torch.cat(
             [
                 design["absorber"].reshape(-1),
                 design["gap"].reshape(-1),
             ]
         )
-        design_tensor = design_vector.unsqueeze(0).expand(edep.shape[0], -1)
+        design_tensor = design_tensor.to(device).unsqueeze(0).expand(edep.shape[0], -1)
         with torch.no_grad():
-            energies = storage.open(self.evaluation_energy(), "cpu").reshape(-1).to(device)
             state_dict = torch.load(self.trained_model(), map_location=device, weights_only=True)
+            energies = storage.open(self.evaluation_energy(), "cpu").reshape(-1).float().to(device)
             model = ParticleEnergyMLP(
                 edep.shape[1:].numel(),
                 design_tensor.shape[1],
@@ -390,7 +392,7 @@ class ParticleEnergyRegression(Module):
             for parameter in model.parameters():
                 parameter.requires_grad_(False)
 
-        predictions = model.denormalize(model(design_tensor.to(device), shower_features(edep)))
+        predictions = model.denormalize(model(design_tensor, shower_features(edep)))
         loss = (((predictions - energies) ** 2)  / (energies + 1.0)).mean()
         with torch.no_grad():
             primal_predictions = fw.unpack_dual(predictions).primal
