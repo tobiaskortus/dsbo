@@ -64,13 +64,17 @@ By default, `unique_filename=True` adds replica suffixes. Register a file with `
 
 File declarations describe what tasks read and write, but do not establish execution order. Connect producers and consumers in the workflow with `>>`; see [Declaring Input and Output Dependencies](modules.md#declaring-input-and-output-dependencies).
 
-`validate_workflow_dependencies(wf, on_error="raise")`, imported from `dsbo.workflow`, checks non-root inputs against declared outputs encountered earlier in topological order. It is a declaration check, not a check that files exist or that all required dependency edges are present.
+`validate_workflow_dependencies(wf, on_error="raise")`, imported from `dsbo.workflow`, checks input and output declarations. It does not check that files exist or replace the explicit dependencies between tasks.
 
 ## File Backend
 
 The active **file backend** supplies the format for framework-managed arrays, gradients, and replica reductions. A module remains backend-neutral only if it resolves that backend at runtime rather than calling a concrete format class directly.
 
-`HDF5File` is the default backend. It stores tensors as HDF5 datasets, which can be inspected with standard HDF5 tools. To read and write a tensor directly:
+`HDF5File` is the default backend. It stores tensors as HDF5 datasets, which can be inspected with standard HDF5 tools.
+
+For C++ installation requirements and standalone usage, see [Native C++ HDF5 I/O](native_io.md).
+
+To read and write a tensor directly:
 
 ```python
 import torch
@@ -122,50 +126,131 @@ In a fan-in such as `simulation * 3 >> reconstruction`, each simulation replica 
 For HDF5, this operation is **concatenation**, not a sum or average:
 
 - Arrays with shapes `(100, 4)`, `(80, 4)`, and `(120, 4)` produce a view with shape `(300, 4)`.
-- Scalar datasets become a vector with one element per source.
-- Named-column datasets concatenate along each column's sample dimension.
+- Scalar flat datasets become a vector with one element per source.
+- TensorDict stores concatenate each key along axis 0. A scalar TensorDict store (all leaves rank 0) is concatenated into a vector with one element per source; stores mixing scalar and non-scalar leaves are rejected.
+- Reduction sources must share the same key set, per-key trailing shape, and dtype.
 
-Sources are ordered by replica index, and rows within each source retain their order. The HDF5 view uses virtual datasets that reference the original files instead of duplicating their data. Keep the source files available for as long as the combined input is needed, including any backward pass.
+For example, two TensorDict stores with `energy` shapes `(3,)` and `(2,)` and `position` shapes `(3, 2)` and `(2, 2)` produce `energy` with shape `(5,)` and `position` with shape `(5, 2)`. Keys remain separate; reduction does not stack them into a common tensor or promote incompatible dtypes. Flat stores and TensorDict stores cannot be mixed in one reduction.
 
-The view is built lazily when the consumer resolves its input handle. [Batch-Fused Workflow Stages](batch-fusion.md) extends this mechanism across candidates. Custom pipelines can also call `HDF5File.reduce(sources, destination)` directly, or use `get_active_file_backend().reduce(...)` for the configured backend.
+Sources are ordered by replica index, and rows within each source retain their order. Keep the source files available for as long as the combined input is needed, including any backward pass.
+
+[Batch-Fused Workflow Stages](batch-fusion.md) describes how to combine inputs across candidates. Custom pipelines can also call `HDF5File.reduce(sources, destination)` directly, or use `get_active_file_backend().reduce(...)` for the configured backend.
 
 ## File-Based Autograd
 
-Beyond the reverse-mode interface introduced in [Differentiable Workflows](autograd.md#file-based-autograd), `HDF5File.write()` accepts an explicit `(primal, tangent)` tuple of arrays. `open()` reconstructs a plain, reverse-mode, or forward-mode tensor according to the active context. Outside an active backward pass, `read_backward_gradient()` resolves the adjacent gradient; ordinary primal reads do not load that adjoint.
+Beyond the reverse-mode interface introduced in [Differentiable Workflows](autograd.md#file-based-autograd), `HDF5File.write()` accepts dual tensors or an explicit `(primal, tangent)` tuple. Keyed primals and tangents use matching field names; tangent keys can be a subset of the primal keys. Use `open()` under `torch.no_grad()` for ordinary reads, with gradient tracking enabled for reverse-mode differentiation, or inside a forward-AD level to read dual tensors. Keyed reads return a TensorDict. Use `read_backward_gradient()` to read reverse-mode adjoints; `open()` does not return them.
 
-Tangents travel with primals; reverse-mode adjoints use separate contribution files and additive aggregation. Gradient file handling is described in [Computing a Gradient Contribution](gradient-flow.md#computing-a-gradient-contribution).
+Unused TensorDict derivative keys are omitted, not zero-filled. See [TensorDict Adjoints](gradient-flow.md#tensordict-adjoints) and [Tangents Per Key](gradient-flow.md#tangents-per-key) for complete examples.
 
 ## Backend Interface
 
-`HDF5File` combines `AutogradFileInterface` with `HDF5Writer`. The adapter delegates primal, tangent, and gradient I/O to its `writer`; reductions and surrogate dataset operations are also exposed on the backend class.
+Custom backends must provide the operations used by their workflows and training code:
 
 | Surface | Backend operations |
 |---|---|
-| Tensor I/O | `open(fpath, device, columns=None)`, `write(fpath, input, columns=None)` |
+| Tensor I/O | `open(fpath, device, columns=None)`, `write(fpath, input)` |
 | Reductions and adjoints | `reduce`, `read_backward_gradient`, `aggregate_gradients` |
 | Dataset access | `write_named_datasets`, `write_row_store`, `open_dataset`, `shape_from_path` |
 
-`open_dataset()` returns a `DatasetView` with keys, shapes, indexed reads, partition sizes, and `close()`. Its optional `statistics()` result contains count, mean, and squared deviation. Subclassing `AutogradFileInterface` alone does not supply reductions or dataset views.
+`open_dataset()` returns a `DatasetView` with keys, per-key shapes, indexed reads, partition sizes, and `close()`. Views also support context-manager cleanup. `statistics(keys)` returns count, mean, and squared-deviation summaries when available; TensorDict views return these per key.
 
-## Named Columns
+## TensorDict Storage
 
-!!! warning "Experimental"
+Use a TensorDict store when one file carries several named quantities. Unlike a stacked tensor, the fields can have different trailing shapes and dtypes.
 
-    Named columns are an experimental feature; the API may still change.
+`write()` accepts a `torch.Tensor`, a `TensorDict`, or a flat `dict[str, torch.Tensor]`. For keyed values:
 
-Arrays can carry named columns: pass `columns=[...]` to `write()` and, optionally, to `open()` to select a subset. Unlike a conventional sample-first table, the column index is tensor axis 0. For example, a tensor with shape `(2, 100)` and `columns=["energy", "cost"]` stores two columns with 100 samples each.
+- Each key keeps its own dtype and shape.
+- Reads preserve the key order unless you request a different selection.
+- Keys must be flat, non-empty strings without `/` or NUL characters; the literal key `"."` is also invalid. Nested TensorDicts and tuple keys are not supported.
 
-Column names and order are stored with the data. Reads reconstruct that order, and backward propagation zero-fills gradients for columns that received no gradient.
+```python
+import torch
+from tensordict import TensorDict
 
-There are three distinct layouts for named data:
+from dsbo.utils.io import Workdir
+from dsbo.utils.io.storage import HDF5File
 
-| Method | Layout and intended use |
+with Workdir.create("files/tensordict_example"), torch.no_grad():
+    path = Workdir.register_file("simulation", "events.h5")()
+    events = TensorDict({
+        "energy": torch.tensor([1.0, 2.0, 3.0]),
+        "position": torch.arange(6, dtype=torch.float32).reshape(3, 2),
+        "event_id": torch.arange(3, dtype=torch.int64),
+    }, batch_size=[3])
+    HDF5File.write(path, events)  # A plain dict[str, Tensor] works too.
+
+    events = HDF5File.open(path, device="cpu")
+    print(events.batch_size)          # torch.Size([3])
+    print(events["position"].shape)   # torch.Size([3, 2])
+    print(events["event_id"].dtype)   # torch.int64
+
+    selected = HDF5File.open(path, device="cpu", columns=["position", "energy"])
+    print(list(selected.keys()))     # ['position', 'energy']
+    print(HDF5File.shape_from_path(path)["position"])  # (3, 2)
+```
+
+Batched fields must share their leading size: `(N,)`, `(N, 2)`, and `(N, 4, 4)` can coexist, but `(N,)` and `(M,)` cannot when `N != M`. All-scalar mappings have an empty batch shape; mixing a scalar field with batched fields is invalid. Repeat a per-file scalar across the samples if it belongs in a batched store.
+
+Reads return `batch_size=(N,)` for batched fields; additional axes remain field dimensions, even if the original TensorDict declared more batch dimensions. `shape_from_path()` returns a dictionary of field shapes for keyed files. Use nonempty mappings for file round trips.
+
+`open(fpath, device, columns=None)` returns a `TensorDict` for dict stores and a tensor for flat stores. For dict stores, `columns` selects an ordered subset of keys. Flat stores do not accept column selection.
+
+Selection changes only the read, not the file's keys. Requesting a missing key raises `KeyError`; duplicate or invalid keys are rejected. During a module's backward pass, open the required keys once and reuse the returned TensorDict.
+
+Tangents and adjoints use the same keys as their corresponding values. Keys that received no gradient are omitted, so querying them with `.get(key)` returns `None`, while zero gradients are retained.
+
+### Migrating Named-Column Writes
+
+The former `write(path, tensor, columns=[...])` interface is replaced by keyed values. For an existing column-first tensor, write each column under its name:
+
+```python
+# Previously: HDF5File.write(path, stacked, columns=["energy", "cost"])
+# stacked has shape (2, N).
+HDF5File.write(path, {"energy": stacked[0], "cost": stacked[1]})
+values = HDF5File.open(path, device="cpu", columns=["cost"])
+cost = values["cost"]  # shape (N,), not a stacked (1, N) tensor
+```
+
+Existing named-column files remain readable, but now return a TensorDict rather than a stacked tensor. The `columns=` argument remains available on reads, not writes. Flat tensor files still return tensors.
+
+### Choosing a Write Method
+
+Choose the write method according to how the data will be used:
+
+| Method | Intended use |
 | --- | --- |
-| `write(..., columns=[...])` | Named columns in the autograd-aware `primal` layout; read with `open()` |
-| `write_named_datasets(fpath, datasets)` | A flat store of named arrays from a `dict[str, np.ndarray]` |
-| `write_row_store(fpath, datasets)` | Equal-length scalar feature columns stored as rows for efficient surrogate training |
+| `write(fpath, TensorDict)` or `write(fpath, dict)` | Autograd-aware named values; read with `open()` |
+| `write_named_datasets(fpath, datasets)` | Named NumPy arrays for indexed dataset reads |
+| `write_row_store(fpath, datasets)` | Equal-length scalar feature columns for sample-first training batches |
 
-These layouts are not interchangeable. Dataset views expose samples first, whereas named-column tensor reads expose columns first.
+These methods are not interchangeable. Dataset views expose samples first. Views of tensor, TensorDict, and named-array files return a TensorDict from `read_many()` and `read_indices()`. Files written with `write_row_store()` return tensor batches with features on the final axis. A single-key `read()` returns a tensor. Use `open()` for file-based differentiation; dataset views are intended for training and data inspection.
+
+## Indexed Dataset Reads
+
+Use a dataset view to fetch rows without loading every field in full. Index lists preserve their requested order and may contain repeated or negative indices:
+
+```python
+import torch
+
+from dsbo.utils.io import Workdir
+from dsbo.utils.io.storage import HDF5File
+
+with Workdir.create("files/dataset_view"):
+    path = Workdir.register_file("simulation", "events.h5")()
+    HDF5File.write(path, {
+        "energy": torch.tensor([1.0, 2.0, 3.0]),
+        "position": torch.arange(6, dtype=torch.float32).reshape(3, 2),
+    })
+    with HDF5File.open_dataset(path) as view:
+        rows = view.read_indices(["energy", "position"], [2, 0, 2])
+        print(rows["energy"])          # tensor([3., 1., 3.])
+        print(rows["position"].shape)  # torch.Size([3, 2])
+        one_row = view.read_many(["energy", "position"], slice(0, 1))
+        print(one_row.batch_size)      # torch.Size([1])
+```
+
+Integer indexing removes the sample axis. When reading scalar-per-sample and vector-valued fields together, retain that axis with a length-one slice or `read_indices(keys, [i])`; `read_many(keys, i)` does not support every combination of field shapes. Use `read(key, i)` when you want a single field without its sample axis. Close views before the workdir is cleaned up, and keep source files available while reading combined inputs.
 
 ## Training Datasets
 
@@ -173,5 +258,7 @@ The pre-built surrogates assemble training datasets from workflow files automati
 
 - **Module surrogates** wrap the contract's data and conditioning files in a `ModuleSurrogateDataset`, which serves matched `(x, c)` pairs from the module's outputs and conditioning.
 - **Workflow surrogates** wrap the row-store results file together with the design matrix in a `WorkflowSurrogateDataset`. The results file is recorded automatically while the training candidates run: each task's returned metrics are appended as rows.
+
+`WorkflowSurrogateDataset` provides keyed scalar results as a target tensor with shape `(rows, number_of_keys)`; it does not treat vector-valued fields as scalar metrics. `ModuleSurrogateDataset` and `LazyShape` currently require files written from a single tensor, not a TensorDict. Writing named data does not automatically make it compatible with the pre-built module surrogates.
 
 See [Writing Surrogates](surrogates.md) for declaring the data and conditioning that these datasets use.

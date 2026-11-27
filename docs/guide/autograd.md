@@ -23,9 +23,9 @@ Decoded continuous values retain their connection to the candidate tensor. Scala
 
 ## File-Based Autograd
 
-A normal workflow forward pass does not record a reverse-mode PyTorch graph across its tasks. Files carry the values between modules; the backward pass uses corresponding gradient files to carry their adjoints in the opposite direction.
+Modules that exchange files must implement `backward()` to propagate derivatives from their outputs to their inputs and design parameters.
 
-The provided `HDF5File` backend implements this channel. `write()` stores a tensor's values. When `open()` is called with gradient tracking enabled, it returns a tensor whose backward hook records a gradient contribution for that file:
+Use `HDF5File.write()` to save values and `open()` with gradient tracking enabled to differentiate a computation using them. After calling `backward()`, read the resulting file gradient with `read_backward_gradient()`:
 
 ```python
 from dsbo.utils.io import Workdir
@@ -42,7 +42,9 @@ with Workdir.create("./file-gradient"):
     gradient = HDF5File.read_backward_gradient(path)  # tensor([2., 3.])
 ```
 
-Within a workflow pass, consumers write private gradient contributions. `read_backward_gradient()` resolves their sum so the producing module can use one incoming adjoint. The runtime scopes gradient state to each pass; modules do not need to share their forward tensors in memory.
+Within a workflow pass, `read_backward_gradient()` returns the sum of downstream gradient contributions. The producing module uses this incoming adjoint in its local backward computation. Recompute the local expression in `backward()` rather than retaining tensors from the forward call.
+
+The same interface supports [TensorDict files](io.md#tensordict-storage): `open()` returns keyed tensors, and gradients are available for the fields used by the local backward pass. `read_backward_gradient()` then returns a TensorDict of contributed keys, not a stacked tensor; absent keys are not automatically filled with zeros. See [TensorDict Adjoints](gradient-flow.md#tensordict-adjoints) for a keyed example with used, zero-gradient, and unused fields.
 
 ## Implementing a Backward Pass
 
@@ -117,6 +119,8 @@ def backward(self, design, grad_output=None):
 ```
 
 For the response `scale * [1, 2, 3, 4]`, the external routine returns `(output_gradient * [1, 2, 3, 4]).sum()`. This is the derivative of the final objective with respect to `scale`, not merely the derivative of the response. The adapter must wait for the derivative program to finish before returning; the workflow then continues the backward pass through upstream tasks.
+
+A native program can instead read and write gradient files directly with `dsbo::io::HDF5Storage`. Pass `self.output.gradient()` as its incoming-adjoint path and `self.input.gradient()` as its outgoing-contribution path. The program must write its input derivatives before returning. See [Native C++ HDF5 I/O](native_io.md#use-in-a-dsbo-workflow) for the native API and a complete wrapper example.
 
 ## Running a Differentiable Workflow
 

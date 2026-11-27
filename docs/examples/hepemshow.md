@@ -177,6 +177,7 @@ The conditional diffusion surrogate uses 12 residual MLP blocks of width 256, DD
 | Quantity | Direct optimization | Surrogate-assisted optimization |
 |---|---|---|
 | Forward model | HepEmShow, 3 layers, passive absorber | same; batch-reduced for training |
+| Simulation backend | `pyHepEmShow` extension or native container | same |
 | Training showers | 40,000 per candidate | 400 per candidate; 8,000 per 20-candidate session |
 | Evaluation showers | 10,000 per candidate | 400 per candidate; 10,000 per full check |
 | Reconstruction | per-candidate geometry-conditioned MLP | batch-fused geometry-conditioned MLP |
@@ -210,6 +211,19 @@ python -m examples.hepemshow.run_optimization_aido
 ```
 
 Both scripts write timestamped SQLite studies in the current directory. Simulation and reconstruction files are staged under `files/example_hepemshow/step=<n>` or `files/example_hepemshow_aido/step=<n>`.
+
+### Containerized native simulation
+
+The problem setup supports a second backend, where all simulations are a native C++ executable inside a container instead of the `pyHepEmShow` Python extension. This keeps the Python optimization workflow and `ParticleEnergyRegression` unchanged while moving the simulation and simulation IO into a standalone binary.
+
+Select the container backend:
+
+```bash
+python -m examples.hepemshow.run_optimization --simulation container
+python -m examples.hepemshow.run_optimization_aido --simulation container
+```
+
+Docker or Apptainer must be available on every worker configured to run the simulation. `ContainerWrapperBase` raises if no compatible runtime is installed.
 
 ## References
 

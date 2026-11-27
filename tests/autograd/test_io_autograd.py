@@ -4,6 +4,7 @@ import h5py
 import numpy as np
 import pytest
 import torch
+from tensordict import TensorDict
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import torch.autograd.forward_ad as fw
@@ -12,6 +13,8 @@ from dsbo.config import config, get_active_file_backend
 from dsbo.utils.io.gradient import gradient_path
 from dsbo.utils.io.datasets import ModuleSurrogateDataset, WorkflowSurrogateDataset
 from dsbo.utils.io.storage.hdf5 import HDF5File, HDF5Writer
+from dsbo.utils.io.storage.utils import to_tensordict
+from dsbo.utils.io.workdir import Workdir
 
 
 @pytest.fixture(
@@ -75,6 +78,35 @@ def test_file_backend_backward_gradient(file_backend):
         torch.testing.assert_close(grad, 2.0 * primal)
 
 
+@pytest.mark.parametrize("keyed", [False, True], ids=["flat", "keyed"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(np.array(1.0000000000000002, dtype=np.float64), id="float64-scalar"),
+        pytest.param(np.full((2, 3), 1.0000000000000002, dtype=np.float64), id="float64-matrix"),
+        pytest.param(np.array([[0.5, 1.5], [-2.0, 3.0]], dtype=np.float16), id="float16-matrix"),
+    ],
+)
+def test_file_backend_backward_gradient_preserves_dtype_and_shape(file_backend, value, keyed):
+    backend, extension = file_backend
+    with TemporaryDirectory() as tempdir, Workdir.create(tempdir, keep=True, error_if_exists=False):
+        file_path = os.path.join(tempdir, f"x{extension}")
+        stored = {"value": value} if keyed else value
+        backend.write(file_path, {"value": torch.from_numpy(value)} if keyed else torch.from_numpy(value))
+        backend.writer.write_gradient(gradient_path(file_path), stored)
+
+        gradient = backend.read_backward_gradient(file_path)
+
+        if keyed:
+            assert isinstance(gradient, TensorDict)
+            assert set(gradient.keys()) == {"value"}
+            gradient = gradient["value"]
+        assert isinstance(gradient, torch.Tensor)
+        assert gradient.shape == value.shape
+        assert gradient.numpy().dtype == value.dtype
+        np.testing.assert_array_equal(gradient.numpy(), value)
+
+
 @pytest.mark.parametrize("reversed_order", [False, True])
 def test_file_backend_backward_gradient_double_open(file_backend, reversed_order):
     backend, extension = file_backend
@@ -126,16 +158,21 @@ def test_hdf5_file_named_columns():
     with TemporaryDirectory() as tempdir, torch.no_grad():
         file_path = os.path.join(tempdir, "x.h5")
         values = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-        columns = ["first", "second", "third"]
+        td = TensorDict({"first": values[0], "second": values[1], "third": values[2]}, batch_size=(2,))
 
-        HDF5File.write(file_path, values, columns=columns)
+        HDF5File.write(file_path, td)
 
         with h5py.File(file_path, "r") as file:
             assert isinstance(file["primal"], h5py.Group)
             np.testing.assert_array_equal(file["primal/second"][:], values[1].numpy())
-        torch.testing.assert_close(HDF5File.open(file_path, "cpu"), values)
-        # Make sure the given column order is preserved when loading
-        torch.testing.assert_close(HDF5File.open(file_path, "cpu", columns=["third", "first"]), values[[2, 0]])
+        loaded = HDF5File.open(file_path, "cpu")
+        assert isinstance(loaded, TensorDict)
+        for key in ("first", "second", "third"):
+            torch.testing.assert_close(loaded[key], td[key])
+        subset = HDF5File.open(file_path, "cpu", columns=["third", "first"])
+        assert list(subset.keys()) == ["third", "first"]
+        torch.testing.assert_close(subset["third"], values[2])
+        torch.testing.assert_close(subset["first"], values[0])
 
 
 def test_file_backend_named_columns_forward_ad_tangent(file_backend):
@@ -145,13 +182,18 @@ def test_file_backend_named_columns_forward_ad_tangent(file_backend):
         file_path = os.path.join(tempdir, f"x{extension}")
         primal = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
         tangent = torch.arange(8, 16, dtype=torch.float32).reshape(2, 2, 2)
+        primal_td = TensorDict(
+            {"first": fw.make_dual(primal[0], tangent[0]), "second": fw.make_dual(primal[1], tangent[1])},
+            batch_size=(2,),
+        )
 
-        backend.write(file_path, fw.make_dual(primal, tangent), columns=["first", "second"])
+        backend.write(file_path, primal_td)
 
         loaded = backend.open(file_path, "cpu", columns=["second"])
-
-        torch.testing.assert_close(loaded, primal[[1]])
-        torch.testing.assert_close(fw.unpack_dual(loaded).tangent, tangent[[1]])
+        assert isinstance(loaded, TensorDict)
+        dual = fw.unpack_dual(loaded["second"])
+        torch.testing.assert_close(dual.primal, primal[1])
+        torch.testing.assert_close(dual.tangent, tangent[1])
 
 
 def test_hdf5_file_named_columns_backward_gradient():
@@ -159,20 +201,19 @@ def test_hdf5_file_named_columns_backward_gradient():
     with TemporaryDirectory() as tempdir:
         file_path = os.path.join(tempdir, "x.h5")
         values = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-        columns = ["first", "second", "third"]
+        td = TensorDict({"first": values[0], "second": values[1], "third": values[2]}, batch_size=(2,))
 
-        HDF5File.write(file_path, values, columns=columns)
+        HDF5File.write(file_path, td)
 
         x = HDF5File.open(file_path, "cpu", columns=["third", "first"])
         weights = torch.tensor([[2.0, 3.0], [4.0, 5.0]])
-        (x * weights).sum().backward()
+        ((x["third"] * weights[0]).sum() + (x["first"] * weights[1]).sum()).backward()
 
-        # Backward gradient updates according to how the data was loaded, column "third" and "first",
-        # while "second" is 0.
-        torch.testing.assert_close(
-            HDF5File.read_backward_gradient(file_path),
-            torch.stack((weights[1], torch.zeros(2), weights[0])),
-        )
+        gradient = HDF5File.read_backward_gradient(file_path)
+        assert isinstance(gradient, TensorDict)
+        assert set(gradient.keys()) == {"third", "first"}
+        torch.testing.assert_close(gradient["third"], weights[0])
+        torch.testing.assert_close(gradient["first"], weights[1])
         with h5py.File(gradient_path(file_path), "r") as file:
             assert list(file["gradient"].keys()) == ["third", "first"]
 
@@ -182,13 +223,17 @@ def test_hdf5_file_named_columns_backward_gradient_without_selection():
     with TemporaryDirectory() as tempdir:
         file_path = os.path.join(tempdir, "x.h5")
         values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        td = TensorDict({"first": values[0], "second": values[1]}, batch_size=(2,))
 
-        HDF5File.write(file_path, values, columns=["first", "second"])
+        HDF5File.write(file_path, td)
 
         x = HDF5File.open(file_path, "cpu")
-        (x * x).sum().backward()
+        sum((value * value).sum() for value in x.values()).backward()
 
-        torch.testing.assert_close(HDF5File.read_backward_gradient(file_path), 2.0 * values)
+        gradient = HDF5File.read_backward_gradient(file_path)
+        assert isinstance(gradient, TensorDict)
+        torch.testing.assert_close(gradient["first"], 2.0 * values[0])
+        torch.testing.assert_close(gradient["second"], 2.0 * values[1])
 
 
 def test_hdf5_file_named_columns_accumulate_gradients():
@@ -196,16 +241,20 @@ def test_hdf5_file_named_columns_accumulate_gradients():
     with TemporaryDirectory() as tempdir:
         file_path = os.path.join(tempdir, "x.h5")
         values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        td = TensorDict({"first": values[0], "second": values[1]}, batch_size=(2,))
 
-        HDF5File.write(file_path, values, columns=["first", "second"])
+        HDF5File.write(file_path, td)
 
         first = HDF5File.open(file_path, "cpu", columns=["first"])
-        (first * 2.0).sum().backward()
+        sum(value.sum() for value in (first * 2.0).values()).backward()
         second = HDF5File.open(file_path, "cpu", columns=["second"])
-        (second * 3.0).sum().backward()
+        sum(value.sum() for value in (second * 3.0).values()).backward()
 
         # The second gradient update has to leave the first one intact.
-        torch.testing.assert_close(HDF5File.read_backward_gradient(file_path), torch.tensor([[2.0, 2.0], [3.0, 3.0]]))
+        gradient = HDF5File.read_backward_gradient(file_path)
+        assert isinstance(gradient, TensorDict)
+        torch.testing.assert_close(gradient["first"], torch.full((2,), 2.0))
+        torch.testing.assert_close(gradient["second"], torch.full((2,), 3.0))
 
 
 @pytest.mark.parametrize("selection_first", [False, True])
@@ -215,45 +264,51 @@ def test_file_backend_named_columns_accumulate_full_and_selected(file_backend, s
     with TemporaryDirectory() as tempdir:
         file_path = os.path.join(tempdir, f"x{extension}")
         values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        td = TensorDict({"first": values[0], "second": values[1]}, batch_size=(2,))
 
-        backend.write(file_path, values, columns=["first", "second"])
+        backend.write(file_path, td)
 
         def backward_selection():
             selected = backend.open(file_path, "cpu", columns=["second"])
-            (selected * 2.0).sum().backward()
+            sum(value.sum() for value in (selected * 2.0).values()).backward()
 
         def backward_full():
-            backend.open(file_path, "cpu").sum().backward()
+            loaded = backend.open(file_path, "cpu")
+            sum(value.sum() for value in loaded.values()).backward()
 
         operations = (backward_selection, backward_full) if selection_first else (backward_full, backward_selection)
         for operation in operations:
             operation()
 
-        torch.testing.assert_close(backend.read_backward_gradient(file_path), torch.tensor([[1.0, 1.0], [3.0, 3.0]]))
+        gradient = backend.read_backward_gradient(file_path)
+        assert isinstance(gradient, TensorDict)
+        torch.testing.assert_close(gradient["first"], torch.ones(2))
+        torch.testing.assert_close(gradient["second"], torch.full((2,), 3.0))
 
 
-def test_hdf5_file_named_columns_validate_dimension_zero():
-    with TemporaryDirectory() as tempdir:
-        file_path = os.path.join(tempdir, "x.h5")
-
-        with pytest.raises(ValueError, match="2 columns.*size 3.*dimension 0"):
-            HDF5File.write(file_path, torch.ones((3, 2)), columns=["first", "second"])
+def test_tensordict_batch_validation():
+    with pytest.raises(AssertionError, match="batch size"):
+        to_tensordict({"first": torch.ones(3), "second": torch.ones(2)})
+    with pytest.raises(AssertionError, match="batch size"):
+        to_tensordict({"first": torch.ones(3), "second": torch.tensor(1.0)})
+    with pytest.raises(ValueError, match="at least one key"):
+        to_tensordict({})
 
 
 def test_file_backend_named_columns_reduce(file_backend):
     backend, extension = file_backend
     with TemporaryDirectory() as tempdir, torch.no_grad():
         sources = [os.path.join(tempdir, f"source_{i}{extension}") for i in range(2)]
-        backend.write(sources[0], torch.tensor([[1.0, 2.0], [4.0, 5.0]]), columns=["first", "second"])
-        backend.write(sources[1], torch.tensor([[3.0], [6.0]]), columns=["first", "second"])
+        backend.write(sources[0], TensorDict({"first": torch.tensor([1.0, 2.0]), "second": torch.tensor([4.0, 5.0])}, batch_size=(2,)))
+        backend.write(sources[1], TensorDict({"first": torch.tensor([3.0]), "second": torch.tensor([6.0])}, batch_size=(1,)))
         destination = os.path.join(tempdir, f"reduced{extension}")
 
         backend.reduce(sources, destination)
 
-        torch.testing.assert_close(
-            backend.open(destination, "cpu"),
-            torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-        )
+        loaded = backend.open(destination, "cpu")
+        assert isinstance(loaded, TensorDict)
+        torch.testing.assert_close(loaded["first"], torch.tensor([1.0, 2.0, 3.0]))
+        torch.testing.assert_close(loaded["second"], torch.tensor([4.0, 5.0, 6.0]))
 
 
 def test_hdf5_file_reduce_creates_virtual_dataset():
@@ -287,20 +342,6 @@ def test_hdf5_virtual_dataset_rejects_missing_sources():
 
         with pytest.raises(FileNotFoundError, match="missing source"):
             HDF5File.open(destination, "cpu")
-
-
-def test_vds_reduction_concatenates_multiple_hdf5_files():
-    with TemporaryDirectory() as tempdir:
-        source1 = os.path.join(tempdir, "s1.h5")
-        source2 = os.path.join(tempdir, "s2.h5")
-        HDF5File.write(source1, torch.tensor([[1.0], [2.0]]))
-        HDF5File.write(source2, torch.tensor([[3.0]]))
-        destination = os.path.join(tempdir, "reduced.h5")
-        HDF5File.reduce([source1, source2], destination)
-        torch.testing.assert_close(
-            HDF5File.open(destination, "cpu"),
-            torch.tensor([[1.0], [2.0], [3.0]]),
-        )
 
 
 @pytest.mark.parametrize(
@@ -395,6 +436,30 @@ def test_file_backend_workflow_surrogate_dataset_records(file_backend):
         assert x.shape == (4, 1)
         assert y.shape == (4, 2)
         torch.testing.assert_close(y.mean(dim=0), torch.zeros(2), atol=1e-6, rtol=0)
+
+
+def test_workflow_surrogate_constant_large_offset_normalization(file_backend, tmp_path):
+    backend, extension = file_backend
+    sources = [tmp_path / f"candidate_{candidate}{extension}" for candidate in range(2)]
+    offset = 1e12 + 0.1
+    for source in sources:
+        backend.write_named_datasets(source, {"energy": np.full(500_000, offset)})
+    records_path = tmp_path / f"records{extension}"
+    backend.reduce(sources, records_path)
+
+    with WorkflowSurrogateDataset(
+        records_path, torch.tensor([[1.0], [2.0]]), get_active_file_backend()
+    ) as dataset:
+        with patch.object(
+            dataset._records,
+            "read_many",
+            side_effect=AssertionError("normalization scanned record values"),
+        ):
+            dataset.compute_stats()
+        torch.testing.assert_close(dataset.mean_y, torch.tensor([offset]), rtol=0, atol=0)
+        torch.testing.assert_close(dataset.std_y, torch.tensor([1e-8]), rtol=0, atol=0)
+        for _, normalized in dataset.__getitems__([0, len(dataset) - 1]):
+            torch.testing.assert_close(normalized, torch.zeros(1), rtol=0, atol=0)
 
 
 def test_nested_record_vds_merge_roundtrip():

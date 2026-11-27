@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+import argparse
 from datetime import datetime
 
 import torch
 
 from dsbo.config import config
-from dsbo.utils.io import Workdir
 from dsbo.storage.sqlmodel import StudyStorage
-from dsbo.worker.spec import SLURMWorkerSpec
-from dsbo.worker.dask import HeterogeneousDaskWorker, WorkerContext
 from dsbo.surrogates.workflow_surrogate import DefaultWorkflowSurrogate
-
+from dsbo.utils.io import Workdir
+from dsbo.worker.dask import HeterogeneousDaskWorker, WorkerContext
+from dsbo.worker.spec import SLURMWorkerSpec
 from examples.hepemshow.aido.strategy import CovarianceStrategy
 from examples.hepemshow.modules.reconstruction import ParticleEnergyRegression
-from examples.hepemshow.modules.simulation import HepEmShowSimulation
 from examples.hepemshow.problem import HepEmShowCalorimeterProblem
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Surrogate-assisted HepEmShow calorimeter optimization.")
+    parser.add_argument(
+        "--simulation",
+        choices=("python", "container"),
+        default="python",
+        help="Simulation backend: the Python extension or the native container.",
+    )
+    return parser.parse_args()
 
 
 def evaluate_candidate(evaluation_workflow, candidate):
@@ -33,44 +43,47 @@ def trial_objectives(evaluation, surrogate_loss, constraint):
     }
 
 
-spec = SLURMWorkerSpec(10, 1, "16GB", "1:00:00", partition="epyc-256").adapt(0, 5)
+def main() -> None:
+    args = parse_arguments()
 
-problem = HepEmShowCalorimeterProblem("aido_hepemshow", None)
-problem.to({HepEmShowSimulation: spec, ParticleEnergyRegression: spec})
+    spec = SLURMWorkerSpec(10, 1, "16GB", "1:00:00", partition="epyc-256").adapt(0, 5)
 
-workflow = problem.batch_reduced_workflow
-evaluation_workflow = problem.default_workflow
+    problem = HepEmShowCalorimeterProblem("aido_hepemshow", None, backend=args.simulation)
+    problem.to({problem.simulation_cls: spec, ParticleEnergyRegression: spec})
 
-strategy = CovarianceStrategy(
-    sigma=2.5,
-    generate_scaling=1.0,
-    trust_region_scale=0.8,
-    num_candidates=20,
-    seed=0,
-)
-surrogate = DefaultWorkflowSurrogate(
-    strategy=strategy,
-    max_epochs=100,
-    batch_size=512,
-    learning_rate=1e-3,
-    patience=8,
-    sample_count=512,
-    num_workers=0,
-)
-surrogate.to(spec)
-workflow.patch(surrogate)
+    workflow = problem.batch_reduced_workflow
+    evaluation_workflow = problem.default_workflow
 
+    strategy = CovarianceStrategy(
+        sigma=2.5,
+        generate_scaling=1.0,
+        trust_region_scale=0.8,
+        num_candidates=20,
+        seed=0,
+    )
+    surrogate = DefaultWorkflowSurrogate(
+        strategy=strategy,
+        max_epochs=100,
+        batch_size=512,
+        learning_rate=1e-3,
+        patience=8,
+        sample_count=512,
+        num_workers=0,
+    )
+    surrogate.to(spec)
+    workflow.patch(surrogate)
 
-candidate = problem.initial_guess(requires_grad=True)
-with torch.no_grad():
-    candidate.tensor.clamp_(min=problem.LOWER_BOUND, max=problem.UPPER_BOUND)
+    candidate = problem.initial_guess(requires_grad=True)
+    with torch.no_grad():
+        candidate.tensor.clamp_(min=problem.LOWER_BOUND, max=problem.UPPER_BOUND)
 
-optimizer = torch.optim.Adam([candidate.tensor], lr=0.2)
-timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-study_path = f"example_hepemshow_aido_{timestamp}.db"
+    optimizer = torch.optim.Adam([candidate.tensor], lr=0.2)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    study_path = f"example_hepemshow_aido_{args.simulation}_{timestamp}.db"
 
-with StudyStorage.create(study_path) as study, HeterogeneousDaskWorker.from_workflow(workflow) as worker:
-    with WorkerContext.use_worker(worker):
+    with StudyStorage.create(study_path) as study, \
+         HeterogeneousDaskWorker.from_workflow(workflow) as worker, \
+         WorkerContext.use_worker(worker):
         for step in range(8000):
             with Workdir.create(f"files/example_hepemshow_aido/step={step}", error_if_exists=False):
                 optimizer.zero_grad()
@@ -95,3 +108,7 @@ with StudyStorage.create(study_path) as study, HeterogeneousDaskWorker.from_work
                 optimizer.step()
                 with torch.no_grad():
                     candidate.tensor.clamp_(min=problem.LOWER_BOUND, max=problem.UPPER_BOUND)
+
+
+if __name__ == "__main__":
+    main()

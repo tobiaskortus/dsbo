@@ -1,5 +1,6 @@
 import random
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,50 @@ import torch.autograd.forward_ad as fw
 from dsbo.config import get_active_file_backend
 from dsbo.modules.simulation import SimulationBase
 from dsbo.utils.io import DefaultPaths, Output, Workdir
-from dsbo.utils.process import available_cores
+from examples.hepemshow.modules.utils import (
+    backpropagate_design_gradients,
+    resolve_num_workers,
+    seed_for_replica,
+)
+
+def split_task(task: dict[str, Any], chunks: int) -> list[dict[str, Any]]:
+    event_count = task["num_events"]
+    chunks = min(chunks, event_count)
+    if chunks < 1:
+        return [task]
+    base, remainder = divmod(event_count, chunks)
+    seed_generator = random.Random(task["random_seed"])
+    bar_edep = task.get("bar_edep")
+    result = []
+    start = 0
+
+    for index in range(chunks):
+        count = base + (index < remainder)
+        stop = start + count
+        chunk = dict(task)
+        chunk["num_events"] = count
+        chunk["random_seed"] = seed_generator.randrange(2**31)
+        if bar_edep is not None:
+            chunk["bar_edep"] = bar_edep[start:stop]
+        result.append(chunk)
+        start = stop
+
+    return result
+
+
+def parallel_tasks(tasks: list[dict[str, Any]], num_workers: int) -> list[dict[str, Any]]:
+    if num_workers <= len(tasks):
+        return tasks
+
+    remaining_workers = num_workers
+    result = []
+    for index, task in enumerate(tasks):
+        remaining_tasks = len(tasks) - index
+        chunks = max(1, remaining_workers // remaining_tasks)
+        split = split_task(task, chunks)
+        result.extend(split)
+        remaining_workers -= len(split)
+    return result
 
 
 class HepEmShowSimulation(SimulationBase):
@@ -97,7 +141,7 @@ class HepEmShowSimulation(SimulationBase):
         if gap_dot is not None:
             common_arguments["gap_thickness_dot"] = gap_dot.detach().cpu().tolist()
 
-        rng = random.Random(self._seed + (self.i or 0) * 1_000_003)
+        rng = random.Random(seed_for_replica(self._seed, self.i))
         tasks = []
         for particle in self.particles:
             for _ in range(self.num_sims_per_particle):
@@ -115,48 +159,6 @@ class HepEmShowSimulation(SimulationBase):
                 tasks.append(task)
         return tasks
 
-    @staticmethod
-    def _split_task(task: dict[str, Any], chunks: int) -> list[dict[str, Any]]:
-        event_count = task["num_events"]
-        chunks = min(chunks, event_count)
-        base, remainder = divmod(event_count, chunks)
-        seed_generator = random.Random(task["random_seed"])
-        bar_edep = task.get("bar_edep")
-        result = []
-        start = 0
-
-        for index in range(chunks):
-            count = base + (index < remainder)
-            stop = start + count
-            chunk = dict(task)
-            chunk["num_events"] = count
-            chunk["random_seed"] = seed_generator.randrange(2**31)
-            if bar_edep is not None:
-                chunk["bar_edep"] = bar_edep[start:stop]
-            result.append(chunk)
-            start = stop
-
-        return result
-
-    def _resolve_num_workers(self) -> int:
-        if self.num_workers is not None:
-            return max(1, self.num_workers)
-        return available_cores(self.resources)
-
-    def _parallel_tasks(self, tasks: list[dict[str, Any]], num_workers: int) -> list[dict[str, Any]]:
-        if num_workers <= len(tasks):
-            return tasks
-
-        remaining_workers = num_workers
-        parallel_tasks = []
-        for index, task in enumerate(tasks):
-            remaining_tasks = len(tasks) - index
-            chunks = max(1, remaining_workers // remaining_tasks)
-            split = self._split_task(task, chunks)
-            parallel_tasks.extend(split)
-            remaining_workers -= len(split)
-        return parallel_tasks
-
     def _run_tasks(self, module, tasks):
         def run(task):
             if task.get("bar_edep") is not None:
@@ -164,34 +166,20 @@ class HepEmShowSimulation(SimulationBase):
                 task["bar_edep"] = np.asarray(task["bar_edep"]).reshape(-1).tolist()
             return module.run_simulation(**task)
 
-        num_workers = self._resolve_num_workers()
-        tasks = self._parallel_tasks(tasks, num_workers)
+        num_workers = resolve_num_workers(self.num_workers, self.resources)
+        tasks = parallel_tasks(tasks, num_workers)
         num_workers = min(num_workers, len(tasks))
-        if num_workers == 1:
+        if num_workers <= 1:
             return [run(task) for task in tasks]
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            return list(executor.map(run, tasks))
+            futures = [executor.submit(copy_context().run, run, task) for task in tasks]
+            return [future.result() for future in futures]
 
     @staticmethod
     def _primal_tangent(value):
         if isinstance(value, torch.Tensor):
             return fw.unpack_dual(value)
         return value, None
-
-    @staticmethod
-    def _backpropagate_native_gradients(design, results):
-        inputs, gradients = [], []
-
-        def add_active(tensor, gradient):
-            if tensor.requires_grad:
-                inputs.append(tensor)
-                gradients.append(torch.as_tensor(gradient, device=tensor.device, dtype=tensor.dtype).expand_as(tensor))
-
-        add_active(design["absorber"], np.sum([result["bar_thickness_absorber"] for result in results], axis=0))
-        add_active(design["gap"], np.sum([result["bar_thickness_gap"] for result in results], axis=0))
-
-        if inputs:
-            torch.autograd.backward(inputs, gradients)
 
     def _run_simulation(
         self,
@@ -213,7 +201,11 @@ class HepEmShowSimulation(SimulationBase):
         results = self._run_tasks(module, tasks)
 
         if grad_output is not None:
-            self._backpropagate_native_gradients(design, results)
+            gradients = {
+                key: np.sum([result[f"bar_thickness_{key}"] for result in results], axis=0)
+                for key in ("absorber", "gap")
+            }
+            backpropagate_design_gradients(design, gradients)
             return None
 
         tensor_kwargs = dict(device=absorber.device, dtype=absorber.dtype)
@@ -268,4 +260,3 @@ class HepEmShowSimulation(SimulationBase):
         except FileNotFoundError:
             return
         self._run_simulation(design, grad_output=bar_edep)
-    
